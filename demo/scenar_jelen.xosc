@@ -1,0 +1,826 @@
+<?xml version="1.0" ?>
+<OpenSCENARIO>
+  <FileHeader revMajor="1" revMinor="0" date="2026-11-18T21:00:00" description="CARLA:DashcamVideoReconstructedScenario" author="video_to_xosc_pipeline"/>
+  <ParameterDeclarations/>
+  <CatalogLocations/>
+  <RoadNetwork>
+    <LogicFile filepath="Town04_Opt"/>
+    <SceneGraphFile filepath=""/>
+  </RoadNetwork>
+  <Entities>
+    <ScenarioObject name="hero">
+      <Vehicle name="vehicle.lincoln.mkz" vehicleCategory="car">
+        <ParameterDeclarations/>
+        <Performance maxSpeed="69.444" maxAcceleration="200" maxDeceleration="15.0"/>
+        <BoundingBox>
+          <Center x="1.5" y="0.0" z="0.9"/>
+          <Dimensions width="2.1" length="4.5" height="1.8"/>
+        </BoundingBox>
+        <Axles>
+          <FrontAxle maxSteering="0.5" wheelDiameter="0.6" trackWidth="1.8" positionX="3.1" positionZ="0.3"/>
+          <RearAxle maxSteering="0.0" wheelDiameter="0.6" trackWidth="1.8" positionX="0.0" positionZ="0.3"/>
+        </Axles>
+        <Properties>
+          <Property name="type" value="ego_vehicle"/>
+          <Property name="color" value="0,100,255"/>
+        </Properties>
+      </Vehicle>
+    </ScenarioObject>
+    <ScenarioObject name="crossing_deer_obstacle">
+      <Pedestrian model="walker.pedestrian.0020" mass="85.0" name="walker.pedestrian.0020" pedestrianCategory="pedestrian">
+        <ParameterDeclarations/>
+        <BoundingBox>
+          <Center x="0.0" y="0.0" z="0.9"/>
+          <Dimensions width="0.8" length="1.2" height="1.6"/>
+        </BoundingBox>
+        <Properties>
+          <Property name="type" value="simulation"/>
+        </Properties>
+      </Pedestrian>
+    </ScenarioObject>
+    <ScenarioObject name="oncoming_vehicle">
+      <Vehicle name="vehicle.tesla.model3" vehicleCategory="car">
+        <ParameterDeclarations/>
+        <Performance maxSpeed="69.444" maxAcceleration="200" maxDeceleration="15.0"/>
+        <BoundingBox>
+          <Center x="1.5" y="0.0" z="0.9"/>
+          <Dimensions width="2.1" length="4.5" height="1.8"/>
+        </BoundingBox>
+        <Axles>
+          <FrontAxle maxSteering="0.5" wheelDiameter="0.6" trackWidth="1.8" positionX="3.1" positionZ="0.3"/>
+          <RearAxle maxSteering="0.0" wheelDiameter="0.6" trackWidth="1.8" positionX="0.0" positionZ="0.3"/>
+        </Axles>
+        <Properties>
+          <Property name="type" value="simulation"/>
+          <Property name="color" value="220,220,255"/>
+        </Properties>
+      </Vehicle>
+    </ScenarioObject>
+  </Entities>
+  <Storyboard>
+    <Init>
+      <Actions>
+        <GlobalAction>
+          <EnvironmentAction>
+            <Environment name="DashcamEnv">
+              <TimeOfDay animation="false" dateTime="2026-06-15T23:30:00"/>
+              <Weather cloudState="free">
+                <Sun intensity="0.02" azimuth="0" elevation="-0.35"/>
+                <Fog visualRange="100000.0"/>
+                <Precipitation precipitationType="dry" intensity="0.0"/>
+              </Weather>
+              <RoadCondition frictionScaleFactor="1.0"/>
+            </Environment>
+          </EnvironmentAction>
+        </GlobalAction>
+        <Private entityRef="hero">
+          <PrivateAction>
+            <TeleportAction>
+              <Position>
+                <WorldPosition x="-511.738" y="242.657" z="0.500" h="1.50950"/>
+              </Position>
+            </TeleportAction>
+          </PrivateAction>
+          <PrivateAction>
+            <ControllerAction>
+              <AssignControllerAction>
+                <Controller name="hero_ctrl">
+                  <Properties>
+                    <Property name="module" value="simple_vehicle_control"/>
+                    <Property name="waypoint_reached_threshold" value="2.0"/>
+                  </Properties>
+                </Controller>
+              </AssignControllerAction>
+              <OverrideControllerValueAction>
+                <Throttle value="0" active="false"/>
+                <Brake value="0" active="false"/>
+                <Clutch value="0" active="false"/>
+                <ParkingBrake value="0" active="false"/>
+                <SteeringWheel value="0" active="false"/>
+                <Gear number="0" active="false"/>
+              </OverrideControllerValueAction>
+            </ControllerAction>
+          </PrivateAction>
+          <PrivateAction>
+            <LongitudinalAction>
+              <SpeedAction>
+                <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                <SpeedActionTarget>
+                  <AbsoluteTargetSpeed value="18.00"/>
+                </SpeedActionTarget>
+              </SpeedAction>
+            </LongitudinalAction>
+          </PrivateAction>
+        </Private>
+        <Private entityRef="crossing_deer_obstacle">
+          <PrivateAction>
+            <TeleportAction>
+              <Position>
+                <WorldPosition x="-460.397" y="371.204" z="0.850" h="0.82205"/>
+              </Position>
+            </TeleportAction>
+          </PrivateAction>
+        </Private>
+        <Private entityRef="oncoming_vehicle">
+          <PrivateAction>
+            <TeleportAction>
+              <Position>
+                <WorldPosition x="-353.917" y="425.884" z="0.500" h="-2.91758"/>
+              </Position>
+            </TeleportAction>
+          </PrivateAction>
+          <PrivateAction>
+            <ControllerAction>
+              <AssignControllerAction>
+                <Controller name="oncoming_vehicle_ctrl">
+                  <Properties>
+                    <Property name="module" value="simple_vehicle_control"/>
+                    <Property name="waypoint_reached_threshold" value="2.0"/>
+                  </Properties>
+                </Controller>
+              </AssignControllerAction>
+              <OverrideControllerValueAction>
+                <Throttle value="0" active="false"/>
+                <Brake value="0" active="false"/>
+                <Clutch value="0" active="false"/>
+                <ParkingBrake value="0" active="false"/>
+                <SteeringWheel value="0" active="false"/>
+                <Gear number="0" active="false"/>
+              </OverrideControllerValueAction>
+            </ControllerAction>
+          </PrivateAction>
+          <PrivateAction>
+            <LongitudinalAction>
+              <SpeedAction>
+                <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                <SpeedActionTarget>
+                  <AbsoluteTargetSpeed value="15.00"/>
+                </SpeedActionTarget>
+              </SpeedAction>
+            </LongitudinalAction>
+          </PrivateAction>
+        </Private>
+      </Actions>
+    </Init>
+    <Story name="DashcamReconstructedStory">
+      <Act name="DashcamReconstructedAct">
+        <ManeuverGroup name="MG_hero" maximumExecutionCount="1">
+          <Actors selectTriggeringEntities="false">
+            <EntityRef entityRef="hero"/>
+          </Actors>
+          <Maneuver name="Maneuver_hero">
+            <Event name="Event_Trajectory_hero" priority="overwrite">
+              <Action name="Action_FollowTrajectory_hero">
+                <PrivateAction>
+                  <RoutingAction>
+                    <FollowTrajectoryAction>
+                      <Trajectory name="Traj_hero" closed="false">
+                        <Shape>
+                          <Polyline>
+                            <Vertex time="1.00">
+                              <Position>
+                                <WorldPosition x="-510.561" y="261.840" z="0.500" h="1.40936"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="2.00">
+                              <Position>
+                                <WorldPosition x="-507.472" y="280.808" z="0.500" h="1.30923"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="3.00">
+                              <Position>
+                                <WorldPosition x="-502.502" y="299.373" z="0.500" h="1.20909"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="4.00">
+                              <Position>
+                                <WorldPosition x="-495.701" y="317.348" z="0.500" h="1.10896"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="5.00">
+                              <Position>
+                                <WorldPosition x="-487.137" y="334.553" z="0.500" h="1.00882"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="6.00">
+                              <Position>
+                                <WorldPosition x="-476.897" y="350.816" z="0.500" h="0.90869"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="7.00">
+                              <Position>
+                                <WorldPosition x="-465.081" y="365.974" z="0.500" h="0.83023"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="8.00">
+                              <Position>
+                                <WorldPosition x="-453.486" y="378.658" z="0.500" h="0.81045"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="9.00">
+                              <Position>
+                                <WorldPosition x="-444.901" y="387.685" z="0.500" h="0.81814"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="10.00">
+                              <Position>
+                                <WorldPosition x="-440.113" y="392.797" z="0.500" h="0.79907"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="11.00">
+                              <Position>
+                                <WorldPosition x="-438.640" y="394.311" z="0.500" h="0.65806"/>
+                              </Position>
+                            </Vertex>
+                          </Polyline>
+                        </Shape>
+                      </Trajectory>
+                      <TimeReference/>
+                      <TrajectoryFollowingMode followingMode="position"/>
+                    </FollowTrajectoryAction>
+                  </RoutingAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="StartCond_hero" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="0.05" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_8" priority="parallel">
+              <Action name="Action_Speed_hero_8">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="14.16"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_8" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="8.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_9" priority="parallel">
+              <Action name="Action_Speed_hero_9">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="9.02"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_9" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="9.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_10" priority="parallel">
+              <Action name="Action_Speed_hero_10">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="3.87"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_10" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="10.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_11" priority="parallel">
+              <Action name="Action_Speed_hero_11">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_11" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="11.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_12" priority="parallel">
+              <Action name="Action_Speed_hero_12">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_12" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="12.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_13" priority="parallel">
+              <Action name="Action_Speed_hero_13">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_13" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="13.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_14" priority="parallel">
+              <Action name="Action_Speed_hero_14">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_14" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="14.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_15" priority="parallel">
+              <Action name="Action_Speed_hero_15">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_15" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="15.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_16" priority="parallel">
+              <Action name="Action_Speed_hero_16">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_16" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="16.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_17" priority="parallel">
+              <Action name="Action_Speed_hero_17">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_17" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="17.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_18" priority="parallel">
+              <Action name="Action_Speed_hero_18">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_18" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="18.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_19" priority="parallel">
+              <Action name="Action_Speed_hero_19">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_19" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="19.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_hero_20" priority="parallel">
+              <Action name="Action_Speed_hero_20">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_hero_20" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="20.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+          </Maneuver>
+        </ManeuverGroup>
+        <ManeuverGroup name="MG_crossing_deer_obstacle" maximumExecutionCount="1">
+          <Actors selectTriggeringEntities="false">
+            <EntityRef entityRef="crossing_deer_obstacle"/>
+          </Actors>
+          <Maneuver name="Maneuver_crossing_deer_obstacle">
+            <Event name="Event_Wait_crossing_deer_obstacle" priority="overwrite">
+              <Action name="Action_Wait_crossing_deer_obstacle">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="5.0" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.0"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="StartCond_crossing_deer_obstacle" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="0.05" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+          </Maneuver>
+        </ManeuverGroup>
+        <ManeuverGroup name="MG_oncoming_vehicle" maximumExecutionCount="1">
+          <Actors selectTriggeringEntities="false">
+            <EntityRef entityRef="oncoming_vehicle"/>
+          </Actors>
+          <Maneuver name="Maneuver_oncoming_vehicle">
+            <Event name="Event_Trajectory_oncoming_vehicle" priority="overwrite">
+              <Action name="Action_FollowTrajectory_oncoming_vehicle">
+                <PrivateAction>
+                  <RoutingAction>
+                    <FollowTrajectoryAction>
+                      <Trajectory name="Traj_oncoming_vehicle" closed="false">
+                        <Shape>
+                          <Polyline>
+                            <Vertex time="1.00">
+                              <Position>
+                                <WorldPosition x="-369.250" y="422.390" z="0.500" h="-2.83413"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="2.00">
+                              <Position>
+                                <WorldPosition x="-384.238" y="417.631" z="0.500" h="-2.75068"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="3.00">
+                              <Position>
+                                <WorldPosition x="-398.777" y="411.639" z="0.500" h="-2.66724"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="4.00">
+                              <Position>
+                                <WorldPosition x="-412.767" y="404.456" z="0.500" h="-2.58379"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="5.00">
+                              <Position>
+                                <WorldPosition x="-426.109" y="396.132" z="0.500" h="-2.50035"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="6.00">
+                              <Position>
+                                <WorldPosition x="-438.710" y="386.725" z="0.500" h="-2.41690"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="7.00">
+                              <Position>
+                                <WorldPosition x="-450.484" y="376.301" z="0.500" h="-2.33345"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="8.00">
+                              <Position>
+                                <WorldPosition x="-461.348" y="364.931" z="0.500" h="-2.25001"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="9.00">
+                              <Position>
+                                <WorldPosition x="-471.227" y="352.696" z="0.500" h="-2.16656"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="10.00">
+                              <Position>
+                                <WorldPosition x="-480.051" y="339.679" z="0.500" h="-2.08311"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="11.00">
+                              <Position>
+                                <WorldPosition x="-487.760" y="325.973" z="0.500" h="-1.99967"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="12.00">
+                              <Position>
+                                <WorldPosition x="-494.299" y="311.671" z="0.500" h="-1.91622"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="13.00">
+                              <Position>
+                                <WorldPosition x="-499.624" y="296.874" z="0.500" h="-1.83278"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="14.00">
+                              <Position>
+                                <WorldPosition x="-503.696" y="281.685" z="0.500" h="-1.74933"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="15.00">
+                              <Position>
+                                <WorldPosition x="-506.489" y="266.210" z="0.500" h="-1.66588"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="16.00">
+                              <Position>
+                                <WorldPosition x="-507.982" y="250.555" z="0.500" h="-1.61699"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="17.00">
+                              <Position>
+                                <WorldPosition x="-508.107" y="247.859" z="0.500" h="1.53175"/>
+                              </Position>
+                            </Vertex>
+                          </Polyline>
+                        </Shape>
+                      </Trajectory>
+                      <TimeReference/>
+                      <TrajectoryFollowingMode followingMode="position"/>
+                    </FollowTrajectoryAction>
+                  </RoutingAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="StartCond_oncoming_vehicle" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="0.05" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_oncoming_vehicle_17" priority="parallel">
+              <Action name="Action_Speed_oncoming_vehicle_17">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_oncoming_vehicle_17" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="17.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_oncoming_vehicle_18" priority="parallel">
+              <Action name="Action_Speed_oncoming_vehicle_18">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_oncoming_vehicle_18" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="18.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_oncoming_vehicle_19" priority="parallel">
+              <Action name="Action_Speed_oncoming_vehicle_19">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_oncoming_vehicle_19" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="19.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+            <Event name="Event_Speed_oncoming_vehicle_20" priority="parallel">
+              <Action name="Action_Speed_oncoming_vehicle_20">
+                <PrivateAction>
+                  <LongitudinalAction>
+                    <SpeedAction>
+                      <SpeedActionDynamics dynamicsShape="step" value="0.5" dynamicsDimension="time"/>
+                      <SpeedActionTarget>
+                        <AbsoluteTargetSpeed value="0.00"/>
+                      </SpeedActionTarget>
+                    </SpeedAction>
+                  </LongitudinalAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="Cond_Speed_oncoming_vehicle_20" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="20.00" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+          </Maneuver>
+        </ManeuverGroup>
+        <StartTrigger>
+          <ConditionGroup>
+            <Condition name="ActStartCond" delay="0" conditionEdge="rising">
+              <ByValueCondition>
+                <SimulationTimeCondition value="0.0" rule="greaterThan"/>
+              </ByValueCondition>
+            </Condition>
+          </ConditionGroup>
+        </StartTrigger>
+        <StopTrigger>
+          <ConditionGroup>
+            <Condition name="ActStopCond" delay="0" conditionEdge="rising">
+              <ByValueCondition>
+                <SimulationTimeCondition value="20.20" rule="greaterThan"/>
+              </ByValueCondition>
+            </Condition>
+          </ConditionGroup>
+        </StopTrigger>
+      </Act>
+    </Story>
+    <StopTrigger>
+      <ConditionGroup>
+        <Condition name="criteria_CollisionTest" delay="0" conditionEdge="rising">
+          <ByValueCondition>
+            <ParameterCondition parameterRef="" value="" rule="lessThan"/>
+          </ByValueCondition>
+        </Condition>
+      </ConditionGroup>
+    </StopTrigger>
+  </Storyboard>
+</OpenSCENARIO>

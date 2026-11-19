@@ -1,0 +1,846 @@
+<?xml version="1.0" ?>
+<OpenSCENARIO>
+  <FileHeader revMajor="1" revMinor="0" date="2026-11-18T19:30:00" description="CARLA:DashcamVideoReconstructedScenario" author="video_to_xosc_pipeline"/>
+  <ParameterDeclarations/>
+  <CatalogLocations/>
+  <RoadNetwork>
+    <LogicFile filepath="Town04_Opt"/>
+    <SceneGraphFile filepath=""/>
+  </RoadNetwork>
+  <Entities>
+    <ScenarioObject name="hero">
+      <Vehicle name="vehicle.lincoln.mkz" vehicleCategory="car">
+        <ParameterDeclarations/>
+        <Performance maxSpeed="69.444" maxAcceleration="200" maxDeceleration="10.0"/>
+        <BoundingBox>
+          <Center x="1.5" y="0.0" z="0.9"/>
+          <Dimensions width="2.1" length="4.5" height="1.8"/>
+        </BoundingBox>
+        <Axles>
+          <FrontAxle maxSteering="0.5" wheelDiameter="0.6" trackWidth="1.8" positionX="3.1" positionZ="0.3"/>
+          <RearAxle maxSteering="0.0" wheelDiameter="0.6" trackWidth="1.8" positionX="0.0" positionZ="0.3"/>
+        </Axles>
+        <Properties>
+          <Property name="type" value="ego_vehicle"/>
+          <Property name="color" value="0,100,255"/>
+        </Properties>
+      </Vehicle>
+    </ScenarioObject>
+    <ScenarioObject name="npc_track_30">
+      <Vehicle name="vehicle.tesla.model3" vehicleCategory="car">
+        <ParameterDeclarations/>
+        <Performance maxSpeed="69.444" maxAcceleration="200" maxDeceleration="10.0"/>
+        <BoundingBox>
+          <Center x="1.5" y="0.0" z="0.9"/>
+          <Dimensions width="2.1" length="4.5" height="1.8"/>
+        </BoundingBox>
+        <Axles>
+          <FrontAxle maxSteering="0.5" wheelDiameter="0.6" trackWidth="1.8" positionX="3.1" positionZ="0.3"/>
+          <RearAxle maxSteering="0.0" wheelDiameter="0.6" trackWidth="1.8" positionX="0.0" positionZ="0.3"/>
+        </Axles>
+        <Properties>
+          <Property name="type" value="simulation"/>
+          <Property name="color" value="255,40,40"/>
+        </Properties>
+      </Vehicle>
+    </ScenarioObject>
+    <ScenarioObject name="npc_track_155">
+      <Vehicle name="vehicle.dodge.charger" vehicleCategory="car">
+        <ParameterDeclarations/>
+        <Performance maxSpeed="69.444" maxAcceleration="200" maxDeceleration="10.0"/>
+        <BoundingBox>
+          <Center x="1.5" y="0.0" z="0.9"/>
+          <Dimensions width="2.1" length="4.5" height="1.8"/>
+        </BoundingBox>
+        <Axles>
+          <FrontAxle maxSteering="0.5" wheelDiameter="0.6" trackWidth="1.8" positionX="3.1" positionZ="0.3"/>
+          <RearAxle maxSteering="0.0" wheelDiameter="0.6" trackWidth="1.8" positionX="0.0" positionZ="0.3"/>
+        </Axles>
+        <Properties>
+          <Property name="type" value="simulation"/>
+          <Property name="color" value="40,180,255"/>
+        </Properties>
+      </Vehicle>
+    </ScenarioObject>
+    <ScenarioObject name="npc_track_27">
+      <Vehicle name="vehicle.kia.niro" vehicleCategory="car">
+        <ParameterDeclarations/>
+        <Performance maxSpeed="69.444" maxAcceleration="200" maxDeceleration="10.0"/>
+        <BoundingBox>
+          <Center x="1.5" y="0.0" z="0.9"/>
+          <Dimensions width="2.1" length="4.5" height="1.8"/>
+        </BoundingBox>
+        <Axles>
+          <FrontAxle maxSteering="0.5" wheelDiameter="0.6" trackWidth="1.8" positionX="3.1" positionZ="0.3"/>
+          <RearAxle maxSteering="0.0" wheelDiameter="0.6" trackWidth="1.8" positionX="0.0" positionZ="0.3"/>
+        </Axles>
+        <Properties>
+          <Property name="type" value="simulation"/>
+          <Property name="color" value="255,200,40"/>
+        </Properties>
+      </Vehicle>
+    </ScenarioObject>
+  </Entities>
+  <Storyboard>
+    <Init>
+      <Actions>
+        <GlobalAction>
+          <EnvironmentAction>
+            <Environment name="DashcamEnv">
+              <TimeOfDay animation="false" dateTime="2026-06-15T14:00:00"/>
+              <Weather cloudState="free">
+                <Sun intensity="0.9" azimuth="0" elevation="1.2"/>
+                <Fog visualRange="100000.0"/>
+                <Precipitation precipitationType="dry" intensity="0.0"/>
+              </Weather>
+              <RoadCondition frictionScaleFactor="1.0"/>
+            </Environment>
+          </EnvironmentAction>
+        </GlobalAction>
+        <Private entityRef="hero">
+          <PrivateAction>
+            <TeleportAction>
+              <Position>
+                <WorldPosition x="-511.731" y="243.227" z="0.500" h="1.56843"/>
+              </Position>
+            </TeleportAction>
+          </PrivateAction>
+          <PrivateAction>
+            <ControllerAction>
+              <AssignControllerAction>
+                <Controller name="hero_ctrl">
+                  <Properties>
+                    <Property name="module" value="simple_vehicle_control"/>
+                    <Property name="waypoint_reached_threshold" value="2.5"/>
+                  </Properties>
+                </Controller>
+              </AssignControllerAction>
+              <OverrideControllerValueAction>
+                <Throttle value="0" active="false"/>
+                <Brake value="0" active="false"/>
+                <Clutch value="0" active="false"/>
+                <ParkingBrake value="0" active="false"/>
+                <SteeringWheel value="0" active="false"/>
+                <Gear number="0" active="false"/>
+              </OverrideControllerValueAction>
+            </ControllerAction>
+          </PrivateAction>
+          <PrivateAction>
+            <LongitudinalAction>
+              <SpeedAction>
+                <SpeedActionDynamics dynamicsShape="step" value="1.0" dynamicsDimension="time"/>
+                <SpeedActionTarget>
+                  <AbsoluteTargetSpeed value="8.00"/>
+                </SpeedActionTarget>
+              </SpeedAction>
+            </LongitudinalAction>
+          </PrivateAction>
+        </Private>
+        <Private entityRef="npc_track_30">
+          <PrivateAction>
+            <TeleportAction>
+              <Position>
+                <WorldPosition x="-514.663" y="254.147" z="0.500" h="1.49129"/>
+              </Position>
+            </TeleportAction>
+          </PrivateAction>
+          <PrivateAction>
+            <ControllerAction>
+              <AssignControllerAction>
+                <Controller name="npc_track_30_ctrl">
+                  <Properties>
+                    <Property name="module" value="simple_vehicle_control"/>
+                    <Property name="waypoint_reached_threshold" value="2.5"/>
+                  </Properties>
+                </Controller>
+              </AssignControllerAction>
+              <OverrideControllerValueAction>
+                <Throttle value="0" active="false"/>
+                <Brake value="0" active="false"/>
+                <Clutch value="0" active="false"/>
+                <ParkingBrake value="0" active="false"/>
+                <SteeringWheel value="0" active="false"/>
+                <Gear number="0" active="false"/>
+              </OverrideControllerValueAction>
+            </ControllerAction>
+          </PrivateAction>
+          <PrivateAction>
+            <LongitudinalAction>
+              <SpeedAction>
+                <SpeedActionDynamics dynamicsShape="step" value="1.0" dynamicsDimension="time"/>
+                <SpeedActionTarget>
+                  <AbsoluteTargetSpeed value="8.18"/>
+                </SpeedActionTarget>
+              </SpeedAction>
+            </LongitudinalAction>
+          </PrivateAction>
+        </Private>
+        <Private entityRef="npc_track_155">
+          <PrivateAction>
+            <TeleportAction>
+              <Position>
+                <WorldPosition x="-504.633" y="290.016" z="0.500" h="1.32106"/>
+              </Position>
+            </TeleportAction>
+          </PrivateAction>
+          <PrivateAction>
+            <ControllerAction>
+              <AssignControllerAction>
+                <Controller name="npc_track_155_ctrl">
+                  <Properties>
+                    <Property name="module" value="simple_vehicle_control"/>
+                    <Property name="waypoint_reached_threshold" value="2.5"/>
+                  </Properties>
+                </Controller>
+              </AssignControllerAction>
+              <OverrideControllerValueAction>
+                <Throttle value="0" active="false"/>
+                <Brake value="0" active="false"/>
+                <Clutch value="0" active="false"/>
+                <ParkingBrake value="0" active="false"/>
+                <SteeringWheel value="0" active="false"/>
+                <Gear number="0" active="false"/>
+              </OverrideControllerValueAction>
+            </ControllerAction>
+          </PrivateAction>
+          <PrivateAction>
+            <LongitudinalAction>
+              <SpeedAction>
+                <SpeedActionDynamics dynamicsShape="step" value="1.0" dynamicsDimension="time"/>
+                <SpeedActionTarget>
+                  <AbsoluteTargetSpeed value="7.59"/>
+                </SpeedActionTarget>
+              </SpeedAction>
+            </LongitudinalAction>
+          </PrivateAction>
+        </Private>
+        <Private entityRef="npc_track_27">
+          <PrivateAction>
+            <TeleportAction>
+              <Position>
+                <WorldPosition x="-512.343" y="271.847" z="0.500" h="1.42074"/>
+              </Position>
+            </TeleportAction>
+          </PrivateAction>
+          <PrivateAction>
+            <ControllerAction>
+              <AssignControllerAction>
+                <Controller name="npc_track_27_ctrl">
+                  <Properties>
+                    <Property name="module" value="simple_vehicle_control"/>
+                    <Property name="waypoint_reached_threshold" value="2.5"/>
+                  </Properties>
+                </Controller>
+              </AssignControllerAction>
+              <OverrideControllerValueAction>
+                <Throttle value="0" active="false"/>
+                <Brake value="0" active="false"/>
+                <Clutch value="0" active="false"/>
+                <ParkingBrake value="0" active="false"/>
+                <SteeringWheel value="0" active="false"/>
+                <Gear number="0" active="false"/>
+              </OverrideControllerValueAction>
+            </ControllerAction>
+          </PrivateAction>
+          <PrivateAction>
+            <LongitudinalAction>
+              <SpeedAction>
+                <SpeedActionDynamics dynamicsShape="step" value="1.0" dynamicsDimension="time"/>
+                <SpeedActionTarget>
+                  <AbsoluteTargetSpeed value="8.45"/>
+                </SpeedActionTarget>
+              </SpeedAction>
+            </LongitudinalAction>
+          </PrivateAction>
+        </Private>
+      </Actions>
+    </Init>
+    <Story name="DashcamReconstructedStory">
+      <Act name="DashcamReconstructedAct">
+        <ManeuverGroup name="MG_hero" maximumExecutionCount="1">
+          <Actors selectTriggeringEntities="false">
+            <EntityRef entityRef="hero"/>
+          </Actors>
+          <Maneuver name="Maneuver_hero">
+            <Event name="Event_Trajectory_hero" priority="overwrite">
+              <Action name="Action_FollowTrajectory_hero">
+                <PrivateAction>
+                  <RoutingAction>
+                    <FollowTrajectoryAction>
+                      <Trajectory name="Traj_hero" closed="false">
+                        <Shape>
+                          <Polyline>
+                            <Vertex time="1.00">
+                              <Position>
+                                <WorldPosition x="-511.711" y="251.783" z="0.500" h="1.54174"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="2.00">
+                              <Position>
+                                <WorldPosition x="-511.462" y="260.358" z="0.500" h="1.49573"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="3.00">
+                              <Position>
+                                <WorldPosition x="-510.817" y="268.932" z="0.500" h="1.40082"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="4.00">
+                              <Position>
+                                <WorldPosition x="-509.363" y="277.405" z="0.500" h="1.35633"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="5.00">
+                              <Position>
+                                <WorldPosition x="-507.533" y="285.804" z="0.500" h="1.31182"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="6.00">
+                              <Position>
+                                <WorldPosition x="-505.332" y="294.114" z="0.500" h="1.26732"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="7.00">
+                              <Position>
+                                <WorldPosition x="-502.763" y="302.318" z="0.500" h="1.22281"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="8.00">
+                              <Position>
+                                <WorldPosition x="-499.831" y="310.399" z="0.500" h="1.17830"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="9.00">
+                              <Position>
+                                <WorldPosition x="-496.543" y="318.342" z="0.500" h="1.13380"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="10.00">
+                              <Position>
+                                <WorldPosition x="-492.905" y="326.131" z="0.500" h="1.08929"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="11.00">
+                              <Position>
+                                <WorldPosition x="-488.924" y="333.750" z="0.500" h="1.04470"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="12.00">
+                              <Position>
+                                <WorldPosition x="-484.588" y="341.216" z="0.500" h="1.00009"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="13.00">
+                              <Position>
+                                <WorldPosition x="-479.944" y="348.450" z="0.500" h="0.95559"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="14.00">
+                              <Position>
+                                <WorldPosition x="-474.982" y="355.471" z="0.500" h="0.91109"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="15.00">
+                              <Position>
+                                <WorldPosition x="-469.714" y="362.264" z="0.500" h="0.86658"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="16.00">
+                              <Position>
+                                <WorldPosition x="-464.148" y="368.815" z="0.500" h="0.82208"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="17.00">
+                              <Position>
+                                <WorldPosition x="-458.296" y="375.113" z="0.500" h="0.77756"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="18.00">
+                              <Position>
+                                <WorldPosition x="-452.170" y="381.144" z="0.500" h="0.73306"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="19.00">
+                              <Position>
+                                <WorldPosition x="-445.780" y="386.898" z="0.500" h="0.68855"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="20.00">
+                              <Position>
+                                <WorldPosition x="-439.142" y="392.360" z="0.500" h="0.64404"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="21.00">
+                              <Position>
+                                <WorldPosition x="-432.268" y="397.522" z="0.500" h="0.64404"/>
+                              </Position>
+                            </Vertex>
+                          </Polyline>
+                        </Shape>
+                      </Trajectory>
+                      <TimeReference/>
+                      <TrajectoryFollowingMode followingMode="position"/>
+                    </FollowTrajectoryAction>
+                  </RoutingAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="StartCond_hero" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="0.05" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+          </Maneuver>
+        </ManeuverGroup>
+        <ManeuverGroup name="MG_npc_track_30" maximumExecutionCount="1">
+          <Actors selectTriggeringEntities="false">
+            <EntityRef entityRef="npc_track_30"/>
+          </Actors>
+          <Maneuver name="Maneuver_npc_track_30">
+            <Event name="Event_Trajectory_npc_track_30" priority="overwrite">
+              <Action name="Action_FollowTrajectory_npc_track_30">
+                <PrivateAction>
+                  <RoutingAction>
+                    <FollowTrajectoryAction>
+                      <Trajectory name="Traj_npc_track_30" closed="false">
+                        <Shape>
+                          <Polyline>
+                            <Vertex time="1.00">
+                              <Position>
+                                <WorldPosition x="-513.973" y="262.818" z="0.500" h="1.43415"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="2.00">
+                              <Position>
+                                <WorldPosition x="-512.787" y="271.437" z="0.500" h="1.38807"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="3.00">
+                              <Position>
+                                <WorldPosition x="-511.095" y="280.594" z="0.500" h="1.32968"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="4.00">
+                              <Position>
+                                <WorldPosition x="-507.867" y="293.723" z="0.500" h="1.22362"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="5.00">
+                              <Position>
+                                <WorldPosition x="-504.179" y="303.915" z="0.500" h="1.18569"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="6.00">
+                              <Position>
+                                <WorldPosition x="-499.576" y="315.271" z="0.500" h="1.12073"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="7.00">
+                              <Position>
+                                <WorldPosition x="-494.984" y="324.775" z="0.500" h="1.05906"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="8.00">
+                              <Position>
+                                <WorldPosition x="-489.992" y="333.663" z="0.500" h="0.99707"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="9.00">
+                              <Position>
+                                <WorldPosition x="-485.191" y="341.093" z="0.500" h="0.95745"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="10.00">
+                              <Position>
+                                <WorldPosition x="-481.593" y="346.204" z="0.500" h="0.94168"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="11.00">
+                              <Position>
+                                <WorldPosition x="-478.491" y="350.466" z="0.500" h="0.97451"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="12.00">
+                              <Position>
+                                <WorldPosition x="-476.009" y="354.123" z="0.500" h="0.95043"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="13.00">
+                              <Position>
+                                <WorldPosition x="-473.266" y="357.962" z="0.500" h="0.91297"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="14.00">
+                              <Position>
+                                <WorldPosition x="-469.256" y="363.152" z="0.500" h="0.85868"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="15.00">
+                              <Position>
+                                <WorldPosition x="-463.630" y="369.670" z="0.500" h="0.79846"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="16.00">
+                              <Position>
+                                <WorldPosition x="-457.932" y="375.518" z="0.500" h="0.75304"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="17.00">
+                              <Position>
+                                <WorldPosition x="-450.626" y="382.366" z="0.500" h="0.71649"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="18.00">
+                              <Position>
+                                <WorldPosition x="-443.813" y="388.300" z="0.500" h="0.67942"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="19.00">
+                              <Position>
+                                <WorldPosition x="-435.931" y="394.667" z="0.500" h="0.62378"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="20.00">
+                              <Position>
+                                <WorldPosition x="-427.696" y="400.593" z="0.500" h="0.57116"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="21.00">
+                              <Position>
+                                <WorldPosition x="-419.942" y="405.575" z="0.500" h="0.57116"/>
+                              </Position>
+                            </Vertex>
+                          </Polyline>
+                        </Shape>
+                      </Trajectory>
+                      <TimeReference/>
+                      <TrajectoryFollowingMode followingMode="position"/>
+                    </FollowTrajectoryAction>
+                  </RoutingAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="StartCond_npc_track_30" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="0.05" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+          </Maneuver>
+        </ManeuverGroup>
+        <ManeuverGroup name="MG_npc_track_155" maximumExecutionCount="1">
+          <Actors selectTriggeringEntities="false">
+            <EntityRef entityRef="npc_track_155"/>
+          </Actors>
+          <Maneuver name="Maneuver_npc_track_155">
+            <Event name="Event_Trajectory_npc_track_155" priority="overwrite">
+              <Action name="Action_FollowTrajectory_npc_track_155">
+                <PrivateAction>
+                  <RoutingAction>
+                    <FollowTrajectoryAction>
+                      <Trajectory name="Traj_npc_track_155" closed="false">
+                        <Shape>
+                          <Polyline>
+                            <Vertex time="1.00">
+                              <Position>
+                                <WorldPosition x="-502.525" y="298.281" z="0.500" h="1.29443"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="2.00">
+                              <Position>
+                                <WorldPosition x="-500.191" y="306.508" z="0.500" h="1.24842"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="3.00">
+                              <Position>
+                                <WorldPosition x="-497.476" y="314.638" z="0.500" h="1.15336"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="4.00">
+                              <Position>
+                                <WorldPosition x="-494.001" y="322.472" z="0.500" h="1.10886"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="5.00">
+                              <Position>
+                                <WorldPosition x="-490.182" y="330.143" z="0.500" h="1.06434"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="6.00">
+                              <Position>
+                                <WorldPosition x="-486.025" y="337.637" z="0.500" h="1.00093"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="7.00">
+                              <Position>
+                                <WorldPosition x="-483.667" y="341.317" z="0.500" h="0.96489"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="8.00">
+                              <Position>
+                                <WorldPosition x="-476.242" y="352.033" z="0.500" h="0.78078"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="9.00">
+                              <Position>
+                                <WorldPosition x="-475.088" y="353.177" z="0.500" h="0.60950"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="10.00">
+                              <Position>
+                                <WorldPosition x="-473.702" y="354.145" z="0.500" h="0.72575"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="11.00">
+                              <Position>
+                                <WorldPosition x="-472.483" y="355.226" z="0.500" h="1.15595"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="12.00">
+                              <Position>
+                                <WorldPosition x="-471.822" y="356.727" z="0.500" h="0.97773"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="13.00">
+                              <Position>
+                                <WorldPosition x="-469.566" y="360.074" z="0.500" h="0.89854"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="14.00">
+                              <Position>
+                                <WorldPosition x="-465.165" y="365.604" z="0.500" h="0.82707"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="15.00">
+                              <Position>
+                                <WorldPosition x="-457.982" y="373.411" z="0.500" h="0.75763"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="16.00">
+                              <Position>
+                                <WorldPosition x="-447.133" y="383.675" z="0.500" h="0.63885"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="17.00">
+                              <Position>
+                                <WorldPosition x="-429.238" y="396.966" z="0.500" h="0.58834"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="18.00">
+                              <Position>
+                                <WorldPosition x="-422.168" y="401.683" z="0.500" h="0.54382"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="19.00">
+                              <Position>
+                                <WorldPosition x="-414.894" y="406.081" z="0.500" h="0.49931"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="20.00">
+                              <Position>
+                                <WorldPosition x="-407.433" y="410.150" z="0.500" h="0.45481"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="21.00">
+                              <Position>
+                                <WorldPosition x="-399.798" y="413.884" z="0.500" h="0.45481"/>
+                              </Position>
+                            </Vertex>
+                          </Polyline>
+                        </Shape>
+                      </Trajectory>
+                      <TimeReference/>
+                      <TrajectoryFollowingMode followingMode="position"/>
+                    </FollowTrajectoryAction>
+                  </RoutingAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="StartCond_npc_track_155" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="0.05" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+          </Maneuver>
+        </ManeuverGroup>
+        <ManeuverGroup name="MG_npc_track_27" maximumExecutionCount="1">
+          <Actors selectTriggeringEntities="false">
+            <EntityRef entityRef="npc_track_27"/>
+          </Actors>
+          <Maneuver name="Maneuver_npc_track_27">
+            <Event name="Event_Trajectory_npc_track_27" priority="overwrite">
+              <Action name="Action_FollowTrajectory_npc_track_27">
+                <PrivateAction>
+                  <RoutingAction>
+                    <FollowTrajectoryAction>
+                      <Trajectory name="Traj_npc_track_27" closed="false">
+                        <Shape>
+                          <Polyline>
+                            <Vertex time="1.00">
+                              <Position>
+                                <WorldPosition x="-511.044" y="280.444" z="0.500" h="1.35204"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="2.00">
+                              <Position>
+                                <WorldPosition x="-509.156" y="288.936" z="0.500" h="1.17583"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="3.00">
+                              <Position>
+                                <WorldPosition x="-507.745" y="292.321" z="0.500" h="1.26051"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="4.00">
+                              <Position>
+                                <WorldPosition x="-502.668" y="308.154" z="0.500" h="1.16626"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="5.00">
+                              <Position>
+                                <WorldPosition x="-496.856" y="321.728" z="0.500" h="1.09905"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="6.00">
+                              <Position>
+                                <WorldPosition x="-491.123" y="332.965" z="0.500" h="1.01255"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="7.00">
+                              <Position>
+                                <WorldPosition x="-482.196" y="347.260" z="0.500" h="0.85414"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="8.00">
+                              <Position>
+                                <WorldPosition x="-479.135" y="350.774" z="0.500" h="0.94333"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="9.00">
+                              <Position>
+                                <WorldPosition x="-477.874" y="352.513" z="0.500" h="0.93223"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="10.00">
+                              <Position>
+                                <WorldPosition x="-472.734" y="359.437" z="0.500" h="0.88773"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="11.00">
+                              <Position>
+                                <WorldPosition x="-467.291" y="366.126" z="0.500" h="0.84312"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="12.00">
+                              <Position>
+                                <WorldPosition x="-461.530" y="372.593" z="0.500" h="0.79852"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="13.00">
+                              <Position>
+                                <WorldPosition x="-455.513" y="378.771" z="0.500" h="0.75402"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="14.00">
+                              <Position>
+                                <WorldPosition x="-449.227" y="384.674" z="0.500" h="0.70951"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="15.00">
+                              <Position>
+                                <WorldPosition x="-442.684" y="390.292" z="0.500" h="0.66500"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="16.00">
+                              <Position>
+                                <WorldPosition x="-435.898" y="395.613" z="0.500" h="0.62050"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="17.00">
+                              <Position>
+                                <WorldPosition x="-428.882" y="400.627" z="0.500" h="0.57600"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="18.00">
+                              <Position>
+                                <WorldPosition x="-421.649" y="405.325" z="0.500" h="0.53148"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="19.00">
+                              <Position>
+                                <WorldPosition x="-414.214" y="409.696" z="0.500" h="0.48698"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="20.00">
+                              <Position>
+                                <WorldPosition x="-406.593" y="413.732" z="0.500" h="0.44247"/>
+                              </Position>
+                            </Vertex>
+                            <Vertex time="21.00">
+                              <Position>
+                                <WorldPosition x="-398.800" y="417.424" z="0.500" h="0.44247"/>
+                              </Position>
+                            </Vertex>
+                          </Polyline>
+                        </Shape>
+                      </Trajectory>
+                      <TimeReference/>
+                      <TrajectoryFollowingMode followingMode="position"/>
+                    </FollowTrajectoryAction>
+                  </RoutingAction>
+                </PrivateAction>
+              </Action>
+              <StartTrigger>
+                <ConditionGroup>
+                  <Condition name="StartCond_npc_track_27" delay="0" conditionEdge="rising">
+                    <ByValueCondition>
+                      <SimulationTimeCondition value="0.05" rule="greaterThan"/>
+                    </ByValueCondition>
+                  </Condition>
+                </ConditionGroup>
+              </StartTrigger>
+            </Event>
+          </Maneuver>
+        </ManeuverGroup>
+        <StartTrigger>
+          <ConditionGroup>
+            <Condition name="ActStartCond" delay="0" conditionEdge="rising">
+              <ByValueCondition>
+                <SimulationTimeCondition value="0.0" rule="greaterThan"/>
+              </ByValueCondition>
+            </Condition>
+          </ConditionGroup>
+        </StartTrigger>
+        <StopTrigger>
+          <ConditionGroup>
+            <Condition name="ActStopCond" delay="0" conditionEdge="rising">
+              <ByValueCondition>
+                <SimulationTimeCondition value="21.76" rule="greaterThan"/>
+              </ByValueCondition>
+            </Condition>
+          </ConditionGroup>
+        </StopTrigger>
+      </Act>
+    </Story>
+    <StopTrigger>
+      <ConditionGroup>
+        <Condition name="criteria_CollisionTest" delay="0" conditionEdge="rising">
+          <ByValueCondition>
+            <ParameterCondition parameterRef="" value="" rule="lessThan"/>
+          </ByValueCondition>
+        </Condition>
+      </ConditionGroup>
+    </StopTrigger>
+  </Storyboard>
+</OpenSCENARIO>
