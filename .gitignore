@@ -7,7 +7,6 @@ scenario_runner/
 __pycache__/
 *.pyc
 .pytest_cache/
-demo/dashcam_tracked_annotated.mp4
-
+demo/*.mp4
+demo/*.jpg
 reports/papers/
-demo/*_tracked_annotated.mp4
