@@ -8,6 +8,7 @@ demo/carla_replay_dashcam.mp4 + demo/carla_replay_telemetry.json.
 
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -63,7 +64,7 @@ cam_tf = carla.Transform(carla.Location(x=1.5, y=0.0, z=1.45))
 camera = world.spawn_actor(cam_bp, cam_tf, attach_to=hero)
 
 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-video_out = work_dir / "demo/carla_replay_dashcam.mp4"
+video_out = Path(os.environ.get("CARLA_REPLAY_OUT_VIDEO", str(work_dir / "demo/carla_replay_dashcam.mp4")))
 video_out.parent.mkdir(parents=True, exist_ok=True)
 writer = cv2.VideoWriter(str(video_out), fourcc, 20.0, (1280, 720))
 latest_frame = [None]
@@ -167,13 +168,23 @@ try:
                 y_off += 28
             writer.write(frame)
             saved_frames += 1
+            try:
+                cv2.imshow("CARLA Dashcam View (Live HUD)", frame)
+                cv2.waitKey(1)
+            except Exception:
+                pass
         time.sleep(0.05)
 finally:
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
     try:
         camera.stop()
         camera.destroy()
     except Exception:
         pass
     writer.release()
-    (work_dir / "demo/carla_replay_telemetry.json").write_text(json.dumps(telemetry, indent=2), encoding="utf-8")
+    telemetry_out = Path(os.environ.get("CARLA_REPLAY_OUT_TELEMETRY", str(work_dir / "demo/carla_replay_telemetry.json")))
+    telemetry_out.write_text(json.dumps(telemetry, indent=2), encoding="utf-8")
     print(f"[CarlaRecorder] Recorded {len(telemetry)} telemetry samples and {saved_frames} video frames -> {video_out}")

@@ -178,6 +178,7 @@ def write_openscenario_xosc(
 
     # Global EnvironmentAction parameterized with logical scenario declarations
     is_night = bool(projected.get("is_night", False))
+    duration = max(5.0, float(projected.get("duration", 15.0)))
     ga = ET.SubElement(init_actions, "GlobalAction")
     ea = ET.SubElement(ga, "EnvironmentAction")
     env = ET.SubElement(ea, "Environment", attrib={"name": "DashcamEnv"})
@@ -186,15 +187,19 @@ def write_openscenario_xosc(
         "TimeOfDay",
         attrib={"animation": "false", "dateTime": "2026-06-15T23:30:00" if is_night else "2026-06-15T14:00:00"},
     )
+    sun_elev = "-0.35" if is_night else "1.20"
+    sun_inten = "0.02" if is_night else "0.90"
+    fric_val = f"{cfg.scenario.default_friction:.2f}"
+
     weather = ET.SubElement(env, "Weather", attrib={"cloudState": "free"})
     ET.SubElement(
         weather,
         "Sun",
-        attrib={"intensity": "$SunIntensity", "azimuth": "0", "elevation": "$SunElevation"},
+        attrib={"intensity": sun_inten, "azimuth": "0", "elevation": sun_elev},
     )
     ET.SubElement(weather, "Fog", attrib={"visualRange": "100000.0"})
     ET.SubElement(weather, "Precipitation", attrib={"precipitationType": "dry", "intensity": "0.0"})
-    ET.SubElement(env, "RoadCondition", attrib={"frictionScaleFactor": "$RoadFriction"})
+    ET.SubElement(env, "RoadCondition", attrib={"frictionScaleFactor": fric_val})
 
     # Init PrivateActions
     for ent in all_entities:
@@ -364,14 +369,14 @@ def write_openscenario_xosc(
     act_stop_cg = ET.SubElement(act_stop, "ConditionGroup")
     act_stop_cond = ET.SubElement(act_stop_cg, "Condition", attrib={"name": "ActStopCond", "delay": "0", "conditionEdge": "rising"})
     act_stop_bvc = ET.SubElement(act_stop_cond, "ByValueCondition")
-    ET.SubElement(act_stop_bvc, "SimulationTimeCondition", attrib={"value": "$ScenarioDuration", "rule": "greaterThan"})
+    ET.SubElement(act_stop_bvc, "SimulationTimeCondition", attrib={"value": f"{duration:.2f}", "rule": "greaterThan"})
 
-    # Clean, valid Storyboard StopTrigger
+    # Clean, valid Storyboard StopTrigger with criteria for CARLA ScenarioRunner
     sb_stop = ET.SubElement(storyboard, "StopTrigger")
     sb_cg = ET.SubElement(sb_stop, "ConditionGroup")
-    sb_cond = ET.SubElement(sb_cg, "Condition", attrib={"name": "StoryboardStopCond", "delay": "0", "conditionEdge": "rising"})
+    sb_cond = ET.SubElement(sb_cg, "Condition", attrib={"name": "criteria_CollisionTest", "delay": "0", "conditionEdge": "rising"})
     sb_bvc = ET.SubElement(sb_cond, "ByValueCondition")
-    ET.SubElement(sb_bvc, "SimulationTimeCondition", attrib={"value": "$ScenarioDuration", "rule": "greaterThan"})
+    ET.SubElement(sb_bvc, "ParameterCondition", attrib={"parameterRef": "", "value": "", "rule": "lessThan"})
 
     xml_bytes = ET.tostring(root, encoding="utf-8")
     pretty_xml = minidom.parseString(xml_bytes).toprettyxml(indent="  ")

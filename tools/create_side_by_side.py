@@ -3,16 +3,25 @@ create_side_by_side.py — Creates a synchronized side-by-side video comparing
 the real dashcam tracking with the CARLA 1.0 3D OpenSCENARIO replay for 'scenar_jelen'.
 """
 
+import argparse
 import sys
 from pathlib import Path
 import cv2
 import numpy as np
 
 def main():
+    parser = argparse.ArgumentParser(description="Create synchronized side-by-side comparison video")
+    parser.add_argument("--real", default="demo/jelen_tracked_annotated.mp4", help="Path to real video")
+    parser.add_argument("--carla", default="demo/carla_replay_dashcam.mp4", help="Path to CARLA video")
+    parser.add_argument("--out", default="demo/jelen_reality_vs_carla_sim.mp4", help="Path to output video")
+    parser.add_argument("--title-real", default="REAL DASHCAM RECORDING", help="Left header title")
+    parser.add_argument("--title-carla", default="CARLA 1.0 3D SIMULATION", help="Right header title")
+    args = parser.parse_args()
+
     root = Path(r"C:\Users\adamk\.gemini\antigravity\scratch\carla-video-to-xosc")
-    real_path = root / "demo" / "jelen_tracked_annotated.mp4"
-    carla_path = root / "demo" / "carla_replay_dashcam.mp4"
-    out_path = root / "demo" / "jelen_reality_vs_carla_sim.mp4"
+    real_path = Path(args.real) if Path(args.real).is_absolute() else root / args.real
+    carla_path = Path(args.carla) if Path(args.carla).is_absolute() else root / args.carla
+    out_path = Path(args.out) if Path(args.out).is_absolute() else root / args.out
 
     if not real_path.exists() or not carla_path.exists():
         print("Missing input videos!")
@@ -68,20 +77,20 @@ def main():
         canvas[0:header_h, 0:canvas_w] = (25, 25, 30)
         cv2.putText(
             canvas,
-            "REAL DASHCAM RECORDING (jelen.mp4)",
+            args.title_real,
             (40, 42),
             cv2.FONT_HERSHEY_DUPLEX,
-            0.9,
+            0.85,
             (0, 220, 255),
             2,
             cv2.LINE_AA,
         )
         cv2.putText(
             canvas,
-            "CARLA 1.0 3D SIMULATION (scenar_jelen.xosc)",
+            args.title_carla,
             (target_w + 40, 42),
             cv2.FONT_HERSHEY_DUPLEX,
-            0.9,
+            0.85,
             (50, 255, 120),
             2,
             cv2.LINE_AA,

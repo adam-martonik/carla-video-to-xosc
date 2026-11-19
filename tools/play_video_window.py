@@ -14,12 +14,15 @@ import cv2
 
 def main():
     root = Path(r"C:\Users\adamk\.gemini\antigravity\scratch\carla-video-to-xosc")
-    vid_path = root / "demo" / "jelen_reality_vs_carla_sim.mp4"
+    if len(sys.argv) > 1:
+        vid_path = Path(sys.argv[1]) if Path(sys.argv[1]).is_absolute() else root / sys.argv[1]
+    else:
+        vid_path = root / "demo" / "jelen_reality_vs_carla_sim.mp4"
     if not vid_path.exists():
         print(f"Video not found: {vid_path}")
         sys.exit(1)
 
-    win_name = "CARLA 1.0 vs Dashcam Reality - Scenar Jelen Replay"
+    win_name = f"CARLA 1.0 vs Dashcam Reality - {vid_path.stem}"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, 1600, 508)
 

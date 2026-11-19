@@ -20,6 +20,8 @@ def main():
         default="demo/dashcam_reconstructed.xosc",
         help="Path to the .xosc file to replay (default: demo/dashcam_reconstructed.xosc)",
     )
+    parser.add_argument("--out-video", default=None, help="Path to output replay MP4")
+    parser.add_argument("--out-telemetry", default=None, help="Path to output telemetry JSON")
     args = parser.parse_args()
 
     work_dir = Path(__file__).resolve().parent
@@ -38,6 +40,11 @@ def main():
     if env.get("PYTHONPATH"):
         py_path = f"{py_path};{env['PYTHONPATH']}"
     env["PYTHONPATH"] = py_path
+
+    if args.out_video:
+        env["CARLA_REPLAY_OUT_VIDEO"] = str(Path(args.out_video).resolve())
+    if args.out_telemetry:
+        env["CARLA_REPLAY_OUT_TELEMETRY"] = str(Path(args.out_telemetry).resolve())
 
     print(f"[run_replay] Starting recorder & spectator follow-cam...")
     rec_proc = subprocess.Popen(
