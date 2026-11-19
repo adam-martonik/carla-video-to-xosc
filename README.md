@@ -111,3 +111,25 @@ Start-Process -FilePath "$workDir\.venv\Scripts\python.exe" -ArgumentList "$work
 & "$workDir\.venv\Scripts\python.exe" "$srRoot\scenario_runner.py" `
     --openscenario "$workDir\demo\dashcam_reconstructed.xosc" --output
 ```
+
+---
+
+## 6. Realistic Pipeline v2 (`src/xosc_pipeline/`), Configuration & Testing
+
+The pipeline has been refactored into a typed, modular architecture (`src/xosc_pipeline/`) driven by `config/default.yaml`:
+- **Calibration (`calibration.py`)**: aspect-ratio-aware intrinsics, Canny+Hough vanishing-point horizon estimation, and inverse-variance ground-plane + width monocular 3D fusion.
+- **Tracking & VO (`tracking.py`)**: YOLO11 + **BoT-SORT** (with Camera Motion Compensation), RANSAC + radial-FOE visual odometry, and post-hoc **tracklet stitching** across brief occlusions.
+- **Kinematics & Deconfliction (`kinematics.py`)**: rolling MAD outlier rejection, **Rauch-Tung-Striebel (RTS)** constant-acceleration Kalman smoother, **bicycle-model** kinematic feasibility limits (`v`, `a`, `jerk`, `yaw_rate`), bounded boundary extrapolation, and multi-timestamp Frenet/OBB deconfliction.
+- **Road Network (`road_network.py`)**: automatic lane-count & curvature estimation, **ASAM OpenDRIVE 1.4 (`.xodr`)** generation, and both live CARLA and deterministic `--offline` projection.
+- **OpenSCENARIO 1.0 (`xosc_writer.py`)**: logical scenario parameterization (`<ParameterDeclarations>`), class-accurate vehicle/pedestrian dimensions, axles, and `<Performance>` limits, 4 Hz `<Polyline>` trajectories, linear `<SpeedAction>`, and strict XSD validation.
+
+```powershell
+# Run offline without CARLA server (outputs .xosc + .xodr + .json)
+& "$workDir\.venv\Scripts\python.exe" "$workDir\video_to_xosc.py" `
+    --video "$workDir\demo\dashcam_input.mp4" --offline --config "$workDir\config\default.yaml"
+
+# Run automated unit & integration tests
+& "$workDir\.venv\Scripts\python.exe" -m pytest -v tests/
+```
+
+See `docs/audit.md`, `docs/plan.md`, `docs/assumptions.md`, `references.bib`, `reports/evaluation/`, and `reports/research_and_changes.pdf` for the complete research survey, audit, and before/after evaluation.

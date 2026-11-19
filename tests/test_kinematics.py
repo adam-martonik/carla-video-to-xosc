@@ -105,7 +105,10 @@ def test_deconflict_trajectories_eliminates_overlap():
         "d": [0.2] * len(t),
     }
     resolved = deconflict_trajectories(ego, [actor], cfg)
-    s_ego = np.array(ego["s"])
-    s_act = np.array(resolved[0]["s"])
-    min_gap = float(np.min(np.abs(s_act - s_ego)))
-    assert min_gap >= cfg.get_class_spec(2).length + cfg.kinematics.min_safety_margin_long_m - 0.1
+    s_ego, d_ego = np.array(ego["s"]), np.array(ego["d"])
+    s_act, d_act = np.array(resolved[0]["s"]), np.array(resolved[0]["d"])
+    spec = cfg.get_class_spec(2)
+    req_s = spec.length + cfg.kinematics.min_safety_margin_long_m - 0.1
+    req_d = spec.width + cfg.kinematics.min_safety_margin_lat_m - 0.1
+    overlaps = (np.abs(s_act - s_ego) < req_s) & (np.abs(d_act - d_ego) < req_d)
+    assert not np.any(overlaps)

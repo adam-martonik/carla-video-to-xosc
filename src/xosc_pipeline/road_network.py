@@ -192,10 +192,15 @@ def _frenet_to_world_analytic(s_val: float, d_val: float, road_geom: Dict[str, A
     return x, y, hdg
 
 
-def _compute_smooth_headings(world_poses: list[Dict[str, float]], is_oncoming: bool = False) -> None:
+def _compute_smooth_headings(
+    world_poses: list[Dict[str, float]],
+    times: list[float] | None = None,
+    is_oncoming: bool = False,
+    max_yaw_rate_rad_s: float = 0.50,
+) -> None:
     """
-    Compute tangent headings from world poses while avoiding 180-deg flips when a vehicle
-    is stationary (displacement < 0.15 m). Preserves oncoming orientation cleanly.
+    Compute rate-limited tangent headings from world poses while avoiding jitter or 180-deg
+    flips when a vehicle is stationary or crawling slowly.
     """
     n = len(world_poses)
     if n < 2:
@@ -204,8 +209,13 @@ def _compute_smooth_headings(world_poses: list[Dict[str, float]], is_oncoming: b
     for i in range(n - 1):
         dx = world_poses[i + 1]["x"] - world_poses[i]["x"]
         dy = world_poses[i + 1]["y"] - world_poses[i]["y"]
-        if math.hypot(dx, dy) > 0.15:
-            last_valid_h = math.atan2(dy, dx)
+        dt = (times[i + 1] - times[i]) if (times is not None and i + 1 < len(times)) else 0.25
+        dt = max(float(dt), 0.05)
+        if math.hypot(dx, dy) > 0.35:
+            raw_h = math.atan2(dy, dx)
+            dh = (raw_h - last_valid_h + math.pi) % (2.0 * math.pi) - math.pi
+            max_dh = max_yaw_rate_rad_s * dt
+            last_valid_h = last_valid_h + float(np.clip(dh, -max_dh, max_dh))
         world_poses[i]["h"] = last_valid_h
     world_poses[-1]["h"] = last_valid_h
 
@@ -235,7 +245,7 @@ def project_frenet_offline(
         for s_val, d_val in zip(ent["s"], ent["d"]):
             x, y, hdg = _frenet_to_world_analytic(s_val, d_val, road_geom)
             poses.append({"x": x, "y": y, "z": z_surf, "h": hdg})
-        _compute_smooth_headings(poses, is_oncoming=bool(ent.get("is_oncoming", False)))
+        _compute_smooth_headings(poses, times=ent.get("times"), is_oncoming=bool(ent.get("is_oncoming", False)))
         ent["world_poses"] = poses
 
     projected["town"] = town_label
@@ -353,7 +363,7 @@ def project_frenet_to_carla_map(
         for s_val, d_val in zip(ent["s"], ent["d"]):
             x, y, z, h_rad = s_d_to_carla_pose(s_val, d_val, z_offset=z_off)
             poses.append({"x": x, "y": y, "z": z, "h": h_rad})
-        _compute_smooth_headings(poses, is_oncoming=bool(ent.get("is_oncoming", False)))
+        _compute_smooth_headings(poses, times=ent.get("times"), is_oncoming=bool(ent.get("is_oncoming", False)))
         ent["world_poses"] = poses
 
     projected["town"] = town

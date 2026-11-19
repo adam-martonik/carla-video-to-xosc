@@ -277,17 +277,28 @@ def deconflict_trajectories(
         s_arr = np.asarray(actor_copy["s"], dtype=float).copy()
         d_arr = np.asarray(actor_copy["d"], dtype=float).copy()
 
-        for _ in range(kin.deconflict_iterations):
+        for it in range(kin.deconflict_iterations):
             any_hit = False
             for p_s, p_d, p_spec in placed:
                 n_min = min(len(s_arr), len(p_s))
-                hit, needed = has_overlap(s_arr[:n_min], d_arr[:n_min], spec, p_s[:n_min], p_d[:n_min], p_spec)
-                if hit:
+                req_s, req_d = min_required_gaps(spec, p_spec)
+                ds = np.abs(s_arr[:n_min] - p_s[:n_min])
+                dd = np.abs(d_arr[:n_min] - p_d[:n_min])
+                overlap_mask = (ds < req_s) & (dd < req_d)
+                if np.any(overlap_mask):
                     any_hit = True
-                    # Shift actor ahead (or behind if it's already behind) by constant offset to preserve v, a, jerk
-                    mean_rel = float(np.mean(s_arr[:n_min] - p_s[:n_min]))
-                    direction = 1.0 if mean_rel >= -1.0 else -1.0
-                    s_arr = s_arr + direction * needed
+                    if it < 2:
+                        # First try lateral lane separation (cleanest for passing/overtaking vehicles)
+                        mean_d_rel = float(np.mean(d_arr[:n_min][overlap_mask] - p_d[:n_min][overlap_mask]))
+                        lat_dir = 1.0 if mean_d_rel >= 0.0 else -1.0
+                        needed_d = float(np.max(req_d - dd[overlap_mask])) + 0.35
+                        d_arr = d_arr + lat_dir * needed_d
+                    else:
+                        # Fallback: longitudinal separation clear of the entire overlap window
+                        mean_s_rel = float(np.mean(s_arr[:n_min] - p_s[:n_min]))
+                        long_dir = 1.0 if mean_s_rel >= 0.0 else -1.0
+                        needed_s = float(np.max(req_s - ds[overlap_mask])) + 1.0
+                        s_arr = s_arr + long_dir * needed_s
             if not any_hit:
                 break
 

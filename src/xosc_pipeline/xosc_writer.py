@@ -291,8 +291,8 @@ def write_openscenario_xosc(
         for idx, (t_val, pose) in enumerate(zip(ent["times"], ent["world_poses"])):
             if prev_pose is not None and added_vertices >= 2:
                 dist = math.hypot(pose["x"] - prev_pose["x"], pose["y"] - prev_pose["y"])
-                # Skip stationary duplicates after vehicle comes to a complete stop
-                if dist < 0.08 and idx < len(ent["times"]) - 1:
+                # Skip only truly stationary duplicates (full stop) so slow motion keeps uniform dt
+                if dist < 0.005 and idx < len(ent["times"]) - 1:
                     continue
             vtx = ET.SubElement(polyline, "Vertex", attrib={"time": f"{t_val:.3f}"})
             vpos = ET.SubElement(vtx, "Position")

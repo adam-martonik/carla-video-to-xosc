@@ -1,0 +1,362 @@
+{
+  "dashcam_input": {
+    "video": "dashcam_input.mp4",
+    "baseline_xosc": "dashcam_reconstructed.xosc",
+    "before": {
+      "xsd_valid": true,
+      "param_count": 0,
+      "max_perf_acc_xml": 200.0,
+      "worst_max_abs_acc": 13.792,
+      "worst_max_abs_jerk": 21.148,
+      "worst_max_yaw_rate": 0.4302,
+      "overlap_steps": 2,
+      "raw_ego_max_abs_acc": 728.27,
+      "has_xodr": false
+    },
+    "after": {
+      "file": "after_dashcam_input.xosc",
+      "xsd_valid": true,
+      "param_count": 6,
+      "entity_count": 5,
+      "categories": {
+        "hero": "car",
+        "npc_track_41": "car",
+        "npc_track_69": "car",
+        "npc_track_28": "car",
+        "npc_track_410": "car"
+      },
+      "max_perf_acc_xml": 4.5,
+      "worst_max_abs_acc": 8.211,
+      "worst_max_abs_jerk": 7.213,
+      "mean_rms_jerk": 2.238,
+      "worst_max_yaw_rate": 0.3443,
+      "min_center_dist_m": 2.834,
+      "obb_collision_steps": 0,
+      "min_ttc_s": 0.0,
+      "trajectories": {
+        "hero": {
+          "n_verts": 88,
+          "v_min": 3.604,
+          "v_max": 26.033,
+          "max_abs_acc": 8.211,
+          "max_abs_jerk": 7.213,
+          "rms_jerk": 2.646,
+          "max_yaw_rate": 0.0686,
+          "max_lat_acc": 1.785
+        },
+        "npc_track_41": {
+          "n_verts": 88,
+          "v_min": 5.462,
+          "v_max": 27.162,
+          "max_abs_acc": 5.954,
+          "max_abs_jerk": 4.85,
+          "rms_jerk": 2.336,
+          "max_yaw_rate": 0.2893,
+          "max_lat_acc": 5.315
+        },
+        "npc_track_69": {
+          "n_verts": 88,
+          "v_min": 5.685,
+          "v_max": 25.798,
+          "max_abs_acc": 5.504,
+          "max_abs_jerk": 6.249,
+          "rms_jerk": 2.134,
+          "max_yaw_rate": 0.0784,
+          "max_lat_acc": 2.023
+        },
+        "npc_track_28": {
+          "n_verts": 88,
+          "v_min": 17.923,
+          "v_max": 27.653,
+          "max_abs_acc": 3.685,
+          "max_abs_jerk": 6.823,
+          "rms_jerk": 2.49,
+          "max_yaw_rate": 0.0764,
+          "max_lat_acc": 2.113
+        },
+        "npc_track_410": {
+          "n_verts": 88,
+          "v_min": 14.562,
+          "v_max": 19.456,
+          "max_abs_acc": 1.621,
+          "max_abs_jerk": 5.112,
+          "rms_jerk": 1.582,
+          "max_yaw_rate": 0.3443,
+          "max_lat_acc": 5.026
+        }
+      },
+      "has_xodr": true,
+      "road_geometry": {
+        "road_start_s": -46.914212242698326,
+        "length": 668.4285543525989,
+        "curvature": 0.002633322709901228,
+        "lane_width": 3.5,
+        "shoulder_width": 2.2,
+        "n_right_lanes": 3,
+        "n_left_lanes": 3
+      }
+    }
+  },
+  "brake": {
+    "video": "brake.mp4",
+    "baseline_xosc": "scenar_brake.xosc",
+    "before": {
+      "xsd_valid": true,
+      "param_count": 0,
+      "max_perf_acc_xml": 200.0,
+      "worst_max_abs_acc": 3.027,
+      "worst_max_abs_jerk": 1.515,
+      "worst_max_yaw_rate": 0.1224,
+      "overlap_steps": 0,
+      "raw_ego_max_abs_acc": 603.56,
+      "has_xodr": false
+    },
+    "after": {
+      "file": "after_brake.xosc",
+      "xsd_valid": true,
+      "param_count": 6,
+      "entity_count": 5,
+      "categories": {
+        "hero": "car",
+        "npc_track_194": "car",
+        "npc_track_286": "truck",
+        "npc_track_3": "car",
+        "npc_track_141": "car"
+      },
+      "max_perf_acc_xml": 4.5,
+      "worst_max_abs_acc": 9.65,
+      "worst_max_abs_jerk": 22.2,
+      "mean_rms_jerk": 2.448,
+      "worst_max_yaw_rate": 0.5008,
+      "min_center_dist_m": 4.847,
+      "obb_collision_steps": 0,
+      "min_ttc_s": 1.124,
+      "trajectories": {
+        "hero": {
+          "n_verts": 73,
+          "v_min": 0.107,
+          "v_max": 11.807,
+          "max_abs_acc": 9.65,
+          "max_abs_jerk": 15.08,
+          "rms_jerk": 3.702,
+          "max_yaw_rate": 0.0074,
+          "max_lat_acc": 0.086
+        },
+        "npc_track_194": {
+          "n_verts": 25,
+          "v_min": 0.0,
+          "v_max": 5.529,
+          "max_abs_acc": 4.939,
+          "max_abs_jerk": 8.011,
+          "rms_jerk": 2.66,
+          "max_yaw_rate": 0.5008,
+          "max_lat_acc": 1.535
+        },
+        "npc_track_286": {
+          "n_verts": 43,
+          "v_min": 0.0,
+          "v_max": 0.638,
+          "max_abs_acc": 1.549,
+          "max_abs_jerk": 5.566,
+          "rms_jerk": 1.153,
+          "max_yaw_rate": 0.0,
+          "max_lat_acc": 0.0
+        },
+        "npc_track_3": {
+          "n_verts": 74,
+          "v_min": 0.207,
+          "v_max": 8.844,
+          "max_abs_acc": 9.451,
+          "max_abs_jerk": 22.2,
+          "rms_jerk": 3.887,
+          "max_yaw_rate": 0.5008,
+          "max_lat_acc": 4.285
+        },
+        "npc_track_141": {
+          "n_verts": 32,
+          "v_min": 0.0,
+          "v_max": 0.213,
+          "max_abs_acc": 0.805,
+          "max_abs_jerk": 3.191,
+          "rms_jerk": 0.837,
+          "max_yaw_rate": 0.0,
+          "max_lat_acc": 0.0
+        }
+      },
+      "has_xodr": true,
+      "road_geometry": {
+        "road_start_s": -25.0,
+        "length": 257.9774640294379,
+        "curvature": 0.0006809945721305225,
+        "lane_width": 3.5,
+        "shoulder_width": 2.2,
+        "n_right_lanes": 3,
+        "n_left_lanes": 1
+      }
+    }
+  },
+  "jelen": {
+    "video": "jelen.mp4",
+    "baseline_xosc": "scenar_jelen.xosc",
+    "before": {
+      "xsd_valid": true,
+      "param_count": 0,
+      "max_perf_acc_xml": 200.0,
+      "worst_max_abs_acc": 13.027,
+      "worst_max_abs_jerk": 13.028,
+      "worst_max_yaw_rate": 3.1344,
+      "overlap_steps": 0,
+      "raw_ego_max_abs_acc": 729.0,
+      "has_xodr": false
+    },
+    "after": {
+      "file": "after_jelen.xosc",
+      "xsd_valid": true,
+      "param_count": 6,
+      "entity_count": 3,
+      "categories": {
+        "hero": "car",
+        "crossing_obstacle": "pedestrian",
+        "oncoming_vehicle": "car"
+      },
+      "max_perf_acc_xml": 4.5,
+      "worst_max_abs_acc": 8.861,
+      "worst_max_abs_jerk": 7.191,
+      "mean_rms_jerk": 1.563,
+      "worst_max_yaw_rate": 0.2271,
+      "min_center_dist_m": 3.652,
+      "obb_collision_steps": 0,
+      "min_ttc_s": 0.136,
+      "trajectories": {
+        "hero": {
+          "n_verts": 48,
+          "v_min": 0.0,
+          "v_max": 24.431,
+          "max_abs_acc": 8.861,
+          "max_abs_jerk": 7.191,
+          "rms_jerk": 2.748,
+          "max_yaw_rate": 0.2271,
+          "max_lat_acc": 0.846
+        },
+        "oncoming_vehicle": {
+          "n_verts": 82,
+          "v_min": 14.942,
+          "v_max": 15.005,
+          "max_abs_acc": 0.245,
+          "max_abs_jerk": 1.927,
+          "rms_jerk": 0.378,
+          "max_yaw_rate": 0.0153,
+          "max_lat_acc": 0.23
+        }
+      },
+      "has_xodr": true,
+      "road_geometry": {
+        "road_start_s": -33.49882347007354,
+        "length": 407.50000000000006,
+        "curvature": 0.001017041885441022,
+        "lane_width": 3.5,
+        "shoulder_width": 2.2,
+        "n_right_lanes": 2,
+        "n_left_lanes": 2
+      }
+    }
+  },
+  "stiahnute_video": {
+    "video": "stiahnute_video.mp4",
+    "baseline_xosc": "moj_scenar.xosc",
+    "before": {
+      "xsd_valid": true,
+      "param_count": 0,
+      "max_perf_acc_xml": 200.0,
+      "worst_max_abs_acc": 15.411,
+      "worst_max_abs_jerk": 24.005,
+      "worst_max_yaw_rate": 0.084,
+      "overlap_steps": 1,
+      "raw_ego_max_abs_acc": 460.29,
+      "has_xodr": false
+    },
+    "after": {
+      "file": "after_stiahnute_video.xosc",
+      "xsd_valid": true,
+      "param_count": 6,
+      "entity_count": 5,
+      "categories": {
+        "hero": "car",
+        "npc_track_40": "car",
+        "npc_track_99": "truck",
+        "npc_track_83": "truck",
+        "npc_track_155": "car"
+      },
+      "max_perf_acc_xml": 4.5,
+      "worst_max_abs_acc": 7.285,
+      "worst_max_abs_jerk": 14.802,
+      "mean_rms_jerk": 1.616,
+      "worst_max_yaw_rate": 0.5006,
+      "min_center_dist_m": 3.025,
+      "obb_collision_steps": 0,
+      "min_ttc_s": 0.0,
+      "trajectories": {
+        "hero": {
+          "n_verts": 61,
+          "v_min": 0.013,
+          "v_max": 3.107,
+          "max_abs_acc": 0.994,
+          "max_abs_jerk": 2.67,
+          "rms_jerk": 0.659,
+          "max_yaw_rate": 0.0167,
+          "max_lat_acc": 0.029
+        },
+        "npc_track_40": {
+          "n_verts": 62,
+          "v_min": 0.018,
+          "v_max": 2.842,
+          "max_abs_acc": 1.659,
+          "max_abs_jerk": 3.915,
+          "rms_jerk": 0.997,
+          "max_yaw_rate": 0.5006,
+          "max_lat_acc": 1.408
+        },
+        "npc_track_99": {
+          "n_verts": 64,
+          "v_min": 0.105,
+          "v_max": 30.617,
+          "max_abs_acc": 7.285,
+          "max_abs_jerk": 14.802,
+          "rms_jerk": 3.485,
+          "max_yaw_rate": 0.1256,
+          "max_lat_acc": 3.827
+        },
+        "npc_track_83": {
+          "n_verts": 64,
+          "v_min": 0.441,
+          "v_max": 4.41,
+          "max_abs_acc": 1.745,
+          "max_abs_jerk": 4.401,
+          "rms_jerk": 1.122,
+          "max_yaw_rate": 0.5006,
+          "max_lat_acc": 0.693
+        },
+        "npc_track_155": {
+          "n_verts": 64,
+          "v_min": 0.208,
+          "v_max": 2.375,
+          "max_abs_acc": 3.225,
+          "max_abs_jerk": 10.288,
+          "rms_jerk": 1.816,
+          "max_yaw_rate": 0.5006,
+          "max_lat_acc": 1.189
+        }
+      },
+      "has_xodr": true,
+      "road_geometry": {
+        "road_start_s": -211.15374044176542,
+        "length": 447.20116039480854,
+        "curvature": -0.0030464873462997238,
+        "lane_width": 3.5,
+        "shoulder_width": 2.2,
+        "n_right_lanes": 2,
+        "n_left_lanes": 4
+      }
+    }
+  }
+}

@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 demo/dashcam_tracked_annotated.mp4
+
+reports/papers/
+demo/*_tracked_annotated.mp4
