@@ -1,0 +1,821 @@
+"""
+Executes a motion plan (agents/motion_planner.py) in CARLA:
+
+  net.xml -> OpenDRIVE map -> spawn actors from *_scene_obj.txt -> drive / walk them -> collision result
+
+  python -m agents.motion_runner <scene_id> [--out auto_result] [--no-map] [--hold 5]
+
+Files used/written in --out:  <scene_id>.net.xml, <scene_id>_scene_obj.txt, <scene_id>_motion.json (plan),
+<scene_id>_motion_result.json (outcome), <scene_id>_motion_ids.json (actors to clean up on the next run).
+"""
+import argparse
+import ast
+import json
+import math
+import os
+import time
+
+from agents.intercept import CutInConfig, CutInController
+from agents.road_frame import RoadFrame
+from agents.xosc_export import TRAJ_SUFFIX, TrajectoryRecorder
+
+VEHICLE_BLUEPRINTS = {
+    "bike": "vehicle.diamondback.century",
+    "motorcycle": "vehicle.harley-davidson.low_rider",
+    "car": "vehicle.dodge.charger",
+    "jeep": "vehicle.nissan.patrol",
+    "suv": "vehicle.nissan.patrol",
+    "van": "vehicle.sprinter.mercedes",
+    "truck": "vehicle.carlacola.actors",
+}
+DT = 0.05
+MAX_CONTACTS = 200      # contacts kept in the result (all of them are counted in contacts_total)
+LANE_WIDTH = 3.5
+CAR_LENGTH = 4.8
+
+
+def ttc(gap_m, closing_speed_ms):
+    """Time to collision; infinite when the gap does not close."""
+    if closing_speed_ms <= 0.0:
+        return math.inf
+    return max(gap_m, 0.0) / closing_speed_ms
+
+
+def rel_in_frame(dx, dy, yaw_deg):
+    """(forward, right) of a point (dx, dy) seen from an actor with the given CARLA yaw (+y is right at yaw 0)."""
+    yaw = math.radians(yaw_deg)
+    return dx * math.cos(yaw) + dy * math.sin(yaw), -dx * math.sin(yaw) + dy * math.cos(yaw)
+
+
+def crash_focus_transform(cx, cy, approach_yaw_deg, back_m=22.0, side_m=6.0, height_m=15.0):
+    """Compute spectator (x, y, z, pitch, yaw) behind/above (cx, cy) aiming directly at the crash site."""
+    rad = math.radians(approach_yaw_deg)
+    fx, fy = math.cos(rad), math.sin(rad)
+    rx, ry = -fy, fx
+    cam_x = cx - back_m * fx + side_m * rx
+    cam_y = cy - back_m * fy + side_m * ry
+    yaw = math.degrees(math.atan2(cy - cam_y, cx - cam_x))
+    pitch = math.degrees(math.atan2(0.8 - height_m, max(math.hypot(cx - cam_x, cy - cam_y), 1.0)))
+    return round(cam_x, 3), round(cam_y, 3), round(height_m, 3), round(pitch, 2), round(yaw, 2)
+
+
+def smooth_camera_pose(cur_pose, target_pose, alpha=0.12):
+    """Exponentially interpolate (x, y, z, pitch, yaw) with wrapped shortest-arc yaw."""
+    a = max(0.0, min(1.0, float(alpha)))
+    cx, cy, cz, cpitch, cyaw = cur_pose
+    tx, ty, tz, tpitch, tyaw = target_pose
+    dyaw = ((tyaw - cyaw + 180.0) % 360.0) - 180.0
+    dpitch = ((tpitch - cpitch + 180.0) % 360.0) - 180.0
+    return (
+        round(cx + a * (tx - cx), 3),
+        round(cy + a * (ty - cy), 3),
+        round(cz + a * (tz - cz), 3),
+        round(cpitch + a * dpitch, 2),
+        round(cyaw + a * dyaw, 2),
+    )
+
+
+def bgra_bytes_to_bgr(raw_bytes, width, height):
+    """Convert raw CARLA BGRA sensor bytes into a contiguous HxWx3 uint8 BGR frame."""
+    import numpy as np
+    arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((height, width, 4))
+    return arr[:, :, :3].copy()
+
+
+def _predict_point_and_yaw(actor, follower, speed_kmh, t_s):
+    loc = actor.get_location()
+    yaw0 = actor.get_transform().rotation.yaw
+    if follower is None or not follower.route or speed_kmh <= 0.1 or t_s <= 0.0:
+        return loc.x, loc.y, yaw0
+    rem = (float(speed_kmh) / 3.6) * float(t_s)
+    px, py, yaw = loc.x, loc.y, yaw0
+    for wp in follower.route:
+        wx, wy = wp.transform.location.x, wp.transform.location.y
+        seg = math.hypot(wx - px, wy - py)
+        if seg > 1e-6:
+            yaw = math.degrees(math.atan2(wy - py, wx - px))
+        if seg >= rem and seg > 1e-6:
+            f = rem / seg
+            return px + f * (wx - px), py + f * (wy - py), yaw
+        rem -= seg
+        px, py = wx, wy
+    return px, py, yaw
+
+
+def _predict_point_at(actor, follower, speed_kmh, t_s):
+    x, y, _ = _predict_point_and_yaw(actor, follower, speed_kmh, t_s)
+    return x, y
+
+
+def barrier_offsets(road_plan):
+    """Lateral offsets d (+ = left) of the barrier lines: just outside the shoulder, on the ego carriageway's outer edges."""
+    if not road_plan:
+        return []
+    lanes, shoulder = int(road_plan.get("lanes", 2)), float(road_plan.get("shoulder_m", 3.0))
+    out = []
+    if road_plan.get("edge_right") == "barrier":
+        out.append(-(lanes * LANE_WIDTH + shoulder + 0.3))
+    if road_plan.get("edge_left") == "barrier" and road_plan.get("one_way"):
+        out.append(shoulder + 0.3)       # with two carriageways the left side is the median, which gets no barrier
+    return out
+
+
+def spawn_barriers(world, bp_lib, road_plan, spawned_ids, step=4.0):
+    """Barrier props along the road edges that the plan marks as 'barrier'. Returns (placed, failed)."""
+    import carla
+    offsets = barrier_offsets(road_plan)
+    bps = bp_lib.filter("static.prop.streetbarrier")
+    if not offsets or not bps or not road_plan.get("centerline"):
+        return 0, 0
+    frame = RoadFrame(road_plan["centerline"])
+    placed = failed = 0
+    for d in offsets:
+        s_ = 0.0
+        while s_ <= frame.length:
+            x, y = frame.to_xy(s_, d)
+            p = world.try_spawn_actor(bps[0], carla.Transform(carla.Location(x, -y, 0.2), carla.Rotation(yaw=-frame.heading(s_))))
+            if p is None:
+                failed += 1
+            else:
+                placed += 1
+                spawned_ids.append(p.id)
+            s_ += step
+    return placed, failed
+
+
+def read_objects(obj_fn):
+    """*_scene_obj.txt holds two printed dict literals: agents and static objects (CARLA frame)."""
+    dicts = []
+    for line in open(obj_fn, encoding="utf-8"):
+        line = line.strip()
+        if line.startswith("{"):
+            dicts.append(ast.literal_eval(line))
+    if not dicts:
+        raise ValueError("no object dictionaries found in " + obj_fn)
+    return dicts[0], (dicts[1] if len(dicts) > 1 else {})
+
+
+class _RoutePoint:
+    """Minimal stand-in for a map waypoint: the route follower only needs transform.location."""
+
+    def __init__(self, loc):
+        import types
+        self.transform = types.SimpleNamespace(location=loc)
+
+
+def polyline_shift(spec):
+    """Shift (dx, dy) in the SUMO frame that the timing search applies to a polyline route (along its first segment)."""
+    pts = spec.get("polyline")
+    off = float(spec.get("offset_m", 0.0))
+    if not pts or not off or len(pts) < 2:
+        return 0.0, 0.0
+    dx, dy = pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]
+    d = math.hypot(dx, dy) or 1.0
+    return dx / d * off, dy / d * off
+
+
+def _to_carla(p):
+    return (float(p[0]), -float(p[1]))
+
+
+def _cleanup(client, ids_fn):
+    if os.path.exists(ids_fn):
+        old = json.load(open(ids_fn))
+        import carla
+        client.apply_batch([carla.command.DestroyActor(i) for i in old])
+        print(f"[motion] removed {len(old)} actors of the previous run")
+        time.sleep(1)
+
+
+def build_route(cmap, start_loc, targets, step=2.0, look=15, max_len=250.0):
+    """Waypoint route from start_loc through the target points. At every fork the branch is chosen by following
+    each candidate `look` steps ahead and keeping the one that ends closest to the current target."""
+    import carla
+    import math as _m
+    wp = cmap.get_waypoint(start_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+    route, length = [wp], 0.0
+    if wp.is_junction:
+        # Inside a junction several connecting lanes overlap. Pick the one that passes through the start position
+        # and leads toward the first target, then continue from its exit.
+        tgt0 = carla.Location(targets[0][0], targets[0][1], 0.0)
+        best, best_d = None, 1e9
+        for entry, _exit in wp.get_junction().get_waypoints(carla.LaneType.Driving):
+            poly, w = [entry], entry
+            while w.is_junction:
+                n = w.next(step)
+                if not n:
+                    break
+                w = n[0]
+                poly.append(w)
+            near = min(range(len(poly)), key=lambda k: poly[k].transform.location.distance(start_loc))
+            if poly[near].transform.location.distance(start_loc) > 2.5:
+                continue
+            tail = w
+            for _ in range(look):
+                n = tail.next(step)
+                if not n:
+                    break
+                tail = n[0]
+            d = tail.transform.location.distance(tgt0)
+            if d < best_d:
+                best, best_d = poly[near:], d
+        if best:
+            route = best
+            wp = route[-1]
+    for tx, ty in targets:
+        tgt = carla.Location(tx, ty, 0.0)
+        while length < max_len:
+            nxt = wp.next(step)
+            if not nxt:
+                break
+            if len(nxt) > 1:
+                best, best_d = None, 1e9
+                for cand in nxt:
+                    w = cand
+                    for _ in range(look):
+                        n = w.next(step)
+                        if not n:
+                            break
+                        w = n[0]
+                    d = w.transform.location.distance(tgt)
+                    if d < best_d:
+                        best, best_d = cand, d
+                wp = best
+            else:
+                wp = nxt[0]
+            route.append(wp)
+            length += step
+            if wp.transform.location.distance(tgt) < step * 1.5:
+                break
+    return route
+
+
+class RouteFollower:
+    """Route follower with road-vehicle limits: comfortable acceleration and braking, speed reduction in curves
+    (lateral acceleration limit), pedal and steering rate limits, brake-for-obstacle headway, and braking after a crash."""
+
+    ACC = 3.0            # m/s^2 comfortable acceleration of a passenger car
+    DEC = 3.5            # m/s^2 comfortable braking
+    DEC_EMERGENCY = 6.0  # m/s^2 emergency braking (measured: brake pedal 1.0 gives about 6.3 m/s^2 in CARLA)
+    A_LAT = 3.0          # m/s^2 comfortable lateral acceleration in curves
+    HEADWAY = 1.2        # s distance kept to an obstacle ahead when avoid=True
+
+    def __init__(self, vehicle, route, speed_kmh, avoid=False, step=2.0):
+        self.v, self.route, self.speed, self.avoid, self.step = vehicle, route, speed_kmh / 3.6, avoid, step
+        self.i = 0
+        self.thr = self.brk = self.str = 0.0
+        self.crash_time = None
+        try:
+            self.max_steer = math.radians(vehicle.get_physics_control().wheels[0].max_steer_angle)
+        except Exception:
+            self.max_steer = math.radians(70.0)
+        self.wheelbase = 2.8
+
+    def curve_speed(self):
+        """Speed that keeps lateral acceleration below A_LAT over the next ~30 m of the route."""
+        end = min(self.i + 15, len(self.route) - 2)
+        worst = 0.0
+        for k in range(self.i, end):
+            a = self.route[k].transform.location
+            b = self.route[k + 1].transform.location
+            c = self.route[k + 2].transform.location
+            h1 = math.atan2(b.y - a.y, b.x - a.x)
+            h2 = math.atan2(c.y - b.y, c.x - b.x)
+            dh = abs((h2 - h1 + math.pi) % (2 * math.pi) - math.pi)
+            ds = 0.5 * (math.hypot(b.x - a.x, b.y - a.y) + math.hypot(c.x - b.x, c.y - b.y))      # real point spacing
+            worst = max(worst, dh / max(ds, 0.5))
+        return max(3.0, math.sqrt(self.A_LAT / worst)) if worst > 1e-3 else 1e9
+
+    def pursuit_point(self, loc, spd, look, t_sim):
+        """Point on the route that the steering aims at."""
+        j = self.i
+        while j < len(self.route) - 1 and self.route[j].transform.location.distance(loc) < look:
+            j += 1
+        return self.route[j].transform.location
+
+    stop_at = None          # simulation time after which the vehicle brakes to a stop (braking lead vehicle)
+
+    def control(self, others, dt, now_abs, t_sim=0.0):
+        import carla
+        loc, yaw = self.v.get_location(), math.radians(self.v.get_transform().rotation.yaw)
+        # after a crash the driver brakes hard (reaction 0.4 s)
+        if self.crash_time is not None and now_abs - self.crash_time > 0.4:
+            self.thr, self.brk = 0.0, 1.0
+            return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+        while self.i < len(self.route) - 1 and self.route[self.i + 1].transform.location.distance(loc) <                 self.route[self.i].transform.location.distance(loc):
+            self.i += 1
+        spd = self.v.get_velocity().length()
+        look = max(5.0, 0.8 * spd)
+        tl = self.pursuit_point(loc, spd, look, t_sim)
+        alpha = math.atan2(tl.y - loc.y, tl.x - loc.x) - yaw
+        alpha = (alpha + math.pi) % (2 * math.pi) - math.pi
+        steer_t = math.atan2(2 * self.wheelbase * math.sin(alpha), max(look, 1.0)) / max(self.max_steer, 0.1)
+        steer_t = max(-1.0, min(1.0, steer_t))
+        self.str += max(-2.0 * dt, min(2.0 * dt, steer_t - self.str))     # steering rate limit (2 / s)
+
+        # target speed: planned speed, limited by curvature, stop at the route end
+        remaining = self.route[-1].transform.location.distance(loc)
+        target = min(self.speed, self.curve_speed())
+        if (remaining < spd * spd / (2 * self.DEC) + 2.0 and self.i >= len(self.route) - 3) or getattr(self, "ended", False):
+            target = 0.0
+            if self.i >= len(self.route) - 2 and remaining < 8.0:
+                self.ended = True                       # stay stopped once the end of the route is reached
+        dec = self.DEC
+        if self.stop_at is not None and t_sim >= self.stop_at:
+            target = 0.0
+            dec = self.DEC_EMERGENCY * 0.8
+        if self.avoid:
+            # nearest obstacle in the own lane corridor ahead; keep a 2 m gap with a comfortable braking curve
+            fx, fy = math.cos(yaw), math.sin(yaw)
+            best = None
+            for o in others:
+                ol = o.get_location()
+                rx, ry = ol.x - loc.x, ol.y - loc.y
+                ahead = rx * fx + ry * fy
+                lateral = -rx * fy + ry * fx
+                if 0.0 < ahead < 80.0 and abs(lateral) < 2.3:
+                    half = 1.0 if o.type_id.startswith("walker") else 2.4
+                    gap = ahead - half - 2.4
+                    if best is None or gap < best[0]:
+                        ov = o.get_velocity()
+                        best = (gap, max(0.0, ov.x * fx + ov.y * fy))
+            if best is not None:
+                gap, v_lead = best
+                gap -= 0.35 * spd                      # brakes need about 0.35 s to build up pressure
+                v_safe = v_lead + math.sqrt(2 * 2.5 * max(gap - 3.5, 0.0))
+                target = min(target, v_safe)
+                a_req = (spd * spd - v_lead * v_lead) / (2 * max(gap - 2.5, 0.1)) if spd > v_lead else 0.0
+                if a_req > dec:                        # comfortable braking is not enough: brake as hard as needed
+                    dec = min(self.DEC_EMERGENCY, a_req * 1.15)
+        a_des = max(-dec, min(self.ACC, (2.0 if target < spd else 1.2) * (target - spd)))
+        thr_t = max(0.0, min(1.0, 0.0145 * spd + 0.3 * max(a_des, 0.0))) if a_des > -0.2 else 0.0
+        brk_t = max(0.0, min(1.0, -a_des / 6.5)) if a_des < -0.3 else 0.0       # pedal 1.0 ~ 6.5 m/s^2
+        self.thr += max(-1.5 * dt, min(1.0 * dt, thr_t - self.thr))        # throttle slew
+        self.brk += max(-4.0 * dt, min(4.0 * dt, brk_t - self.brk))        # brake slew
+        return carla.VehicleControl(throttle=self.thr, steer=self.str, brake=self.brk, hand_brake=False)
+
+
+class InterceptFollower(RouteFollower):
+    """Cut-in car: steered from live positions by agents/intercept.CutInController instead of following a pre-computed path.
+    The route (along the source lane) is only used for the end-of-road stop; the contact feedback is the crash time."""
+
+    def __init__(self, vehicle, route, speed_kmh, ego, frame, controller):
+        super().__init__(vehicle, route, speed_kmh, False)
+        self.ego, self.frame, self.ctl = ego, frame, controller
+
+    def curve_speed(self):
+        return 1e9
+
+    def pursuit_point(self, loc, spd, look, t_sim):
+        import carla
+        el = self.ego.get_location()
+        s_e, d_e = self.frame.to_sd(el.x, -el.y)
+        s_m, d_m = self.frame.to_sd(loc.x, -loc.y)
+        d_t, v_t = self.ctl.update(t_sim, (s_e, d_e, self.ego.get_velocity().length()), (s_m, d_m, spd), self.crash_time is not None)
+        self.speed = v_t
+        x, y = self.frame.to_xy(s_m + look, d_t)
+        return carla.Location(x, -y, 0.0)
+
+
+def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost", port=2000, seed=0, record_video=None):
+    import carla
+    from agents.map_builder import build_and_load_map
+
+    if record_video is None:
+        env_rec = os.getenv("AS_RECORD_VIDEO")
+        record_video = bool(env_rec and env_rec != "0")
+    if record_video is True:
+        record_path = os.path.join(out_dir, f"{scene_id}_carla.mp4")
+    elif isinstance(record_video, str) and record_video:
+        record_path = record_video
+    else:
+        record_path = None
+
+    obj_fn = os.path.join(out_dir, f"{scene_id}_scene_obj.txt")
+    plan_fn = os.path.join(out_dir, f"{scene_id}_motion.json")
+    net_fn = os.path.join(out_dir, f"{scene_id}.net.xml")
+    ids_fn = os.path.join(out_dir, f"{scene_id}_motion_ids.json")
+    agents, statics = read_objects(obj_fn)
+    plan = json.load(open(plan_fn))
+
+    client = carla.Client(host, port)
+    client.set_timeout(120.0)
+    try:
+        client.get_world()
+    except RuntimeError as e:
+        raise RuntimeError("CARLA server not reachable on %s:%s (start the editor and press Play)" % (host, port)) from e
+
+    world = client.get_world()
+    if load_map:
+        world = build_and_load_map(client, net_fn, out_dir, plan.get("road"))
+    else:
+        _cleanup(client, ids_fn)
+    bp_lib = world.get_blueprint_library()
+    tm = client.get_trafficmanager()
+
+    try:
+        world.apply_settings(carla.WorldSettings(synchronous_mode=True, fixed_delta_seconds=DT, substepping=True,
+                                                 max_substep_delta_time=0.01, max_substeps=10))
+    except TypeError:
+        world.apply_settings(carla.WorldSettings(synchronous_mode=True, fixed_delta_seconds=DT))
+    tm.set_synchronous_mode(True)
+    tm.set_random_device_seed(seed)
+
+    actors, sensors, spawned_ids = {}, [], []
+    collisions, overflow, t0_abs = [], [0], [None]
+
+    def record_contact(ev, aid):
+        """Collision callback: one record per contact with the geometry the checker needs (all contacts, not just the first)."""
+        t = world.get_snapshot().timestamp.elapsed_seconds
+        rec = {"t": round(t, 2), "t_sim": round(t - t0_abs[0], 2) if t0_abs[0] is not None else 0.0, "actor": aid,
+               "other": ev.other_actor.type_id, "other_id": ev.other_actor.id, "impulse": round(ev.normal_impulse.length(), 1),
+               "impulse_vec": [round(ev.normal_impulse.x, 1), round(ev.normal_impulse.y, 1), round(ev.normal_impulse.z, 1)],
+               "ego_yaw": round(ev.transform.rotation.yaw, 1)}
+        try:
+            me, ot = ev.transform.location, ev.other_actor.get_location()
+            rec["rel"] = [round(v, 2) for v in rel_in_frame(ot.x - me.x, ot.y - me.y, ev.transform.rotation.yaw)]
+        except Exception:
+            rec["rel"] = None
+        if len(collisions) < MAX_CONTACTS:
+            collisions.append(rec)
+        else:
+            overflow[0] += 1
+
+    result = {"scene_id": scene_id, "outcome": "no_collision", "events": [], "plan_note": plan.get("note")}
+    cam_sensor, cam_q, cam_writer, last_frame = None, None, None, [None]
+
+    def _capture_tick():
+        if cam_q is None or cam_writer is None:
+            return
+        import queue
+        frame = None
+        while not cam_q.empty():
+            frame = cam_q.get_nowait()
+        if frame is None:
+            try:
+                frame = cam_q.get(timeout=0.5)
+            except queue.Empty:
+                frame = None
+        if frame is not None:
+            last_frame[0] = bgra_bytes_to_bgr(frame.raw_data, frame.width, frame.height)
+        if last_frame[0] is not None:
+            cam_writer.write(last_frame[0])
+
+    try:
+        # ---- spawn
+        for aid, a in agents.items():
+            x, y, z = a["location"]
+            yaw = a["rotation"][1]
+            if a["type"] == "pedestrian":
+                bp = bp_lib.filter("walker.pedestrian.*")[0]
+            else:
+                bp = bp_lib.find(VEHICLE_BLUEPRINTS[a["type"]])
+                color = plan["agents"].get(aid, {}).get("color")
+                if color and bp.has_attribute("color"):
+                    bp.set_attribute("color", color)
+            off = float(plan["agents"].get(aid, {}).get("offset_m", 0.0))
+            pspec = plan["agents"].get(aid, {})
+            if pspec.get("polyline") and off:
+                sx, sy = polyline_shift(pspec)
+                x, y = x + sx, y - sy                         # obj coordinates are CARLA frame (y negated)
+                off = 0.0
+            if off:                                          # timing search: move the spawn point along the lane
+                wp0 = world.get_map().get_waypoint(carla.Location(x, y, 0.0), project_to_road=True)
+                cand = wp0.next(off) if off > 0 else wp0.previous(-off)
+                if cand:
+                    x, y = cand[0].transform.location.x, cand[0].transform.location.y
+            actor = None
+            for zz in (z, 1.0, 0.5):                        # big vehicles may not fit at the generated height
+                actor = world.try_spawn_actor(bp, carla.Transform(carla.Location(x, y, zz), carla.Rotation(yaw=yaw)))
+                if actor is not None:
+                    break
+            if actor is None:
+                print(f"[motion] spawn failed for {aid}")
+                continue
+            actors[aid] = actor
+            spawned_ids.append(actor.id)
+        for oid, o in statics.items():
+            bps = bp_lib.filter("static.prop." + o["type"])
+            if bps:
+                x, y, z = o["location"]
+                p = world.try_spawn_actor(bps[0], carla.Transform(carla.Location(x, y, z), carla.Rotation(yaw=o["rotation"][1])))
+                if p is not None:
+                    spawned_ids.append(p.id)
+        n_bar, n_bar_failed = spawn_barriers(world, bp_lib, plan.get("road"), spawned_ids)
+        if n_bar or n_bar_failed:
+            print(f"[motion] barrier props: {n_bar} placed, {n_bar_failed} could not be spawned")
+        for aid, actor in actors.items():
+            if actor.type_id.startswith("vehicle"):
+                actor.apply_control(carla.VehicleControl(brake=1.0, hand_brake=True))
+                s = world.spawn_actor(bp_lib.find("sensor.other.collision"), carla.Transform(), attach_to=actor)
+                s.listen(lambda ev, aid=aid: record_contact(ev, aid))
+                sensors.append(s)
+                spawned_ids.append(s.id)
+        json.dump(spawned_ids, open(ids_fn, "w"))
+        id_of = {a.id: k for k, a in actors.items()}
+
+        for _ in range(10):          # in synchronous mode new actors report (0, 0) until the world has ticked
+            world.tick()
+        t0_abs[0] = world.get_snapshot().timestamp.elapsed_seconds      # scenario time zero for the contact records
+
+        # ---- behaviour
+        pa = plan["agents"]
+        ego = plan.get("ego") if plan.get("ego") in actors else next(iter(actors))
+        followers = {}
+        road_pl = plan.get("road") or {}
+        road_frame = RoadFrame(road_pl["centerline"]) if road_pl.get("centerline") else RoadFrame.straight()
+
+        def make_follower(aid, v, spec):
+            speed = float(spec.get("speed_kmh", 40))
+            ic = spec.get("intercept")
+            target = actors.get(ic.get("target", ego)) if ic else None
+            if ic and target is not None:
+                vl = v.get_location()
+                s0 = road_frame.to_sd(vl.x, -vl.y)[0]
+                route = []
+                s_ = s0
+                while s_ < road_frame.length - 2.0:
+                    x, y = road_frame.to_xy(s_, ic["lane_src_d"])
+                    route.append(_RoutePoint(carla.Location(x, -y, 0.0)))
+                    s_ += 2.0
+                cfg = CutInConfig(lane_src_d=float(ic["lane_src_d"]), lane_dst_d=float(ic["lane_dst_d"]), t_event_s=float(ic["t_event_s"]),
+                                  lead_s=float(ic.get("lead_s", 1.4)), aim_offset_m=float(ic.get("aim_offset_m", 0.0)))
+                return InterceptFollower(v, route, speed, target, road_frame, CutInController(cfg))
+            if spec.get("polyline"):
+                sx, sy = polyline_shift(spec)
+                route = [_RoutePoint(carla.Location(p_[0] + sx, -(p_[1] + sy), 0.0)) for p_ in spec["polyline"]]
+            else:
+                route = build_route(world.get_map(), v.get_location(), [_to_carla(pt) for pt in spec["path"]])
+            return RouteFollower(v, route, speed, bool(spec.get("avoid", False)))
+
+        for aid, spec in pa.items():
+            if aid in actors and spec["mode"] == "drive":
+                followers[aid] = make_follower(aid, actors[aid], spec)
+                followers[aid].stop_at = spec.get("stop_at_s")
+                print(f"[motion] {aid}: route of {len(followers[aid].route)} waypoints" + (" (closed-loop cut-in)" if spec.get("intercept") else ""))
+
+        # focus spectator camera smoothly along the approach and glide onto the impact site
+        ego_yaw = 0.0
+        cur_cam_pose = None
+        locked_cam_target = None
+        exp = plan.get("expect") or {}
+        exp_actors = exp.get("actors") or []
+
+        def _chase_target_pose():
+            if locked_cam_target is not None:
+                return locked_cam_target
+            if ego in actors and actors[ego].is_alive:
+                el = actors[ego].get_location()
+                ey = actors[ego].get_transform().rotation.yaw
+                spd_ego = float(pa.get(ego, {}).get("speed_kmh", 0.0))
+                if spd_ego >= 5.0:
+                    # Look slightly ahead of moving ego so crossing/cut-in vehicles stay centered
+                    rad = math.radians(ey)
+                    return crash_focus_transform(el.x + 8.0 * math.cos(rad), el.y + 8.0 * math.sin(rad), ey,
+                                                 back_m=16.0, side_m=0.0, height_m=7.5)
+                if len(exp_actors) >= 2 and exp_actors[0] in actors and exp_actors[1] in actors:
+                    la, lb = actors[exp_actors[0]].get_location(), actors[exp_actors[1]].get_location()
+                    return crash_focus_transform(0.5 * (la.x + lb.x), 0.5 * (la.y + lb.y), ey,
+                                                 back_m=16.0, side_m=0.0, height_m=7.5)
+                rad = math.radians(ey)
+                return crash_focus_transform(el.x + 12.0 * math.cos(rad), el.y + 12.0 * math.sin(rad), ey,
+                                             back_m=16.0, side_m=0.0, height_m=7.5)
+            return None
+
+        def _apply_cam_pose(pose):
+            tf = carla.Transform(carla.Location(pose[0], pose[1], pose[2]), carla.Rotation(pitch=pose[3], yaw=pose[4]))
+            world.get_spectator().set_transform(tf)
+            if cam_sensor is not None and cam_sensor.is_alive:
+                cam_sensor.set_transform(tf)
+
+        try:
+            ego_yaw = actors[ego].get_transform().rotation.yaw
+            cur_cam_pose = _chase_target_pose()
+            if cur_cam_pose is not None:
+                spec_tf = carla.Transform(
+                    carla.Location(cur_cam_pose[0], cur_cam_pose[1], cur_cam_pose[2]),
+                    carla.Rotation(pitch=cur_cam_pose[3], yaw=cur_cam_pose[4]),
+                )
+                world.get_spectator().set_transform(spec_tf)
+                if record_path:
+                    import queue, cv2
+                    cam_bp = bp_lib.find("sensor.camera.rgb")
+                    cam_bp.set_attribute("image_size_x", "1280")
+                    cam_bp.set_attribute("image_size_y", "720")
+                    cam_bp.set_attribute("fov", "90")
+                    cam_sensor = world.try_spawn_actor(cam_bp, spec_tf)
+                    if cam_sensor is not None:
+                        cam_q = queue.Queue()
+                        cam_sensor.listen(cam_q.put)
+                        sensors.append(cam_sensor)
+                        spawned_ids.append(cam_sensor.id)
+                        json.dump(spawned_ids, open(ids_fn, "w"))
+                        cam_writer = cv2.VideoWriter(record_path, cv2.VideoWriter_fourcc(*"mp4v"), round(1.0 / DT, 1), (1280, 720))
+                        print(f"[motion] recording CARLA spectator video -> {record_path}")
+        except Exception:
+            pass
+
+        def ref_ttc(trig):
+            ref = actors.get(trig.get("who", ego))
+            if ref is None:
+                return 1e9
+            px, py = _to_carla(trig["point"])
+            loc = ref.get_location()
+            spd = ref.get_velocity().length()
+            if spd < 1.0:
+                spd = max(float(pa.get(trig.get("who", ego), {}).get("speed_kmh", 30)) / 3.6, 1.0)
+            return math.hypot(loc.x - px, loc.y - py) / spd
+
+        started, wp_idx, start_time, trace = {}, {}, {}, []
+        walker_speed, peak = {}, {aid: {"long": 0.0, "lat": 0.0} for aid in followers}
+        min_pair = {}                                    # closest approach (centre to centre) of every pair of actors
+        # vehicles that are already driving when the scene begins start with their planned speed along the route;
+        # all others pull away from rest with the controller's acceleration limit
+        for aid, fol in followers.items():
+            if pa[aid].get("already_moving", False):
+                v = actors[aid]
+                v.apply_control(carla.VehicleControl(brake=0.0, hand_brake=False))
+                tl = fol.route[min(fol.i + 3, len(fol.route) - 1)].transform.location
+                vl = v.get_location()
+                dd = max(math.hypot(tl.x - vl.x, tl.y - vl.y), 1e-3)
+                sp = float(pa[aid].get("speed_kmh", 40)) / 3.6
+                v.set_target_velocity(carla.Vector3D((tl.x - vl.x) / dd * sp, (tl.y - vl.y) / dd * sp, 0.0))
+                started[aid], start_time[aid] = True, 0.0
+        t_end, first_hit = float(plan.get("duration_s", 15)), None
+        tick, printed = 0, 0
+        recorder = TrajectoryRecorder()                 # raw poses of every actor, every tick -> <scene>_trajectories.json
+        while tick * DT < t_end + 3.0:
+            now = tick * DT
+            for aid, spec in pa.items():
+                if aid not in actors or spec["mode"] == "static" or aid in started:
+                    continue
+                trig = spec.get("start") or {"type": "time", "t": 0.0}
+                go = (now >= float(trig.get("t", 0))) if trig["type"] == "time" else (ref_ttc(trig) <= float(trig.get("seconds", 2)))
+                if go:
+                    started[aid] = True
+                    start_time[aid] = round(now, 2)
+                    if spec["mode"] == "drive":
+                        actors[aid].apply_control(carla.VehicleControl(brake=0.0, hand_brake=False))   # pulls away from rest
+            now_abs = world.get_snapshot().timestamp.elapsed_seconds
+            for c in collisions[printed:]:
+                if c["actor"] == ego and not c["other"].startswith(("vehicle", "walker")):
+                    print(f"[motion] the ego car touched {c['other']} at {c['t_sim']} s")
+            printed = len(collisions)
+            for aid, fol in followers.items():            # a lead car that brakes when the ego car is about ttc_s away
+                bt = pa[aid].get("brake_trigger")
+                ref = actors.get(bt.get("who", ego)) if bt else None
+                if ref is not None and aid in started and fol.v.is_alive and ref.is_alive and (fol.stop_at is None or fol.stop_at > now):
+                    rl, ll, tf = ref.get_location(), fol.v.get_location(), ref.get_transform().get_forward_vector()
+                    ahead = (ll.x - rl.x) * tf.x + (ll.y - rl.y) * tf.y
+                    if ahead > 0.0:
+                        vr, vl = ref.get_velocity(), fol.v.get_velocity()
+                        closing = (vr.x - vl.x) * tf.x + (vr.y - vl.y) * tf.y
+                        if ttc(ahead - CAR_LENGTH, closing) <= float(bt.get("ttc_s", 2.0)):
+                            fol.stop_at = now
+            for c in collisions:                          # a vehicle that hit another vehicle or a pedestrian starts braking
+                f_ = followers.get(c["actor"])
+                if f_ is not None and f_.crash_time is None and c["other"].startswith(("vehicle", "walker")):
+                    f_.crash_time = c["t"]
+            for aid, fol in followers.items():
+                if aid in started and fol.v.is_alive:
+                    fol.v.apply_control(fol.control([a for k, a in actors.items() if k != aid and a.is_alive], DT, now_abs, now))
+            for aid, spec in pa.items():
+                if aid in actors and spec["mode"] == "walk" and aid in started:
+                    w = actors[aid]
+                    i = wp_idx.get(aid, 0)
+                    if i < len(spec["path"]):
+                        tx, ty = _to_carla(spec["path"][i])
+                        loc = w.get_location()
+                        dx, dy = tx - loc.x, ty - loc.y
+                        d = math.hypot(dx, dy)
+                        if d < 0.4:
+                            wp_idx[aid] = i + 1
+                        else:
+                            cur = walker_speed.get(aid, 0.0)           # pedestrians accelerate at about 1.5 m/s^2
+                            cur = min(float(spec.get("speed_ms", 1.4)), cur + 1.5 * DT)
+                            walker_speed[aid] = cur
+                            w.apply_control(carla.WalkerControl(direction=carla.Vector3D(dx / d, dy / d, 0.0), speed=cur))
+                    else:
+                        w.apply_control(carla.WalkerControl(speed=0.0))
+            world.tick()
+            _capture_tick()
+            tick += 1
+            recorder.record(tick * DT, actors)
+            alive = {k: a.get_location() for k, a in actors.items() if a.is_alive}
+            ks = sorted(alive)
+            for ia in range(len(ks)):
+                for ib in range(ia + 1, len(ks)):
+                    d_ = alive[ks[ia]].distance(alive[ks[ib]])
+                    key = ks[ia] + "-" + ks[ib]
+                    if d_ < min_pair.get(key, 1e9):
+                        min_pair[key] = d_
+            if tick % 10 == 0:                              # trace every 0.5 s: position and speed, None once destroyed
+                trace.append({"t": round(tick * DT, 2), **{k: ([round(a.get_location().x, 1), round(a.get_location().y, 1),
+                              round(a.get_velocity().length(), 1)] if a.is_alive else None) for k, a in actors.items()}})
+            hits = [c for c in collisions if not c["other"].startswith("static")
+                    or c["other"].startswith("static.prop")]
+            exp = plan.get("expect") or {}
+            exp_pair = set(exp.get("actors", [])) if exp.get("type") in ("collision", "near_miss") and len(exp.get("actors", [])) == 2 else None
+            if exp_pair is not None:
+                # the run ends 1.5 s after the expected event; other collisions are recorded but do not end it
+                hits = [c for c in collisions if {c["actor"], id_of.get(c["other_id"])} == exp_pair]
+            if hits and first_hit is None:
+                first_hit = now
+                try:
+                    c0 = hits[0]
+                    ha, hb = c0["actor"], id_of.get(c0["other_id"])
+                    if ha in actors and hb in actors and actors[ha].is_alive and actors[hb].is_alive:
+                        la, lb = actors[ha].get_location(), actors[hb].get_location()
+                        cur_yaw = actors[ego].get_transform().rotation.yaw if ego in actors and actors[ego].is_alive else ego_yaw
+                        locked_cam_target = crash_focus_transform(
+                            0.5 * (la.x + lb.x), 0.5 * (la.y + lb.y), cur_yaw, back_m=16.0, side_m=0.0, height_m=7.5)
+                except Exception:
+                    pass
+            try:
+                tgt_pose = _chase_target_pose()
+                if tgt_pose is not None:
+                    cur_cam_pose = tgt_pose if cur_cam_pose is None else smooth_camera_pose(cur_cam_pose, tgt_pose, alpha=0.14)
+                    _apply_cam_pose(cur_cam_pose)
+            except Exception:
+                pass
+            if not hits and now > 0.5:      # skip the start-up jump caused by the initial velocity
+                for aid, fol in followers.items():
+                    if aid in started and fol.v.is_alive:
+                        acc, tf = fol.v.get_acceleration(), fol.v.get_transform()
+                        fw, rt = tf.get_forward_vector(), tf.get_right_vector()
+                        peak[aid]["long"] = max(peak[aid]["long"], abs(acc.x * fw.x + acc.y * fw.y))
+                        peak[aid]["lat"] = max(peak[aid]["lat"], abs(acc.x * rt.x + acc.y * rt.y))
+            if first_hit is not None and now > first_hit + 1.5:
+                break
+
+        for c in collisions:
+            c["other_actor"] = id_of.get(c["other_id"], c["other"])
+        result["peak_accel_before_first_collision_ms2"] = {k: {a: round(b, 1) for a, b in v_.items()} for k, v_ in peak.items()}
+        result["min_pair_dist_m"] = {k: round(v, 2) for k, v in sorted(min_pair.items(), key=lambda kv: kv[1])[:12]}
+        result.update({"trace": trace, "events": collisions[:MAX_CONTACTS], "contacts_total": len(collisions) + overflow[0], "started_at_s": start_time, "sim_time_s": round(tick * DT, 2),
+                       "actors_spawned": sorted(actors), "ego": ego})
+        pair = [c for c in collisions if c["other"].startswith(("vehicle", "walker"))]
+        if pair:
+            result["outcome"] = "collision"
+            result["first_collision"] = pair[0]
+        elif collisions:
+            result["outcome"] = "contact_with_scenery"
+        # let the final scene stay visible while finishing any camera glide
+        for _ in range(int(hold_sec / DT)):
+            try:
+                tgt_pose = _chase_target_pose()
+                if tgt_pose is not None and cur_cam_pose is not None:
+                    cur_cam_pose = smooth_camera_pose(cur_cam_pose, tgt_pose, alpha=0.12)
+                    _apply_cam_pose(cur_cam_pose)
+            except Exception:
+                pass
+            world.tick()
+            _capture_tick()
+        result["actors_alive_at_end"] = sorted(k for k, a in actors.items() if a.is_alive)
+        for aid, a in actors.items():
+            if a.is_alive and a.type_id.startswith("vehicle"):
+                try:
+                    a.set_autopilot(False)
+                    a.apply_control(carla.VehicleControl(brake=1.0))
+                except RuntimeError:
+                    pass
+    finally:
+        if cam_writer is not None:
+            try:
+                cam_writer.release()
+                if record_path and os.path.exists(record_path):
+                    result["video_path"] = record_path
+            except Exception:
+                pass
+        for s in sensors:
+            try:
+                s.stop()
+            except Exception:
+                pass
+        try:
+            world.apply_settings(carla.WorldSettings(synchronous_mode=False, fixed_delta_seconds=0.0))
+            tm.set_synchronous_mode(False)
+        except Exception as e:
+            print("[motion] could not restore asynchronous mode:", e)
+    res_fn = os.path.join(out_dir, f"{scene_id}_motion_result.json")
+    json.dump(result, open(res_fn, "w"), indent=1)
+    try:                                                # a failed export must never lose the run result
+        meta = {aid: {"type": a["type"], "blueprint": actors[aid].type_id if aid in actors else None,
+                      "color": plan["agents"].get(aid, {}).get("color")} for aid, a in agents.items()}
+        recorder.save(os.path.join(out_dir, scene_id + TRAJ_SUFFIX), meta, DT)
+        print(f"[motion] trajectories -> {scene_id}{TRAJ_SUFFIX}  (python -m agents.xosc_export {out_dir} {scene_id})")
+    except Exception as e:
+        print("[motion] could not save trajectories:", e)
+    print(f"[motion] outcome: {result['outcome']}  ({res_fn})")
+    return result
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("scene_id")
+    ap.add_argument("--out", default="auto_result")
+    ap.add_argument("--no-map", action="store_true", help="keep the currently loaded CARLA map")
+    ap.add_argument("--hold", type=float, default=5.0)
+    ap.add_argument("--record", action="store_true", help="save crash-focused spectator camera video")
+    args = ap.parse_args()
+    run_motion(args.out, args.scene_id, load_map=not args.no_map, hold_sec=args.hold, record_video=args.record)

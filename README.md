@@ -1,135 +1,189 @@
-# CARLA 1.0 + ScenarioRunner 1.0 & Monocular Dashcam Video-to-OpenSCENARIO (`.xosc`) Pipeline
+# AutoScenario
 
-This repository contains the complete setup, research survey, and working open-source pipeline for converting a monocular dashcam video clip into an ASAM OpenSCENARIO 1.0 (`.xosc`) scenario and replaying it in **CARLA 1.0 (Unreal Engine 5.8)** via **ScenarioRunner 1.0**.
+## Overview
+**AutoScenario** is an automated framework designed to improve the safety and reliability of **autonomous vehicle (AV) systems** through **realistic corner case generation**. Leveraging a **multimodal Large Language Model (LLM)**, it transforms **safety-critical real-world data** into structured scenario representations, enabling **generalization of key risk factors** for robust AV validation.
 
----
-
-## 1. Environment Check (Step 0)
-
-| Component | Detected Value | CARLA 1.0 Requirement | Status |
-|---|---|---|---|
-| **OS** | Microsoft Windows 11 Pro 64-bit (`10.0.26300`) | Windows 11 64-bit or Ubuntu 22.04/24.04 | **PASS** |
-| **System RAM** | 31.76 GB total (~19.3 GB free) | 16–32 GB recommended | **PASS** |
-| **GPU** | AMD Radeon RX 9060 XT (`0x7590`) | Dedicated GPU with 6–8+ GB VRAM | **PASS** |
-| **GPU Driver** | `32.0.32015.7029` | Modern DX12 / Vulkan driver | **PASS** |
-| **VRAM** | **15.92 GB** (`17,095,983,104` bytes via registry `HardwareInformation.qwMemorySize`; note WMI `Win32_VideoController.AdapterRAM` is a 32-bit uint capped at 4 GB) | 6–8 GB min (12–16 GB recommended for UE5) | **PASS** |
-| **Disk Space** | 363.84 GB free on `C:` (prior to install) | ~20–30 GB free | **PASS** |
-| **Python** | Python `3.14.10` (`C:\Users\adamk\AppData\Local\Programs\Python\Python314\python.exe`) | Python 3.10–3.15 (CARLA 1.0 ships cp310–cp315 wheels) | **PASS** |
-
-> **Note on AMD GPU & Off-Screen Rendering:** Because this machine uses an AMD Radeon RX 9060 XT (no CUDA/NVIDIA DLSS hardware), the server is run with `-RenderOffScreen -quality-level=Low`. On CARLA 1.0 (UE 5.8), `-quality-level=Low` retains full view distance and simulation geometry while disabling hardware ray tracing, booting to RPC readiness in ~12 seconds. (Avoid `-nullrhi` when spawning RGB cameras, as UE 5.8 requires an active RHI render target for camera sensor readback.)
+By integrating with **Simulation of Urban Mobility (SUMO) and CARLA**, AutoScenario automates **scenario generation, execution, and evaluation**, ensuring diverse and challenging test cases for AV systems. The framework supports **multimodal inputs(Text, Image and Video)**, making it an adaptable approach to **simulating rare and high-risk driving conditions**.
 
 ---
 
-## 2. Installed Components & Paths (Step 1)
-
-* **CARLA Simulator**: **CARLA `1.0`** (Latest official stable release, published 2026-11-17, Unreal Engine 5.8, commit `3ea166118d2c3c094b13b15c5b7a66a9a279998d`)
-  * Path: `C:\Users\adamk\.gemini\antigravity\scratch\carla-video-to-xosc\CARLA_1.0\Carla-1.0-Win64-Shipping`
-  * Additional Maps Pack: `AdditionalMaps_1.0.tar.gz` installed via `Tools\carla_pack.py` into `CarlaUnreal\Packs\AdditionalMaps` (adds `Town01_Opt`–`Town07_Opt`, `Town11`, `Town13`, `Town_C`, `Eixample`, `Mine_01` alongside base maps `Town10HD_Opt`, `Town12`, `Town15`, `EmptyMap`).
-* **Python Virtual Environment**: `C:\Users\adamk\.gemini\antigravity\scratch\carla-video-to-xosc\.venv` (Python `3.14.10`)
-  * CARLA Python API Wheel: `carla-1.0-cp314-cp314-win_amd64.whl` (from `PythonAPI\carla\dist\`)
-  * Core Packages: `carla==1.0`, `py-trees==2.6.0`, `xmlschema==1.0.18`, `antlr4-python3-runtime==4.9.3`, `pygame-ce==2.5.8`, `scenariogeneration==0.15.1`, `yt-dlp==2026.10.26`, `ultralytics==8.4.215`, `torch==2.15.0`, `opencv-python==5.1.0.95`, `scipy==1.18.1`, `transformers==5.23.0`, `lap==0.5.14`.
-* **CARLA ScenarioRunner**: **ScenarioRunner `v1.0`** (`ue58-dev` branch, commit `23c4db61652a2880f09a048b273011ad60628712`, published 2026-11-06)
-  * Path: `C:\Users\adamk\.gemini\antigravity\scratch\carla-video-to-xosc\scenario_runner`
-  * OpenSCENARIO Support:
-    * **OpenSCENARIO 1.0 (`.xosc`)** via `--openscenario` (XML Storyboard/Act/Maneuver/Event/Action format, validated against `srunner/openscenario/OpenSCENARIO.xsd` with `xmlschema==1.0.18`).
-    * **OpenSCENARIO 2.0 (`.osc`)** via `--openscenario2` (ANTLR 4.9.3 DSL parser under `srunner/osc2/`).
-
-### Verified Fixes Applied for Windows + Python 3.14 + ScenarioRunner 1.0
-
-During live verification, two upstream bugs were encountered and fixed (automated in `setup.sh`):
-
-1. **`xmlschema==1.0.18` on Python 3.13/3.14 Windows (`URLError: [WinError 123] ... 'C:\\c:\\Users\\...'`)**:
-   * In Python 3.13+, `os.path.isabs('/c:/Users/...')` returns `False` on Windows, causing `xmlschema.resources.normalize_url()` to call `os.path.abspath('/c:/Users/...')`, which prepends `C:\` a second time (`C:\c:\Users\...`).
-   * **Fix**: Patched `.venv/Lib/site-packages/xmlschema/resources.py` (`normalize_url` and `filter_url`) to recognize `/c:/...` as absolute and strip duplicate drive prefixes.
-2. **ScenarioRunner `v1.0` OpenSCENARIO 1.0 (`py_trees==2.6.0` migration omissions)**:
-   * `srunner/tools/openscenario_parser.py`: Restored `RunningStopTest`, `RunningRedLightTest`, `WrongLaneTest`, `OnSidewalkTest`, `KeepLaneTest`, `DrivenDistanceTest`, etc. imports accessed dynamically via `globals()` (line 43), and replaced `blackboard.get(variable_name)` with `get_blackboard(variable_name)` (line 73).
-   * `srunner/scenarios/open_scenario.py`: Replaced legacy `py_trees 0.8` `self.blackboard.set(name=..., value=..., overwrite=True)` calls with `set_blackboard(key, val)`.
-   * `srunner/scenariomanager/scenarioatomics/atomic_trigger_conditions.py`: Replaced `self._blackboard.get(blackboard_variable_name)` in `OSCStartEndCondition.update()` with `get_blackboard(blackboard_variable_name)`.
+## Key Features
+- 🚗 **Realistic Corner Case Generation**  
+  Uses **LLMs** to synthesize **high-risk driving scenarios** from real-world data.  
+- 📡 **Multimodal Input Processing**  
+  Converts **Multimodal data or scene descriptions** into structured scenario representations.  
+- 🏙 **Seamless Integration with SUMO & CARLA**  
+  Automates the creation of AV test scenarios in standard simulators.  
+- 📊 **Scenario Evaluation & Analysis**  
+  Provides  **performance metrics** for generated scenarios.  
 
 ---
 
-## 3. Survey of Dashcam/Video-to-OpenSCENARIO & CARLA Tools (Step 2)
+## Installation
+### Prerequisites
+- Python 3.8+
+- **Recommended**: Use a virtual environment (Conda or virtualenv)
 
-| Rank | Tool / Paper Name | Repo / Paper Link | Last Commit / Date | License | Code Released? | Output Format | CARLA Support | Input Requirements | Runs w/o Proprietary Data? |
-|---|---|---|---|---|---|---|---|---|---|
-| **1** | **From Dashcam Videos to Driving Simulations: Stress Testing Automated Vehicles against Rare Events** (Miao et al., ASU / Toyota / UIUC) | [arXiv:2411.16027v2](https://arxiv.org/abs/2411.16027v2) | Nov 2024 (Paper) | N/A (No repo) | **No** (Paper only) | **Scenic** (`.scenic`) scripts via VLM prompting (not `.xosc`) | CARLA 0.9.x (via Scenic) | Plain monocular dashcam crash video | Requires proprietary VLM API (GPT-4o) |
-| **2** | **DeepCrashTest: Turning Dashcam Videos into Virtual Crash Tests for Automated Driving Systems** (Bashetty et al., ASU) | [arXiv:2003.11766](https://arxiv.org/abs/2003.11766) / [C-Aniruddh/deepcrashtest_v2](https://github.com/C-Aniruddh/deepcrashtest_v2) | Oct 2022 (`deepcrashtest_v2` placeholder) | Unspecified | **No** (`README.md` only: *"Code coming soon"*) | Custom trajectory waypoints for **Webots / Sim-ATAV** (not `.xosc`) | None (Webots) | Uncalibrated monocular dashcam video | Yes (if re-implemented) |
-| **3** | **Dash2Sim: Closed-Loop Driving Simulation from in-the-wild Dashcam Videos** (Ghosh et al., CMU / NEC) | [arXiv:2606.07366](https://arxiv.org/abs/2606.07366) | Jun 2026 (Paper) | N/A (No repo) | **No** (Dataset `ROADWork4D` & paper only) | **nuPlan** 4D driving log + OpenStreetMap alignment (not `.xosc`) | None (nuPlan) | Monocular in-the-wild dashcam video | Yes (uses OSM) |
-| **4** | **scenariogeneration (`pyoscx`)** + **Scenic** | [pyoscx/scenariogeneration](https://github.com/pyoscx/scenariogeneration) / [Scenic-Foundation/Scenic](https://github.com/Scenic-Foundation/Scenic) | Nov 2026 (Active) | MPL-2.0 / BSD-3-Clause | **Yes** (PyPI `scenariogeneration`, `scenic`) | **OpenSCENARIO 1.x (`.xosc`)** & OpenDRIVE (`.xodr`) / `.scenic` | CARLA 0.9.x–1.0 (via ScenarioRunner) | Extracted 3D trajectories / programmatic definitions (needs CV front-end for video) | **Yes** |
-| **5** | **CARLA 1.0 NVIDIA NuRec Integration** (`PythonAPI/examples/nvidia/nurec`) | Bundled in [CARLA 1.0](https://github.com/carla-simulator/carla/releases/tag/1.0) | Nov 2026 | MIT (client) / NVIDIA NGC | **Yes** (in CARLA 1.0 package) | NuRec `.usdz` neural scene + OpenDRIVE `.xodr` + actor tracks | CARLA 1.0 (UE 5.8) | Multi-sensor calibrated fleet logs reconstructed into `.usdz` (not plain YouTube video); requires NVIDIA GPU + Docker NGC container | Yes (public HF sample dataset `nvidia/PhysicalAI-Autonomous-Vehicles-NuRec`) |
-| **6** | **ScenarioNet** (Li et al., MetaDrive / UCLA) | [metadriverse/scenarionet](https://github.com/metadriverse/scenarionet) / [arXiv:2306.12241](https://arxiv.org/abs/2306.12241) | Mar 2026 | Apache-2.0 | **Yes** | MetaDrive `.pkl` scenario description | None (MetaDrive) | Multi-sensor AV logs with 3D boxes & HD maps (Waymo, nuScenes, nuPlan) | Yes |
-| **7** | **AC3R: Automatically Reconstructing Car Crashes from Police Reports** (Huynh et al.) | [TriHuynh00/AC3R-Demo](https://github.com/TriHuynh00/AC3R-Demo) | Apr 2023 | Unspecified | **Yes** (Java prototype) | BeamNG.tech scenario JSON | None (BeamNG) | Structured police crash reports (text/NLP, not video) | Yes |
+### **Step 1: Create & Activate Virtual Environment (Recommended)**
+Using **Conda**:
+```sh
+conda create --name autoscenario python=3.8
+conda activate autoscenario
+```
+Or using **virtualenv**:
+```sh
+python -m venv autoscenario
+source autoscenario/bin/activate  # On macOS/Linux
+autoscenario\Scripts\activate     # On Windows
+```
 
-### Conclusion of Tool Survey
-No maintained, ready-made open-source tool takes a raw, uncalibrated monocular YouTube dashcam video and directly outputs an ASAM OpenSCENARIO (`.xosc`) file for CARLA. The three closest academic systems (*From Dashcam Videos to Driving Simulations*, *DeepCrashTest*, and *Dash2Sim*) have not released working source code and target Scenic, Webots, or nuPlan respectively. Therefore, **Step 3** implements a clean, modular open-source pipeline (`video_to_xosc.py`) connecting maintained CV components to CARLA ScenarioRunner's `.xosc` execution engine.
-
----
-
-## 4. Minimal Open-Source Pipeline Design & Glue Code (`video_to_xosc.py`, Step 3)
-
-| Stage | Component / Library Used | Glue Code Written in `video_to_xosc.py` |
-|---|---|---|
-| **a) Video Download** | `yt-dlp` (`2026.10.26`) | `download_youtube_clip()`: wraps `yt-dlp` CLI to fetch a $\le 720\text{p}$ MP4 stream (with ToS/copyright reminder). |
-| **b) 2D Detection & Multi-Object Tracking** | `ultralytics` (`8.4.215`) **YOLO11m/n** + **ByteTrack** (`bytetrack.yaml`) | Detects both vehicles (`car`, `motorcycle`, `bus`, `truck`) and vulnerable road users / wildlife (`person`, `bicycle`, `dog`, `horse`, `cow`, `sheep`, `bear`), detects multi-camera scene cuts (e.g. TeslaCam front-to-side repeater cuts), and detects short-duration looming frontal collision obstacles. |
-| **c) Monocular Metric Depth & Ego-Motion** | Pinhole Width + Ground-Plane Depth Fusion + OpenCV Pyramidal Lucas-Kanade Optical Flow VO | Estimates ego yaw rate and forward speed (allowing full deceleration to `0.0 m/s`), auto-detects night scenes (`sky_mean < 65`) and oncoming headlights, and reconstructs emergency braking + shoulder pull-over trajectories after collision impact. |
-| **d) Road Layout & CARLA Map Projection** | `carla` Python API (`1.0`) Waypoint Graph | `project_frenet_to_carla_map()`: connects to CARLA, finds a continuous multi-lane highway corridor on `Town04_Opt` where both left and right adjacent lanes are driving lanes, and maps Frenet coordinates $(s(t), d(t))$ onto CARLA world transforms $(x, y, z, \text{yaw})$. |
-| **e) OpenSCENARIO 1.0 (`.xosc`) Generation** | `xml.etree.ElementTree` + `xmlschema` (`1.0.18`) | `write_openscenario_xosc()`: emits `<FileHeader description="CARLA:..." revMajor="1" revMinor="0"/>`, spawns `hero`, vehicles, and `<Pedestrian>` collision obstacles via `<TeleportAction>`, writes `<FollowTrajectoryAction>` polylines paired with time-triggered `<SpeedAction>` events (including full stops at `0.0 m/s`), and validates against `srunner/openscenario/OpenSCENARIO.xsd`. |
-| **f) Replay in CARLA** | `run_replay.py` (`scenario_runner.py` + `record_carla_replay.py`) | Single-command launcher that executes the `.xosc` in CARLA 1.0, moves the CARLA window spectator camera to follow `hero`, enables vehicle headlights & impact ragdoll physics, and records `demo/carla_replay_dashcam.mp4` + `demo/carla_replay_telemetry.json`. |
+### **Step 2: Install Dependencies**
+Once the virtual environment is activated, install the required dependencies:
+```sh
+pip install -r requirements.txt
+```
+If you have not installed **CARLA** yet, please follow the official installation guide here:  
+👉 [**CARLA Quick Start Guide**](https://carla.readthedocs.io/en/latest/start_quickstart/)
 
 ---
 
-## 5. Exact Commands to Run Everything
+## **Usage**
+### **Step 1: Set Up API Key and Configuration**
+Before running simulations, configure your API key:
 
-```powershell
-$workDir = "C:\Users\adamk\.gemini\antigravity\scratch\carla-video-to-xosc"
-$carlaRoot = "$workDir\CARLA_1.0\Carla-1.0-Win64-Shipping"
-$srRoot = "$workDir\scenario_runner"
-$env:CARLA_ROOT = $carlaRoot
-$env:SCENARIO_RUNNER_ROOT = $srRoot
-$env:PYTHONPATH = "$carlaRoot\PythonAPI\carla;$srRoot"
+1. **Copy the example configuration file:**
+   ```sh
+   cp config.example .env
+   ```
 
-# 1. Start CARLA 1.0 Server (Off-Screen, Low Quality)
-Start-Process -FilePath "$carlaRoot\CarlaUnreal\Binaries\Win64\CarlaUnreal-Win64-Shipping.exe" `
-    -ArgumentList "CarlaUnreal", "-RenderOffScreen", "-quality-level=Low" `
-    -WorkingDirectory $carlaRoot
+2. **Edit the `.env` file** with your actual API credentials:
+   ```
+   OPENAI_KEY=your-openai-api-key-here
+   OPENAI_URL=https://api.openai.com/v1/chat/completions
+   OPENAI_MODEL=gpt-4o
+   OPENAI_MAX_TOKENS=2000
+   OPENAI_TIMEOUT=30
+   ```
+3. Save the file in the project root directory.
 
-# 2. Run Bundled ScenarioRunner OpenSCENARIO 1.0 Example (FollowLeadingVehicle.xosc)
-Start-Process -FilePath "$workDir\.venv\Scripts\python.exe" -ArgumentList "$workDir\drive_hero_headless.py" -NoNewWindow
-& "$workDir\.venv\Scripts\python.exe" "$srRoot\scenario_runner.py" `
-    --openscenario "$srRoot\srunner\osc_examples\FollowLeadingVehicle.xosc" --output
+---
 
-# 3. Convert Dashcam Video Clip to OpenSCENARIO 1.0 (.xosc)
-& "$workDir\.venv\Scripts\python.exe" "$workDir\video_to_xosc.py" `
-    --video "$workDir\demo\dashcam_input.mp4" `
-    --town "Town04_Opt" `
-    --output-xosc "$workDir\demo\dashcam_reconstructed.xosc" `
-    --output-json "$workDir\demo\reconstructed_trajectories.json" `
-    --xsd "$srRoot\srunner\openscenario\OpenSCENARIO.xsd"
+### **Step 2: Run the Main Simulation**
+You can run different **scenario generation modes** based on your input type(- Test samples can be found in the **data** folder):
 
-# 4. Replay Reconstructed OpenSCENARIO (.xosc) in CARLA 1.0 & Record Replay Dashcam Video
-Start-Process -FilePath "$workDir\.venv\Scripts\python.exe" -ArgumentList "$workDir\record_carla_replay.py" -NoNewWindow
-& "$workDir\.venv\Scripts\python.exe" "$srRoot\scenario_runner.py" `
-    --openscenario "$workDir\demo\dashcam_reconstructed.xosc" --output
+#### **Command-Based Generation**
+```sh
+python experiments/auto_generate_all_command.py
+```
+#### **Long-Text-Based Generation**
+```sh
+python experiments/auto_generate_all_text.py
+```
+#### **Image-Based Generation**
+```sh
+python experiments/auto_generate_all_vlm.py
+```
+#### **Video-Based Generation**
+```sh
+python experiments/auto_generate_all_video.py
+```
+
+
+### Run Scenario Evaluations
+```sh
+python evaluation/general_evaluator.py
+```
+
+
+
+---
+
+## Project Structure
+```
+/AutoScenario
+│── agents/           # Core source code for AV agents
+│── experiments/      # Experiment scripts for scenario testing
+│── tools/            # Utility and evaluation scripts
+│── data/             # Multimodal input datasets
+│── requirements.txt  # Python dependencies
+│── .gitignore        # Git ignore rules
+│── LICENSE           # Open-source license
+│── README.md         # Project documentation
 ```
 
 ---
 
-## 6. Realistic Pipeline v2 (`src/xosc_pipeline/`), Configuration & Testing
+## Contributing
+We welcome contributions! 🚀  
+To contribute, please follow these steps:
 
-The pipeline has been refactored into a typed, modular architecture (`src/xosc_pipeline/`) driven by `config/default.yaml`:
-- **Calibration (`calibration.py`)**: aspect-ratio-aware intrinsics, Canny+Hough vanishing-point horizon estimation, and inverse-variance ground-plane + width monocular 3D fusion.
-- **Tracking & VO (`tracking.py`)**: YOLO11 + **BoT-SORT** (with Camera Motion Compensation), RANSAC + radial-FOE visual odometry, and post-hoc **tracklet stitching** across brief occlusions.
-- **Kinematics & Deconfliction (`kinematics.py`)**: rolling MAD outlier rejection, **Rauch-Tung-Striebel (RTS)** constant-acceleration Kalman smoother, **bicycle-model** kinematic feasibility limits (`v`, `a`, `jerk`, `yaw_rate`), bounded boundary extrapolation, and multi-timestamp Frenet/OBB deconfliction.
-- **Road Network (`road_network.py`)**: automatic lane-count & curvature estimation, **ASAM OpenDRIVE 1.4 (`.xodr`)** generation, and both live CARLA and deterministic `--offline` projection.
-- **OpenSCENARIO 1.0 (`xosc_writer.py`)**: logical scenario parameterization (`<ParameterDeclarations>`), class-accurate vehicle/pedestrian dimensions, axles, and `<Performance>` limits, 4 Hz `<Polyline>` trajectories, linear `<SpeedAction>`, and strict XSD validation.
+1. **Fork the repository** 📌  
+2. **Create a new branch** (`feature-branch`) 🔀  
+3. **Commit your changes** (`git commit -m "Add feature X"`) ✅  
+4. **Push to your branch** (`git push origin feature-branch`) ⏫  
+5. **Create a Pull Request (PR)** 📝  
 
-```powershell
-# Run offline without CARLA server (outputs .xosc + .xodr + .json)
-& "$workDir\.venv\Scripts\python.exe" "$workDir\video_to_xosc.py" `
-    --video "$workDir\demo\dashcam_input.mp4" --offline --config "$workDir\config\default.yaml"
+---
 
-# Run automated unit & integration tests
-& "$workDir\.venv\Scripts\python.exe" -m pytest -v tests/
+## Citation
+If you use **AutoScenario** in your research or projects, please cite us:  
+📄 **Qiujing Lu, Meng Ma, Ximiao Dai, Xuanhan Wang, and Shuo Feng.**  
+*"Realistic Corner Case Generation for Autonomous Vehicles with Multimodal Large Language Model."*  
+**arXiv preprint arXiv:2412.00243 (2024).**  
+
+```bibtex
+@article{lu2024realistic,
+  title={Realistic Corner Case Generation for Autonomous Vehicles with Multimodal Large Language Model},
+  author={Lu, Qiujing and Ma, Meng and Dai, Ximiao and Wang, Xuanhan and Feng, Shuo},
+  journal={arXiv preprint arXiv:2412.00243},
+  year={2024}
+}
 ```
 
-See `docs/audit.md`, `docs/plan.md`, `docs/assumptions.md`, `references.bib`, `reports/evaluation/`, and `reports/research_and_changes.pdf` for the complete research survey, audit, and before/after evaluation.
+Your citation **supports our work** and helps improve **future development** of AutoScenario! 🚀
+
+---
+
+## License
+This project is **open-source** and licensed under the **MIT License**. See the `LICENSE` file for details.
+
+---
+
+## Contact & Support
+💬 **For issues or collaborations, please:**  
+- **Open an issue** on GitHub  
+- **Reach out to the maintainers**  
+
+🚀 **Let’s build safer AV systems together!** 🚗💨  
+
+## Movement stage (added)
+After the object layout and scene generation, `agents/motion_stage.py` adds what the public repo lacks: movement.
+1. `agents/motion_planner.py` asks the LLM for a JSON motion plan (mode, speed, path, start trigger per actor) -> `<scene>_motion.json`.
+2. `agents/map_builder.py` exports the SUMO net to OpenDRIVE (signals moved off the lanes) and loads it in CARLA.
+3. `agents/motion_runner.py` spawns the actors from `<scene>_scene_obj.txt`, drives them along waypoint routes with a pure-pursuit
+   controller, walks pedestrians, records collisions -> `<scene>_motion_result.json`.
+Every experiment script calls `run_motion_stage(output_folder, scene_id)` at the end. `AS_MOTION=0` skips it, `AS_MOTION_RUN=0` only
+writes the plan (no CARLA needed), `AS_MOTION_MAP=0` keeps the currently loaded map. Standalone: `python -m agents.motion_runner <scene_id> --no-map`.
+
+Driving physics of the runner: acceleration limited to 3 m/s^2, braking 3.5 m/s^2 (6 m/s^2 emergency, the measured limit of the CARLA brakes), speed reduced in curves to
+keep lateral acceleration below 3 m/s^2, throttle/brake/steering rate limits, physics substepping (0.01 s), pedestrians accelerate
+at 1.5 m/s^2, vehicles brake hard 0.4 s after a crash. Vehicles flagged `already_moving` start with their planned speed, all others pull
+away from rest. `<scene>_motion_result.json` reports the peak acceleration of each vehicle before the first collision.
+
+## Standard OpenSCENARIO export (added)
+`agents/motion_runner.py` also records the pose of every actor at every tick -> `<scene>_trajectories.json` (raw CARLA frame).
+`python -m agents.xosc_export <folder> <scene_id> [--dt 0.1] [--hold 0.3] [--xsd tests/fixtures/OpenSCENARIO.xsd]` turns it into
+`<scene>.xosc` (OpenSCENARIO 1.0, replayable with CARLA ScenarioRunner, ego named `hero`, road network `<scene>.xodr`):
+- `agents/traj_smoothing.py` (ported from carla-video-to-xosc): Hampel outlier filter, RTS Kalman smoothing of x(t) and y(t), then speed, acceleration, braking, jerk and cornering limits per vehicle class. The path shape is kept, only the timing along it changes.
+- `agents/xosc_writer.py`: schema-valid writer, one timed `Polyline` trajectory per actor. Validated against `tests/fixtures/OpenSCENARIO.xsd` (ASAM, 1.0.0).
+- The recording is cropped 0.3 s after the first contact of the expected pair: motion after an impact is not drivable behaviour.
+- Static props (barriers, parked objects) are not exported yet.
+
+## Road shape, traffic and contact checking (added)
+`python -m agents.local_pipeline <video> --out <folder>` builds the scene from the video without any hand editing:
+- `agents/road_curve.py` measures the road bend from the ego yaw rate (optical flow of the far field + the speed overlay); the road is straight when the estimate is weak or the model's left/right answer disagrees. `agents/road_probes.py` reads vehicles per lane, the road edges (barrier / shoulder / open) and one-way vs two-way from the frames, and searches the crash moment coarse-to-fine.
+- `agents/scene_builder.py` places everything in road coordinates (`agents/road_frame.py`), so lanes, traffic, the cutting car and the ego route follow the curve. Measured traffic is queued ahead (never in the crash corridor, at most 12 vehicles).
+- The cutting car is steered from live positions (`agents/intercept.py`) instead of a pre-computed path; after contact it stops steering and both cars brake. `agents/map_builder.py` adds a paved shoulder, `agents/motion_runner.py` puts barrier props on the edges.
+- `agents/scenario_check.py` accepts a run only when the expected pair touched inside the time window, the contact direction fits (a cut-in must be a side contact) and nothing else was hit. A failed run is repeated with changed controller parameters (4 runs at most) and the report says which rule failed.
+- If CARLA rejects a curved map the road is rebuilt straight and the report says so. `python -m tools.smoke_curved_map` tests curved maps against a running CARLA.
+- Tests: `python -m unittest discover -s tests -v` (no CARLA needed).

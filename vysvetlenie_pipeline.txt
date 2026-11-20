@@ -1,0 +1,211 @@
+======================================================================
+VEĽMI JEDNODUCHÉ VYSVETLENIE: AKO FUNGUJE CELÝ PIPELINE A ČO ROBIA .PY SÚBORY
+======================================================================
+
+1. ČO ROBÍ CELÝ PIPELINE? (PRE ÚPLNÉHO ZAČIATOČNÍKA)
+----------------------------------------------------------------------
+Predstav si, že máš obyčajné video z autokamery (dashcam), na ktorom sa
+stane dopravná nehoda (napríklad auto vyletí z bočnej ulice alebo sa
+prudko preradí pred teba).
+
+Cieľ celého programu je:
+  "Pozrieť si skutočné video z auta -> pochopiť, aká je tam cesta a aké
+   autá tam sú -> postaviť tú istú cestu a tie isté autá v 3D simulátore
+   CARLA -> a prehrať tú nehodu znova tak, aby naozaj nastala!"
+
+Celý proces (v súbore local_pipeline.py) prebieha v 6 jednoduchých krokoch:
+
+  KROK 1: Nájde sekundu nárazu a zistí, či kamera (ego auto) išla alebo stála
+    - Program prebehne video, ignoruje kapotu auta a nápisy na obrazovke.
+    - Podľa pohybu pozadia vypočíta rýchlosť nášho auta (km/h) a nájde
+      okamihy, kedy obrazom trhlo alebo sa niečo mihlo zboku.
+    - Potom sa lokálneho AI modelu (Qwen2.5-VL) opýta: "Je na týchto
+      snímkach nehoda?" -> tak nájde presný čas nárazu (t_crash).
+
+  KROK 2: Nájde na videu jednotlivé autá a zmeria, kde sú
+    - Detektor objektov (OwlViT) zakrúžkuje autá okolo momentu nárazu.
+    - Z výrezov obrázka lokálna AI zistí farbu a typ (napr. "červené SUV")
+      a ktorým smerom je auto otočené.
+    - Program prepočíta polohu z 2D obrazu na skutočné metre na ceste
+      (koľko metrov vpredu a koľko metrov vľavo/vpravo) a spojí snímky
+      do pohybu ("toto auto ide zľava doprava").
+
+  KROK 3: Zistí, ako vyzerá cesta
+    - Lokálna AI odpovie na jednoduché otázky o ceste:
+      Je to rovná cesta alebo križovatka? Koľko má pruhov? Je v zákrute?
+      Kde je žltá stredová čiara? Stoja v bočných pruhoch ďalšie autá?
+
+  KROK 4: Spojí všetky informácie do jedného čistého plánu (_spec.json)
+    - Program skontroluje, či si AI niečo nevymyslela (napr. ak AI povie
+      nezmyselnú rýchlosť oproti pohybu kamery, opraví ju) a uloží čistý
+      zápis scény do súboru *_spec.json.
+
+  KROK 5: Postaví 3D cestu, semafory a naplánuje jazdu (bez hádania AI)
+    - Matematika (scene_builder.py a map_builder.py) podľa plánu presne
+      vygeneruje rovnú cestu, zákrutu alebo križovatku, rozmiestni autá do
+      svojich pruhov tak, aby si na začiatku nezavadzali, a odsunie
+      semafory mimo vozovku, aby do nich autá nenarážali.
+
+  KROK 6: Spustí simulátor CARLA a doladí načasovanie
+    - CARLA načíta cestu, postaví autá a pustí simuláciu (20 snímok za sekundu).
+    - Sleduje, či sa správne dve autá naozaj zrazili v správnom čase.
+    - Ak sa tesne minuli, program automaticky posunie čas štartu alebo
+      odstup a skúsi to znova (max 4 pokusy), kým nie je výsledok "ready".
+    - Plynulá kamera pritom celý priebeh natočí do videa (*_carla.mp4).
+
+
+======================================================================
+2. ČO ROBIA JEDNOTLIVÉ .PY SÚBORY (priečinok agents/)
+======================================================================
+
+--- A) HLAVNÉ SÚBORY NOVÉHO LOKÁLNEHO PIPELINE ---
+
+1. local_pipeline.py
+   "Šéf / dirigent celého procesu."
+   Spúšťa všetko zaradom: najprv analýzu videa (phase1), potom stavbu mapy
+   a áut, potom spustenie simulácie v CARLA (phase2) a nakoniec vypíše
+   prehľadnú správu (report.txt).
+
+2. video_events.py
+   "Oko pre pohyb a otrasy."
+   Číta snímky videa pomocou OpenCV. Meria optický tok pozadia (bez kapoty
+   a hornej lišty), aby zistil, či naše auto stojí alebo ide (v km/h),
+   odhalí pohyb áut zboku a nájde časové kandidáty na nehodu.
+
+3. road_probes.py
+   "Rýchly pýtač na cestu a nehodu."
+   Klade lokálnemu VLM modelu (Qwen2.5-VL) krátke uzavreté otázky s možnosťami
+   (napr. A/B/C/D alebo Áno/Nie): koľko je pruhov, či je tam križovatka,
+   zákruta, žltá čiara vľavo, koľko je okolo áut a kedy presne nastal náraz.
+
+4. vehicle_tracker.py
+   "Sledovač áut v priestore."
+   Pomocou detektora OwlViT nájde autá v zábere, zmeria ich polohu v metroch
+   od kamery, cez VLM zistí ich farbu, typ a natočenie, a vyhodnotí, ktoré
+   dve autá sa zrazili (vrátane nehôd dvoch iných áut pred nami).
+
+5. llm_backend.py
+   "Motor pre lokálnu AI."
+   Načíta lokálny model Qwen2.5-VL na grafickej karte/počítači, posiela mu
+   obrázky s otázkami a vracia odpovede alebo pravdepodobnosti (logprobs).
+
+6. scene_spec.py
+   "Strážca poriadku v dátach."
+   Definuje povolené farby áut, typy ciest a čistí dáta scenára tak, aby v
+   pláne (*_spec.json) neboli chýbajúce alebo nezmyselné hodnoty.
+
+7. scene_builder.py
+   "Architekt cesty a štartových miest."
+   Z čistého plánu (*_spec.json) matematicky vytvorí cestu (rovnú, zákrutu
+   alebo križovatku), rozmiestni hlavné aj vedľajšie autá do pruhov a vyrobí
+   plán jazdy (*_motion.json) + mapu pre SUMO (*.net.xml).
+
+8. road_frame.py a road_curve.py
+   "Pravítko pre rovné aj zakrivené cesty."
+   Pomáhajú počítať polohu na zákrute tak, aby sa dalo jednoducho povedať:
+   "choď 30 metrov dopredu po ceste a ostaň v pravom pruhu" (Frenetove súradnice).
+
+9. map_builder.py
+   "Staviteľ 3D mapy pre CARLA."
+   Prevedie sieť cesty zo SUMO do formátu OpenDRIVE (.xodr), pridá krajnice,
+   odsunie semafory aspoň 3,5 metra od jazdných pruhov a nahrá mapu do CARLA.
+
+10. motion_runner.py
+    "Vodič a kameraman v CARLA."
+    Pripojí sa na spustenú CARLA, vytvorí (spawne) všetky autá a prekážky,
+    riadi ich jazdu každých 0,05 sekundy, sleduje kolízie a plynulo natáča
+    kamerou miesto nárazu do videa (*_carla.mp4).
+
+11. intercept.py
+    "Špecialista na náhle preradenie (cut-in)."
+    Uzavretý regulátor riadenia, ktorý zabezpečí, aby sa vedľajšie auto
+    plynulo preradilo do nášho pruhu presne tak, aby prišlo k zrážke (alebo
+    tesnému minutiu) v požadovanom čase.
+
+12. scenario_check.py a contact_analysis.py
+    "Rozhodca a ladič."
+    Po skončení simulácie skontroluje, či sa zrazili správne dve autá, z
+    akej strany (spredu, zozadu, zboku) a či nikto nenabúral do semaforu
+    alebo mimo cesty. Ak niečo nesedí, upraví parametre a spustí ďalší pokus.
+
+
+--- B) SÚBORY PÔVODNÉHO AUTOSCENARIA (CLOUD LLM PRÍSTUP) ---
+(Tieto súbory tu zostali z pôvodného projektu AutoScenario na porovnanie.)
+
+13. task_agent.py
+    "Spojka s cloudovým OpenAI API."
+    Posiela texty a obrázky cez internet do modelu GPT-4o / GPT-4V a ukladá
+    odpovede do textových súborov.
+
+14. universal_interpreter.py
+    "Rozdeľovač textu."
+    Vyberie, či je vstup obrázok, video alebo text, a potom cez ďalší LLM
+    dotaz rozdelí opis na časti (cesta, autá, statické objekty, scenár).
+
+15. video_interpreter.py / vlm_interpreter.py / text_interpretor.py / command_interpreter.py
+    "Pôvodní čitači vstupu."
+    VideoInterpreter vyberie každú 60. snímku videa a nechá GPT napísať voľný
+    opis scény bez sledovania konkrétnych áut. Ostatné čítajú fotku alebo text.
+
+16. net_generator.py
+    "Pôvodný tvorca cesty cez LLM."
+    Požiada GPT, aby napísal XML súbory cesty (.nod.xml a .edg.xml) a pustí
+    nástroj netconvert.
+
+17. obstacle_generator.py a scenario_generator.py
+    "Pôvodní tvorcovia áut a kódu cez LLM."
+    Požiadajú GPT, aby vygeneroval Python kód so súradnicami áut a prekážok
+    (*_scene.py a *_scene_final.py).
+
+18. rou_generator.py
+    "Generátor trás pre SUMO."
+    Stará sa o vytváranie náhodných alebo plánovaných jázd v simulátore SUMO.
+
+19. motion_stage.py a motion_planner.py
+    "Dodatočný plánovač pohybu pre pôvodný AutoScenario."
+    Pošlú zoznam objektov a pruhov do LLM, aby vytvoril JSON plán pohybu,
+    a potom ho raz spustia cez motion_runner.py v CARLA (bez opakovania a ladenia).
+
+
+======================================================================
+3. ČO CHÝBALO V PÔVODNOM AUTOSCENARIU A BOLO TREBA DOPLNIŤ
+======================================================================
+Pôvodný verejný repozitár AutoScenario (pred našimi úpravami) nevedel
+prehrať nehodu z videa v CARLA sám od seba. Chýbali v ňom tieto kľúčové veci:
+
+1. CHÝBAJÚCE EGO VOZIDLO A POHYB ÁUT (motion_planner.py, motion_runner.py, motion_stage.py)
+   - Pôvodný ScenarioGenerator autá iba položil na cestu a zapol im brzdu
+     (brake=1.0, autopilot=False). Autá vôbec nejazdili!
+   - V repozitári chýbalo rozlíšenie, ktoré auto je "ego" (naše testované
+     auto s kamerou), akú má rýchlosť, trasu a kedy sa majú ostatné autá
+     pohnúť (trigger), aby sa naozaj stretli na mieste nehody.
+
+2. CHÝBAJÚCI STAVITEĽ MAPY PRE CARLA (map_builder.py)
+   - Pôvodný kód vyrobil iba mapu pre SUMO (.net.xml), ale nevedel ju
+     automaticky premeniť na OpenDRIVE (.xodr), pridať krajnice, odsunúť
+     semafory z jazdných pruhov a načítať ju do spusteného simulátora CARLA.
+
+3. CHÝBAJÚCE LOKÁLNE AI A SLEDOVANIE ÁUT Z VIDEA
+   (llm_backend.py, video_events.py, road_probes.py, vehicle_tracker.py)
+   - Pôvodný AutoScenario posielal každú 60. snímku do plateného cloudového
+     OpenAI API (GPT-4o / GPT-4V) a spoliehal sa len na voľný textový opis.
+   - Bolo treba doplniť lokálny VLM model (Qwen2.5-VL), meranie rýchlosti
+     z pohybu pozadia, nájdenie presného času nárazu a 2D->3D sledovanie áut
+     (OwlViT + prepočet na metre), aby autá v simulácii stáli tam, kde vo videu.
+
+4. DETERMINISTICKÝ STAVITEĽ CIEST A MANÉVROV
+   (scene_spec.py, scene_builder.py, road_frame.py, road_curve.py, intercept.py)
+   - Pôvodné generovanie XML a Python kódu cez LLM často robilo geometrické
+     chyby a nevedelo presne postaviť zákruty či bočné preraďovanie (cut-in).
+   - Bolo treba doplniť matematické generovanie ciest a uzavreté riadenie
+     preraďovania/kríženia.
+
+5. OVERENIE NEHODY A SAMOOPRAVA + TESTY (scenario_check.py, contact_analysis.py, tests/)
+   - V pôvodnom projekte neboli kolízne senzory na autách, kontrola či sa
+     zrazili správne dve autá, automatické doladenie načasovania pri minutí,
+     ani automatické testy (tests/).
+
+6. AKTUALIZÁCIA PRE CARLA 1.0 A REŽIM BEZ API KĽÚČA (scenario_generator.py, task_agent.py)
+   - Bolo treba upraviť zoznam modelov áut (VEHICLE_BLUEPRINTS) pre CARLA 1.0
+     a doplniť súborový hand-off režim (HANDOFF_DIR), ak nie je OpenAI kľúč.
+======================================================================
