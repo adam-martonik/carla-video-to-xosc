@@ -189,3 +189,33 @@ def refine_crash_time(candidates, score_fn, span=0.6, step=0.15):
             if sc > best:
                 best_t, best = t, sc
     return (best_t, best) if best_t is not None else (None, 0.0)
+
+
+
+# ----------------------------------------------------------------------------------------- lanes that leave as a branch
+BRANCH_RISE_Q = (CTX + "Is there a road or lanes on the %s that are HIGHER than the ego vehicle's road, rising up on a ramp, "
+                 "embankment or bridge? Answer YES or NO.")
+BRANCH_SPLIT_Q = (CTX + "Look at the %s side of the ego vehicle's road. Do some lanes on the %s separate from the ego vehicle's road "
+                  "and continue as a different road (a fork, an exit ramp, a separate carriageway or a flyover), divided from it by a "
+                  "barrier, a gap or a different height? Answer YES or NO.")
+RISE_P = 0.5           # mean YES probability above which the lanes that leave climb (measured: 0.52-0.68 vs 0.08-0.40 without)
+SPLIT_P = 0.5          # ... above which they go on as a flat road of their own (a weaker cue: the plain question overlaps more)
+
+
+def branch_evidence(video, t, side, duration, n=4, span=4.0):
+    """(P(lanes on `side` go on as a separate road), P(that road rises)) from frames in the `span` seconds after video time t,
+    when lanes have left the ego road on that side. (0, 0) when the model is not available."""
+    try:
+        times = [min(t + 0.5 + span * i / max(n - 1, 1), max(duration - 0.1, 0.0)) for i in range(n)]
+        word = side.upper()
+        ps, pr, used = 0.0, 0.0, 0
+        for tt in times:
+            fr = video_events.grab_frames(video, [tt], width=640)
+            if not fr:
+                continue
+            ps += llm_backend.yes_probability(BRANCH_SPLIT_Q % (word, word), fr)
+            pr += llm_backend.yes_probability(BRANCH_RISE_Q % word, fr)
+            used += 1
+        return (ps / used, pr / used) if used else (0.0, 0.0)
+    except Exception:
+        return 0.0, 0.0

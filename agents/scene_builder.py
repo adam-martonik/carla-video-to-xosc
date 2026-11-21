@@ -42,9 +42,13 @@ def _write_json(path, obj):
 class Road:
     """Geometry of the generated road in the net frame."""
 
-    def __init__(self, kind, lanes, centerline=None, one_way=False):
-        self.kind, self.L = kind, lanes
+    def __init__(self, kind, lanes, centerline=None, one_way=False, sections=None):
+        """sections (straight roads only): [{"s0", "s1", "n", "m"}] along the road, see agents/lane_profile.py. Without them the
+        road has `lanes` lanes everywhere. self.L is the widest extent (max m + n); lanes are numbered k = 0 (right-most of that
+        extent) .. L - 1, so a lane keeps its index and lateral position in every section. self.Lw: lanes of the opposite direction."""
+        self.kind, self.L, self.Lw = kind, lanes, lanes
         self.one_way = bool(one_way)
+        self.sections = None
         if kind == "straight":
             pts = [(float(p[0]), float(p[1])) for p in centerline] if centerline else [(0.0, 0.0), (300.0, 0.0)]
             mx, my = min(p[0] for p in pts), min(p[1] for p in pts)
@@ -53,12 +57,55 @@ class Road:
             self.length = self.frame.length
             self.end_s = self.length - 10.0
             self.C = None
+            self.sections = [{"s0": 0.0, "s1": self.length, "n": lanes, "m": 0}]
+            if sections and len(sections) > 1:
+                secs = [dict(sc) for sc in sections if sc["s0"] < self.length - 1.0]
+                secs[0]["s0"], secs[-1]["s1"] = 0.0, self.length
+                if len(secs) > 1:
+                    self.sections = secs
+                    self.L = max(sc["m"] + sc["n"] for sc in secs)
         else:
             self.end_s = None
             self.frame = None
             self.arm = 100.0
             self.C = (100.0, 100.0)
             self.half_j = lanes * W + 4.0
+
+    # lanes along a straight road ---------------------------------------------------------------------
+    @property
+    def varying(self):
+        return bool(self.sections) and (len(self.sections) > 1 or self.sections[0]["m"] != 0)
+
+    def section(self, s):
+        for sc in self.sections:
+            if s < sc["s1"]:
+                return sc
+        return self.sections[-1]
+
+    def lanes_at(self, s):
+        """Indices k of the lanes that exist at distance s (all of them on a crossroad)."""
+        if not self.sections:
+            return list(range(self.L))
+        sc = self.section(s)
+        return list(range(self.L - sc["m"] - sc["n"], self.L - sc["m"]))
+
+    def has_lane(self, s, k):
+        return k in self.lanes_at(s)
+
+    def clamp_lane(self, s, k):
+        """The existing lane at s nearest to lane k."""
+        return min(self.lanes_at(s), key=lambda q: (abs(q - k), q))
+
+    def right_edge_d(self, s):
+        """Lateral offset of the right edge of the ego carriageway at s."""
+        if not self.sections:
+            return -self.L * W
+        sc = self.section(s)
+        return -(sc["m"] + sc["n"]) * W
+
+    def end_point(self, k):
+        """Route end for a vehicle in lane k: the same lane at the end of the road, or the nearest lane that is left there."""
+        return list(self.lane_point(self.end_s, self.clamp_lane(self.end_s, k)))
 
     def off(self, k):
         """Offset of lane index k (0 = right-most lane of a direction) from the road centre line."""
@@ -84,7 +131,8 @@ class Road:
 
     def opposite_lane_point(self, s, k):
         """Centre of lane k of the opposite carriageway at distance s along the road."""
-        return self.frame.to_xy(s, -lane_offset(self.L, k))
+        k = max(0, min(int(k), self.Lw - 1))
+        return self.frame.to_xy(s, -lane_offset(self.Lw, k))
 
     def northbound_x(self, k):
         return self.C[0] + self.off(k)
@@ -93,12 +141,133 @@ class Road:
         return self.C[0] - self.off(k)
 
 
+SPLIT_GAP_M = 4.0          # half length of the junction where a branch leaves
+DIVERGE_LEN_M = 120.0      # a branch moves this far along the road while it pulls away sideways
+DIVERGE_D_M = 6.0          # ... by this much (the strip between the ego road and the branch)
+RISE_LEN_M = 150.0         # a branch reaches its full height after this far along the road
+
+
+def _smooth(x):
+    x = max(0.0, min(1.0, x))
+    return x * x * (3.0 - 2.0 * x)
+
+
+def split_index(road):
+    """Index of the first section that carries a branch, or None."""
+    for i, sc in enumerate(road.sections or []):
+        if i > 0 and sc.get("branch") and SPLIT_GAP_M + 1.0 < sc["s0"] < road.length - 40.0:
+            return i
+    return None
+
+
+def _pieces(road):
+    """Road pieces of the ego direction: [(edge id, s0, s1, sections)], one piece without a split, before/after it with one.
+    Each piece is one edge with the widest lanes of its sections; lane changes inside a piece go into the OpenDRIVE map."""
+    b = split_index(road)
+    if b is None:
+        return [("eastbound", 0.0, road.length, road.sections)]
+    s_b = road.sections[b]["s0"]
+    return [("eastbound", 0.0, s_b - SPLIT_GAP_M, road.sections[:b]), ("eastbound_after", s_b + SPLIT_GAP_M, road.length, road.sections[b:])]
+
+
+def _shape(frame, s0, s1, dfun, zfun=None, step=4.0):
+    """'x,y[,z] ...' of the line at lateral offset dfun(s) (and height zfun(s)) from s0 to s1, keeping the frame's vertices."""
+    ss = sorted(set([s0, s1] + [c for c in frame.cum if s0 < c < s1] + [s0 + step * i for i in range(1, int((s1 - s0) / step))]))
+    pts = []
+    for s in ss:
+        x, y = frame.to_xy(s, dfun(s))
+        pts.append("%.3f,%.3f,%.3f" % (x, y, zfun(s)) if zfun else "%.3f,%.3f" % (x, y))
+    return " ".join(pts)
+
+
+def _split_net(road):
+    """Nodes, edges and connections of a straight road where some lanes leave as a branch of their own (a fork or a flyover).
+    Before the split one edge holds every lane; after it the ego road goes on along the road frame and the branch pulls away
+    to its side by DIVERGE_D_M and climbs to rise_m. Every lane connects to exactly one lane after the split (no merging),
+    so the junction is clean. With a left branch on a two-way road the opposite carriageway follows the branch (the two are
+    the main road), so the strip between them stays."""
+    fr, secs = road.frame, road.sections
+    b = split_index(road)
+    a_sec, b_sec = secs[b - 1], secs[b]
+    br = b_sec["branch"]
+    s_b = b_sec["s0"]
+    left = br["side"] == "left"
+    leave = list(range(a_sec["m"], b_sec["m"])) if left else list(range(b_sec["m"] + b_sec["n"], a_sec["m"] + a_sec["n"]))
+    rise = float(br.get("rise_m", 0.0))
+    f = lambda s: DIVERGE_D_M * _smooth((s - s_b) / DIVERGE_LEN_M) * (1.0 if left else -1.0)
+    z = lambda s: rise * _smooth((s - s_b) / RISE_LEN_M)
+    nodes = ['<node id="west" x="%.3f" y="%.3f" type="priority"/>' % fr.pts[0]]
+    x, y = fr.to_xy(s_b, -(a_sec["m"] + 0.5 * a_sec["n"]) * W)
+    nodes.append('<node id="split" x="%.3f" y="%.3f" type="priority"/>' % (x, y))
+    edges, cons, ext = [], [], {}
+    for eid, s0, s1, ps in _pieces(road):
+        mP = min(sc["m"] for sc in ps)
+        eP = max(sc["m"] + sc["n"] for sc in ps)
+        ext[eid] = (mP, eP)
+        frm, to = ("west", "split") if eid == "eastbound" else ("split", "east")
+        edges.append('<edge id="%s" from="%s" to="%s" numLanes="%d" speed="30.0" width="%.1f" spreadType="right" shape="%s"/>'
+                     % (eid, frm, to, eP - mP, W, _shape(fr, s0, s1, lambda s, mP=mP: -mP * W)))
+    x, y = fr.to_xy(fr.length, -(ext["eastbound_after"][0]) * W)
+    nodes.append('<node id="east" x="%.3f" y="%.3f" type="priority"/>' % (x, y))
+    j0 = min(leave)
+    bshape = _shape(fr, s_b + SPLIT_GAP_M, fr.length, lambda s: -j0 * W + f(s), z)
+    bx, by, bz = map(float, bshape.split()[-1].split(","))
+    nodes.append('<node id="branch_end" x="%.3f" y="%.3f" z="%.3f" type="priority"/>' % (bx, by, bz))
+    edges.append('<edge id="branch" from="split" to="branch_end" numLanes="%d" speed="30.0" width="%.1f" spreadType="right" shape="%s"/>'
+                 % (len(leave), W, bshape))
+    local = lambda eid, j: (ext[eid][1] - 1) - j                # SUMO lane 0 is the right-most lane of an edge
+    mA, eA = ext["eastbound"]
+    for j in range(mA, eA):
+        if j in leave:
+            cons.append('<connection from="eastbound" to="branch" fromLane="%d" toLane="%d"/>' % (local("eastbound", j), max(leave) - j))
+        elif ext["eastbound_after"][0] <= j < ext["eastbound_after"][1]:
+            cons.append('<connection from="eastbound" to="eastbound_after" fromLane="%d" toLane="%d"/>'
+                        % (local("eastbound", j), local("eastbound_after", j)))
+    if not road.one_way:
+        if left:                                                # the opposite carriageway follows the branch
+            g = lambda s: max(f(s), 0.0)
+            hz = lambda s: z(s) if s > s_b else 0.0
+            wshape = _shape(fr, 0.0, fr.length, g, hz).split()
+            wshape = " ".join(reversed(wshape))
+            (ex, ey, ez), (sx, sy, sz) = [tuple(map(float, p.split(","))) for p in (wshape.split()[0], wshape.split()[-1])]
+            nodes.append('<node id="wb_from" x="%.3f" y="%.3f" z="%.3f" type="priority"/>' % (ex, ey, ez))
+            nodes.append('<node id="wb_to" x="%.3f" y="%.3f" z="%.3f" type="priority"/>' % (sx, sy, sz))
+            edges.append('<edge id="westbound" from="wb_from" to="wb_to" numLanes="%d" speed="30.0" width="%.1f" spreadType="right" shape="%s"/>'
+                         % (road.Lw, W, wshape))
+        else:
+            rshape = " ".join("%.3f,%.3f" % p for p in reversed(fr.pts))
+            nodes.append('<node id="wb_from" x="%.3f" y="%.3f" type="priority"/>' % fr.pts[-1])
+            edges.append('<edge id="westbound" from="wb_from" to="west" numLanes="%d" speed="30.0" width="%.1f" spreadType="right" shape="%s"/>'
+                         % (road.Lw, W, rshape))
+    return nodes, edges, cons
+
+
+def xodr_pieces(road):
+    """The road pieces whose lanes the OpenDRIVE post-processing rewrites (map_builder.apply_lane_sections): the pieces whose
+    lane count changes inside them, with the sections' m relative to the piece's own left-most lane."""
+    out = []
+    for eid, s0, s1, ps in _pieces(road):
+        mP = min(sc["m"] for sc in ps)
+        if len(ps) < 2 and ps[0]["m"] == mP:
+            continue
+        secs = []
+        for sc in ps:
+            secs.append({"s0": round(max(sc["s0"], s0), 2), "s1": round(min(sc["s1"], s1), 2), "n": sc["n"], "m": sc["m"] - mP})
+        out.append({"road": eid, "s0": round(s0, 2), "s1": round(s1, 2), "sections": secs})
+    return out
+
+
 def write_net(road, out_dir, scene_id, signals):
     nod = os.path.join(out_dir, scene_id + ".nod.xml")
     edg = os.path.join(out_dir, scene_id + ".edg.xml")
     net = os.path.join(out_dir, scene_id + ".net.xml")
     L = road.L
-    if road.kind == "straight":
+    cons = []
+    if road.kind == "straight" and split_index(road) is not None:
+        nodes, edges, cons = _split_net(road)
+    elif road.kind == "straight":
+        # a lane count that changes along the road goes into the OpenDRIVE map afterwards (map_builder.apply_lane_sections): the
+        # net has the widest number of lanes, so netconvert needs no junction where a lane ends
         pts = road.frame.pts
         nodes = ['<node id="west" x="%.3f" y="%.3f" type="priority"/>' % pts[0], '<node id="east" x="%.3f" y="%.3f" type="priority"/>' % pts[-1]]
         shape = " ".join("%.3f,%.3f" % p for p in pts)
@@ -106,7 +275,7 @@ def write_net(road, out_dir, scene_id, signals):
         # spreadType right: the lanes lie to the right of the shape, so lane k is exactly at lane_offset(L, k) from the centre line
         edges = ['<edge id="eastbound" from="west" to="east" numLanes="%d" speed="30.0" width="%.1f" spreadType="right" shape="%s"/>' % (L, W, shape)]
         if not road.one_way:
-            edges.append('<edge id="westbound" from="east" to="west" numLanes="%d" speed="30.0" width="%.1f" spreadType="right" shape="%s"/>' % (L, W, rshape))
+            edges.append('<edge id="westbound" from="east" to="west" numLanes="%d" speed="30.0" width="%.1f" spreadType="right" shape="%s"/>' % (road.Lw, W, rshape))
     else:
         ctype = "traffic_light" if signals and L > 1 else "priority"
         nodes = ['<node id="center" x="0.0" y="0.0" type="%s"/>' % ctype]
@@ -118,8 +287,13 @@ def write_net(road, out_dir, scene_id, signals):
             edges.append('<edge id="%s_out" from="center" to="%s" numLanes="%d" speed="15.0" width="%.1f"/>' % (nid, nid, L, W))
     _write_text(nod, '<?xml version="1.0" encoding="UTF-8"?>\n<nodes>\n  ' + "\n  ".join(nodes) + "\n</nodes>\n")
     _write_text(edg, '<?xml version="1.0" encoding="UTF-8"?>\n<edges>\n  ' + "\n  ".join(edges) + "\n</edges>\n")
-    res = subprocess.run([find_netconvert(), "--node-files=" + nod, "--edge-files=" + edg, "--default.spreadtype", "center",
-                          "--no-turnarounds", "--output-file=" + net], capture_output=True, text=True)
+    cmd = [find_netconvert(), "--node-files=" + nod, "--edge-files=" + edg, "--default.spreadtype", "center",
+           "--no-turnarounds", "--output-file=" + net]
+    if cons:
+        con = os.path.join(out_dir, scene_id + ".con.xml")
+        _write_text(con, '<?xml version="1.0" encoding="UTF-8"?>\n<connections>\n  ' + "\n  ".join(cons) + "\n</connections>\n")
+        cmd.append("--connection-files=" + con)
+    res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0 or not os.path.exists(net):
         raise RuntimeError("netconvert failed: " + res.stderr[-300:])
     if road.kind == "straight":
@@ -168,19 +342,19 @@ def traffic_actors(traffic, ego_kmh, T, lane_idx, road, existing):
     for i in range(n["ego_lane_ahead"]):
         add("ahead", "same", base + 12.0 * i, v_t_kmh)
     if n["left_lane"]:
-        if lane_idx + 1 > road.L - 1:
+        if not road.has_lane(S_START, lane_idx + 1):
             notes.append("traffic: the ego car is in the left-most lane, no left lane for %d vehicle(s)" % n["left_lane"])
         else:
             for i in range(n["left_lane"]):
                 add("ahead", "left", base + 12.0 * i, v_t_kmh)
     if n["right_lane"]:
-        if lane_idx - 1 < 0:
+        if not road.has_lane(S_START, lane_idx - 1):
             notes.append("traffic: the ego car is in the right-most lane, no right lane for %d vehicle(s)" % n["right_lane"])
         else:
             for i in range(n["right_lane"]):
                 add("ahead", "right", base + 12.0 * i, v_t_kmh)
     for i in range(n["oncoming"]):
-        add("oncoming", "left" if (road.L > 1 and i % 2) else "same", 20.0 + 15.0 * i, 40.0)
+        add("oncoming", "left" if (road.Lw > 1 and i % 2) else "same", 20.0 + 15.0 * i, 40.0)
     return out, notes
 
 
@@ -235,6 +409,44 @@ def crossroad_traffic_actors(traffic, ego_kmh, lane_idx, road, existing, ego_y0)
 
 
 # ----------------------------------------------------------------------------------------- the builder
+def _road_with_profile(spec, road, s_ego0, d_event, ev_actor):
+    """Straight road whose lane count follows spec.road.lane_profile (distances from the ego start, agents/lane_profile.py).
+    Returns (road, ego lane index k, note). The ego lane is the measured one (counted from the left) when it exists at the start;
+    a car that merges into the ego lane needs its source lane beside the ego car at the start and at the event."""
+    prof = spec["road"]["lane_profile"]
+    big = 1e9
+    secs = [{"s0": s_ego0 + (sc["d0"] if sc["d0"] is not None else -big), "s1": s_ego0 + (sc["d1"] if sc["d1"] is not None else big),
+             "n": int(sc["n"]), "m": int(sc.get("m", 0)), **({"branch": dict(sc["branch"])} if sc.get("branch") else {})}
+            for sc in prof]
+    new = Road("straight", spec["road"]["lanes_per_direction"], spec["road"].get("centerline"), spec["road"].get("one_way", False))
+    secs = [sc for sc in secs if sc["s1"] > 1.0 and sc["s0"] < new.length - 1.0]
+    if len(secs) < 2:
+        return road, (0 if spec["ego"]["lane"] == "right" or road.L == 1 else road.L - 1), \
+            "lane profile: the count does not change on the simulated stretch"
+    lo = min(sc["m"] for sc in secs)
+    for sc in secs:
+        sc["m"] -= lo
+    new = Road("straight", spec["road"]["lanes_per_direction"], spec["road"].get("centerline"), spec["road"].get("one_way", False), secs)
+    ks = new.lanes_at(s_ego0)
+    idx = spec["ego"].get("lane_index")
+    k = new.L - 1 - (idx - lo) if idx is not None else None
+    if k not in ks:
+        k = min(ks) if spec["ego"]["lane"] == "right" or len(ks) == 1 else max(ks)
+    if ev_actor is not None and (ev_actor["relation"] == "beside" or ev_actor["behavior"] == "cutting_in"):
+        step = 1 if ev_actor["lane"] != "right" else -1
+        ok = [q for q in ks if new.has_lane(s_ego0, q + step) and new.has_lane(s_ego0 + d_event, q + step) and new.has_lane(s_ego0 + d_event, q)]
+        if not ok:                      # the crash matters more than the lane count: keep the road the crash needs
+            return road, (0 if spec["ego"]["lane"] == "right" or road.L == 1 else road.L - 1), \
+                "lane profile dropped: no lane on the %s of the ego car for %s's merge at the event" % (
+                    "left" if step > 0 else "right", ev_actor["id"])
+        if k not in ok:
+            k = min(ok, key=lambda q: abs(q - k))
+    note = "lane profile: %s lanes along the road, ego in lane %d of %d from the left at the start" % (
+        " -> ".join("%d" % sc["n"] if i == 0 else "%d (from %.0f m)" % (sc["n"], sc["s0"] - s_ego0) for i, sc in enumerate(new.sections)),
+        new.L - k - new.section(s_ego0)["m"], len(ks))
+    return new, k, note
+
+
 def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
     os.makedirs(out_dir, exist_ok=True)
     notes = []
@@ -268,14 +480,18 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
     if straight_tp_cross and road.L < 2:
         road = Road("straight", 2, spec["road"].get("centerline"), spec["road"].get("one_way", False))
         lane_idx = 0 if ego["lane"] == "right" else road.L - 1
+    T = min(max(event["time_s"], 3.0), 8.0) if ev_actor is not None else 6.0       # simulated time of the event
+    if road.kind == "straight" and spec["road"].get("lane_profile") and not (third_party and not straight_tp_cross):
+        s_ego0 = 65.0 if straight_tp_cross else S_START
+        road, lane_idx, pnote = _road_with_profile(spec, road, s_ego0, v_e * T, ev_actor)
+        notes.append(pnote)
     if third_party and not straight_tp_cross:
         # the crash is between two other road users: they meet in the junction while the ego car passes by
         if spec["road"]["type"] == "straight":
             notes.append("third-party crash needs a junction: road changed to crossroad")
-            road = Road("crossroad", road.L)
+            road = Road("crossroad", spec["road"]["lanes_per_direction"])
         ev_actor.update({"relation": "cross_left", "behavior": "driving", "type": ev_actor["type"] if ev_actor["type"] != "pedestrian" else "car"})
         ev2.update({"relation": "cross_right", "behavior": "turning_left", "type": ev2["type"] if ev2["type"] != "pedestrian" else "car"})
-    T = min(max(event["time_s"], 3.0), 8.0) if ev_actor is not None else 6.0       # simulated time of the event
     has_straight_cross = (road.kind == "straight" and (straight_tp_cross or (not third_party and any(
         a["relation"] in ("cross_left", "cross_right") and a["type"] != "pedestrian" for a in actors))))
     shoulder_m = 6.0 if has_straight_cross else SHOULDER_M
@@ -287,7 +503,7 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
     # ---- ego geometry ---------------------------------------------------------------------------------
     if road.kind == "straight":
         heading = road.lane_heading(S_START)
-        end_pt = list(road.lane_point(road.end_s, lane_idx))
+        end_pt = road.end_point(lane_idx)
     else:
         ego_x = road.northbound_x(lane_idx)
         heading = 90.0
@@ -374,10 +590,12 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
     placed_adj_y = {}
     tp_cross_s = (65.0 + min(max(ev_actor["distance_m"], 6.5), 11.0)) if straight_tp_cross else None
     tp_k2 = (max(lane_idx - 1, 0) if ev2["lane"] == "right" else min(lane_idx + 1, road.L - 1)) if straight_tp_cross else None
+    if straight_tp_cross:
+        tp_k2 = road.clamp_lane(tp_cross_s, tp_k2)
     tp_t_cross = None
     if straight_tp_cross:
-        d_left_tp = (0.0 if road.one_way else road.L * W) + shoulder_m - 1.5
-        d_right_tp = -(road.L * W + shoulder_m - 1.5)
+        d_left_tp = (0.0 if road.one_way else road.Lw * W) + shoulder_m - 1.5
+        d_right_tp = road.right_edge_d(tp_cross_s) - (shoulder_m - 1.5)
         d_start_tp = d_left_tp if ev_actor["relation"] == "cross_left" else d_right_tp
         d_conf_tp = lane_offset(road.L, tp_k2)
         tp_t_cross = abs(d_start_tp - d_conf_tp) / max(ev_actor["speed_kmh"] / 3.6, 1.0)
@@ -415,6 +633,8 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
             # a vehicle in the neighbouring lane that changes into the ego lane (side contact or close pass)
             left = a["lane"] != "right"
             k_src = min(lane_idx + 1, road.L - 1) if left else max(lane_idx - 1, 0)
+            if road.kind == "straight" and not road.has_lane(S_START, k_src):
+                k_src = lane_idx                                         # the neighbouring lane does not exist here
             if k_src == lane_idx:
                 notes.append("%s: the road has no neighbouring lane, placed ahead in the ego lane" % a["id"])
                 if road.kind == "straight":
@@ -460,7 +680,8 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     s_c = s_ls + v * dur
                     while s_c < end_s:
                         s_c += 4.0
-                        pts.append(lane_pt(lane_idx, min(s_c, end_s)))
+                        k_c = road.clamp_lane(S_START + min(s_c, end_s), lane_idx) if road.kind == "straight" else lane_idx
+                        pts.append(lane_pt(k_c, min(s_c, end_s)))
                     agents[vid] = {"type": a["type"], "x": pts[0][0], "y": pts[0][1], "heading": head}
                     spec_p = {"mode": "drive", "speed_kmh": round(v * 3.6, 1), "already_moving": True, "avoid": False,
                               "polyline": [[round(x, 2), round(y, 2)] for x, y in pts]}
@@ -471,21 +692,23 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 agents[vid] = {"type": a["type"], "x": road.lane_point(s_c2, tp_k2)[0], "y": road.lane_point(s_c2, tp_k2)[1],
                                "heading": road.lane_heading(s_c2)}
                 spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": False,
-                          "path": [list(road.lane_point(road.end_s, tp_k2))]}
+                          "path": [road.end_point(tp_k2)]}
             elif rel in ("cross_left", "cross_right"):
                 left = rel == "cross_left"
-                d_left = (0.0 if road.one_way else road.L * W) + shoulder_m - 1.5
-                d_right = -(road.L * W + shoulder_m - 1.5)
-                d_start, d_end = (d_left, d_right) if left else (d_right, d_left)
-                if straight_tp_cross and a is ev_actor:
-                    ps = tp_cross_s
-                elif is_ev and event["type"] != "none" and not stop_behaviours:
-                    d_ego = lane_offset(road.L, lane_idx)
-                    t_cross = abs(d_start - d_ego) / max(v_a, 1.0)
-                    t_ego_conflict = t_cross + (1.0 if event["type"] == "near_miss" else 0.0)
-                    ps = min(S_START + v_e * t_ego_conflict, road.end_s - 20.0)
-                else:
-                    ps = S_START + max(a["distance_m"], 15.0) + 12.0 * n_cross
+                d_left = (0.0 if road.one_way else road.Lw * W) + shoulder_m - 1.5
+                ps = None
+                for _ in range(2 if road.varying else 1):      # the right edge (where the car starts or ends) depends on ps
+                    d_right = (road.right_edge_d(ps) if ps is not None else -road.L * W) - (shoulder_m - 1.5)
+                    d_start, d_end = (d_left, d_right) if left else (d_right, d_left)
+                    if straight_tp_cross and a is ev_actor:
+                        ps = tp_cross_s
+                    elif is_ev and event["type"] != "none" and not stop_behaviours:
+                        d_ego = lane_offset(road.L, lane_idx)
+                        t_cross = abs(d_start - d_ego) / max(v_a, 1.0)
+                        t_ego_conflict = t_cross + (1.0 if event["type"] == "near_miss" else 0.0)
+                        ps = min(S_START + v_e * t_ego_conflict, road.end_s - 20.0)
+                    else:
+                        ps = S_START + max(a["distance_m"], 15.0) + 12.0 * n_cross
                 n_cross += 1
                 n_pts = max(int(abs(d_end - d_start) / 2.0), 4)
                 pts = [road.frame.to_xy(ps, d_start + (d_end - d_start) * j / n_pts) for j in range(n_pts + 1)]
@@ -506,6 +729,8 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     if close <= 0.5:
                         notes.append("%s: event cannot happen, the actor is not slower than the ego car" % a["id"])
                 sa = (65.0 if straight_tp_cross else S_START) + gapd
+                if not road.has_lane(sa, lane_k):
+                    lane_k = road.clamp_lane(sa, lane_k)
                 if straight_tp_cross and not is_ev:
                     if lane_k == lane_idx:
                         sa = max(sa, tp_cross_s + 8.5)
@@ -519,13 +744,14 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                         sa += 9.0
                     placed_bg_s.setdefault(lane_k, []).append(sa)
                 sa = min(sa, road.end_s)
+                lane_k = road.clamp_lane(sa, lane_k)
                 agents[vid] = {"type": a["type"], "x": road.lane_point(sa, lane_k)[0], "y": road.lane_point(sa, lane_k)[1],
                                "heading": road.lane_heading(sa)}
                 if beh in ("stopped",) or v_a < 1.0:
                     spec_p = {"mode": "static"}
                 else:
                     spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": False,
-                              "path": [list(road.lane_point(road.end_s, lane_k))]}
+                              "path": [road.end_point(lane_k)]}
                     if beh == "braking":
                         spec_p["stop_at_s"] = round(max(T - 1.5, 1.0), 2)
                         if is_ev:           # closed loop: brake when the ego car is about 2 s away, whichever comes first
@@ -535,10 +761,11 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 if sb < 3.0:
                     notes.append("%s: no room behind the ego car, actor dropped" % a["id"])
                     continue
+                lane_k = road.clamp_lane(sb, lane_k)
                 agents[vid] = {"type": a["type"], "x": road.lane_point(sb, lane_k)[0], "y": road.lane_point(sb, lane_k)[1],
                                "heading": road.lane_heading(sb)}
                 spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": True,
-                          "path": [list(road.lane_point(road.end_s, lane_k))]}
+                          "path": [road.end_point(lane_k)]}
             else:       # oncoming
                 so = (65.0 if straight_tp_cross else S_START) + a["distance_m"] + v_a * 2
                 if straight_tp_cross:
@@ -676,6 +903,10 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                  "edge_right": "shoulder" if has_straight_cross else spec["road"].get("edge_right", "shoulder"),
                  "edge_left": "shoulder" if has_straight_cross else spec["road"].get("edge_left", "shoulder"),
                  "shoulder_m": shoulder_m}
+    if road.kind == "straight" and road.varying:
+        road_plan["sections"] = [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in sc.items()} for sc in road.sections]
+        road_plan["lanes_opposite"] = road.Lw
+        road_plan["xodr_pieces"] = xodr_pieces(road)
     plan = {"ego": "v1", "duration_s": round(T + 5.0, 1), "expect": expect, "agents": plan_agents, "idmap": idmap,
             "notes": notes, "source": "scene_builder", "road": road_plan}
     _write_json(os.path.join(out_dir, scene_id + "_motion.json"), plan)

@@ -154,7 +154,7 @@ COLOR_Q = (CTX_NOTE + "What colour is the vehicle that comes closest to the ego 
            "A) white\nB) black\nC) silver\nD) gray\nE) red\nF) blue\nG) green\nH) another colour")
 COLOR_KEYS = {"A": "white", "B": "black", "C": "silver", "D": "gray", "E": "red", "F": "blue", "G": "green"}
 LANES_Q = ("A frame from a dashcam video (the camera is in the ego vehicle). How many lanes does the road have in the ego vehicle's "
-           "own driving direction (not counting the opposite direction)?\nA) 1\nB) 2\nC) 3\nD) 4 or more")
+           "own driving direction (not counting the opposite direction)?\nA) 1\nB) 2\nC) 3\nD) 4\nE) 5\nF) 6 or more")
 CROSS_Q = ("A frame from a dashcam video (the camera is in the ego vehicle). Is there an intersection where another road crosses "
            "the ego vehicle's road within about 30 meters ahead, with traffic lights or a crossing street? Answer YES or NO.")
 
@@ -169,7 +169,7 @@ def road_scores(video, duration, n=10, t0=None, t1=None, t_crash=None, log_fn=lo
     else:
         lo = 0.0 if t0 is None else float(t0)
     times = [round(lo + (hi - lo) * (i + 0.5) / n, 2) for i in range(n)]
-    lanes = {k: 0.0 for k in "ABCD"}
+    lanes = {k: 0.0 for k in "ABCDEF"}
     cross = 0.0
     used = 0
     for t in times:
@@ -177,7 +177,7 @@ def road_scores(video, duration, n=10, t0=None, t1=None, t_crash=None, log_fn=lo
         if not fr:
             continue
         try:
-            pl = llm_backend.choice_probabilities(LANES_Q, fr, "ABCD")
+            pl = llm_backend.choice_probabilities(LANES_Q, fr, "ABCDEF")
             cr = llm_backend.yes_probability(CROSS_Q, fr)
             for k in lanes:
                 lanes[k] += pl[k]
@@ -188,7 +188,7 @@ def road_scores(video, duration, n=10, t0=None, t1=None, t_crash=None, log_fn=lo
     if used:
         lanes = {k: v / used for k, v in lanes.items()}
         cross /= used
-    n_lanes = {"A": 1, "B": 2, "C": 3, "D": 3}[max(lanes, key=lanes.get)]
+    n_lanes = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6}[max(lanes, key=lanes.get)]
     return {"lanes": n_lanes, "lane_probs": {k: round(v, 2) for k, v in lanes.items()}, "intersection": round(cross, 2)}
 
 
@@ -479,6 +479,145 @@ def add_curve(spec, video, duration, t_crash, caps, log_fn=log):
     return spec
 
 
+def sim_window(spec):
+    """(video time at which the simulation starts, simulated event time T): the scene builder starts the ego car T seconds before
+    the event, with T = event time clamped to 3..8 s (6 s and the video start without an event)."""
+    ev = spec.get("event") or {}
+    if ev.get("type") in ("collision", "near_miss") and ev.get("actor_id"):
+        t_ev = float(ev.get("time_s", 5.0))
+        T = min(max(t_ev, 3.0), 8.0)
+        return max(t_ev - T, 0.0), T
+    return 0.0, 6.0
+
+
+def vehicle_lane_evidence(video, t0, t1, samples, step=1.0):
+    """[{"t", "left", "right"}]: lanes beside the ego lane that vehicles stand in, one frame every `step` seconds (vehicles
+    from the local model's boxes, agents/vehicle_tracker; only cars on the ego carriageway count, agents/lane_lines). A queue of
+    cars hides its lanes' road surface, so the cars are the evidence that those lanes are there. [] without the model."""
+    import cv2
+    from agents import lane_lines, vehicle_tracker
+    out = []
+    try:
+        y_b, _ = lane_lines.road_bottom(video)
+        t = float(t0) + 0.5 * step
+        while t <= float(t1):
+            dets, (w, h), im = vehicle_tracker._detect_with_image(video, t, width=640)
+            near = min(samples, key=lambda r: abs(r["t"] - t), default=None)
+            vp_y = (near or {}).get("vp", [None, None])[1] if near and near.get("vp") else None
+            frame = cv2.resize(im, (lane_lines.WIDTH, int(round(h * lane_lines.WIDTH / float(w))))) if im is not None else None
+            ev = {"t": round(t, 2), "left": 0, "right": 0}
+            for d in dets:
+                ok = frame is not None and lane_lines.on_ego_road(frame, d["box"], y_b, src_w=w,
+                                                                  vp_y=None if vp_y is None else vp_y)
+                vl = lane_lines.vehicle_lane(d, ok)
+                if vl:
+                    ev[vl[0]] = max(ev[vl[0]], vl[1])
+            out.append(ev)
+            t += step
+    except Exception as e:
+        log("vehicle lane evidence failed: %s" % e)
+    return out
+
+
+def _move_leaving_lanes(prof, k, side):
+    """Re-attribute the lanes that leave at section k to `side`: section k and every later one keep their lane counts, and their
+    m (lanes missing on the left) is set so that the lanes that stay are on the other side."""
+    a, b = prof[k - 1], prof[k]
+    gone = a["n"] - b["n"]
+    if gone <= 0:
+        return
+    new_m = a["m"] + gone if side == "left" else a["m"]
+    delta = new_m - b["m"]
+    for sc in prof[k:]:
+        sc["m"] += delta
+    lo = min(sc["m"] for sc in prof)
+    for sc in prof:
+        sc["m"] -= lo
+
+
+def tag_branches(prof, t_v0, v, video, duration, probe=None):
+    """Mark the first place where lanes leave the ego road as a branch when the frames after it show lanes going on as a road of
+    their own: rising (a flyover or ramp) or, with a stronger cue, flat. Both sides are asked; a clearly stronger cue on the
+    other side than the one the road width points to wins (a paved shoulder can make the wrong side look narrower).
+    Returns a note or None."""
+    from agents import road_probes
+    probe = probe or road_probes.branch_evidence
+    for k in range(1, len(prof)):
+        a, b = prof[k - 1], prof[k]
+        if b["n"] >= a["n"] or v < 1.0:
+            continue
+        side = "left" if b["m"] > a["m"] else "right"
+        t_b = t_v0 + b["d0"] / v
+        ev = {sd: probe(video, t_b, sd, duration) for sd in ("left", "right")}
+        other = "right" if side == "left" else "left"
+        if max(ev[other]) >= max(road_probes.RISE_P, road_probes.SPLIT_P) and max(ev[other]) > max(ev[side]) + 0.1:
+            side = other
+            _move_leaving_lanes(prof, k, side)
+        p_split, p_rise = ev[side]
+        if p_rise >= road_probes.RISE_P:
+            b["branch"] = {"side": side, "rise_m": 6.0}
+        elif p_split >= road_probes.SPLIT_P:
+            b["branch"] = {"side": side, "rise_m": 0.0}
+        what = ("a branch that climbs" if p_rise >= road_probes.RISE_P else "a flat branch") if b.get("branch") else "lanes that end"
+        return "lanes leaving on the %s at %.0f m (video %.1f s): %s (split/rise left %.2f/%.2f, right %.2f/%.2f)" % (
+            side, b["d0"], t_b, what, ev["left"][0], ev["left"][1], ev["right"][0], ev["right"][1])
+    return None
+
+
+def add_lane_profile(spec, video, duration, t_crash=None, samples=None, step=0.5, log_fn=log, branch_probe=None):
+    """Lane count along the simulated stretch of road (straight roads), from the lane-line and road-surface detector
+    (agents/lane_lines.py): the count is measured every `step` seconds, smoothed into sections, the side of every change is
+    where the road got narrower or wider, and the times become distances driven by the simulated ego car.
+    Sets spec.road.lane_profile (or None), spec.road.lanes_per_direction (count at the event) and spec.ego.lane_index.
+    Returns the samples so that the caller can store them."""
+    from agents import lane_profile, lane_lines
+    road = spec["road"]
+    if road["type"] != "straight":
+        return samples
+    t_v0, T = sim_window(spec)
+    t_lo, t_hi = max(t_v0 - 0.5, 0.0), min(max(duration - 0.1, 0.0), t_v0 + T + 5.0)
+    if samples is None:
+        samples = lane_lines.lane_timeline(video, t_lo, t_hi, step=step)
+        lane_lines.apply_vehicle_evidence(samples, vehicle_lane_evidence(video, t_lo, t_hi, samples))
+    measured = [s for s in samples if s.get("probs")]
+    segs = lane_profile.segment_counts(measured)
+    if not segs:
+        road["lane_profile"] = None
+        spec.setdefault("notes", []).append("lane count: no usable lane measurement (%d windows)" % len(samples))
+        return samples
+    t_ev = t_v0 + T if t_crash is None else float(t_crash)
+    at_ev = next((sg for sg in segs if sg["t1"] >= t_ev), segs[-1])
+    need = 2 if any(a["relation"] == "beside" for a in spec["actors"]) else 1
+    v = 0.0 if spec["ego"]["behavior"] == "stopped" else float(spec["ego"]["speed_kmh"]) / 3.6
+    bounds = lane_profile.boundary_times(segs, measured)
+    sides = [lane_lines.change_side(measured, a["t1"], b["t0"]) for a, b in zip(segs, segs[1:])]
+    prof = lane_profile.build_profile(segs, bounds, sides, t_v0, v)
+    if not prof:
+        road["lanes_per_direction"] = max(at_ev["n"], need)
+        road["lane_profile"] = None
+        spec.setdefault("notes", []).append("lane count from %d windows: %d (no change on the simulated stretch)" % (
+            len(measured), road["lanes_per_direction"]))
+        return samples
+    sec_ev = lane_profile.section_at(prof, v * T)
+    if sec_ev["n"] < need:                                    # the merging car needs a lane beside the ego car
+        sec_ev["n"] = need
+    bnote = tag_branches(prof, t_v0, v, video, duration, branch_probe)
+    if bnote:
+        spec.setdefault("notes", []).append(bnote)
+        log_fn(bnote)
+    road["lane_profile"] = prof
+    road["lanes_per_direction"] = sec_ev["n"]
+    sec0 = lane_profile.section_at(prof, 0.0)
+    left = sorted(s["lanes_left"] for s in measured if s.get("lanes_left") is not None and t_v0 <= s["t"] <= t_v0 + 1.5)
+    j = min(int(round(left[len(left) // 2])), sec0["n"] - 1) if left else None
+    spec["ego"]["lane_index"] = None if j is None else sec0["m"] + j
+    txt = ", ".join("%d lanes%s" % (sc["n"], "" if sc["d0"] is None else " from %.0f m" % sc["d0"]) for sc in prof)
+    spec.setdefault("notes", []).append("lane profile from %d windows: %s (changes on the %s); ego lane %s from the left at the start" % (
+        len(measured), txt, "/".join(sides) or "-", "?" if j is None else j + 1))
+    log_fn("lane profile: " + txt)
+    return samples
+
+
 def refine(spec, caps, events, duration, roads=None, t_crash=None, ego_motion=None):
     """Deterministic fusion: road from the frame scores, ego motion from the pre-event motion analysis."""
     notes = []
@@ -660,6 +799,12 @@ def phase1(video, out, spec_path=None, fps=6.0, assume_crash=True, reuse=False):
                 ts = time.time()
                 spec = add_curve(spec, video, dur, t_crash, caps)
                 t_stages["curve"] = time.time() - ts
+                ts = time.time()
+                lane_samples = add_lane_profile(spec, video, dur, t_crash=t_crash,
+                                                samples=_cached(out, "lane_timeline.json", reuse))
+                if lane_samples:
+                    _save(lane_samples, os.path.join(out, "lane_timeline.json"))
+                t_stages["lane_profile"] = time.time() - ts
     spec["degraded"] = degraded
     if not spec_path and os.environ.get("LLM_KEEP") != "1":
         llm_backend.stop_server()            # free the memory for CARLA

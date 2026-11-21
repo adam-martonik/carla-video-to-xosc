@@ -107,16 +107,22 @@ def _predict_point_at(actor, follower, speed_kmh, t_s):
     return x, y
 
 
-def barrier_offsets(road_plan):
-    """Lateral offsets d (+ = left) of the barrier lines: just outside the shoulder, on the ego carriageway's outer edges."""
+def barrier_offsets(road_plan, s=None):
+    """Lateral offsets d (+ = left) of the barrier lines: just outside the shoulder, on the ego carriageway's outer edges.
+    When the lane count changes along the road (road_plan["sections"]), the offsets are those of the section at distance s."""
     if not road_plan:
         return []
     lanes, shoulder = int(road_plan.get("lanes", 2)), float(road_plan.get("shoulder_m", 3.0))
+    left_m = 0
+    secs = road_plan.get("sections")
+    if secs and s is not None:
+        sc = next((x for x in secs if s < float(x["s1"])), secs[-1])
+        lanes, left_m = int(sc["m"]) + int(sc["n"]), int(sc["m"])
     out = []
     if road_plan.get("edge_right") == "barrier":
         out.append(-(lanes * LANE_WIDTH + shoulder + 0.3))
     if road_plan.get("edge_left") == "barrier" and road_plan.get("one_way"):
-        out.append(shoulder + 0.3)       # with two carriageways the left side is the median, which gets no barrier
+        out.append(-left_m * LANE_WIDTH + shoulder + 0.3)    # with two carriageways the left side is the median: no barrier
     return out
 
 
@@ -129,9 +135,11 @@ def spawn_barriers(world, bp_lib, road_plan, spawned_ids, step=4.0):
         return 0, 0
     frame = RoadFrame(road_plan["centerline"])
     placed = failed = 0
-    for d in offsets:
+    for i in range(len(offsets)):
         s_ = 0.0
         while s_ <= frame.length:
+            here = barrier_offsets(road_plan, s_)
+            d = here[i] if len(here) == len(offsets) else offsets[i]
             x, y = frame.to_xy(s_, d)
             p = world.try_spawn_actor(bps[0], carla.Transform(carla.Location(x, -y, 0.2), carla.Rotation(yaw=-frame.heading(s_))))
             if p is None:
@@ -563,7 +571,13 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
 
         def _chase_target_pose():
             if locked_cam_target is not None:
-                return locked_cam_target
+                # after the contact: follow the crash pair (the cars keep moving while they brake), looking the way the ego
+                # car looked at the moment of contact so that the framing stays steady
+                ha, hb, yaw0 = locked_cam_target
+                if ha in actors and hb in actors and actors[ha].is_alive and actors[hb].is_alive:
+                    la, lb = actors[ha].get_location(), actors[hb].get_location()
+                    return crash_focus_transform(0.5 * (la.x + lb.x), 0.5 * (la.y + lb.y), yaw0, back_m=16.0, side_m=0.0, height_m=7.5)
+                return cur_cam_pose
             if ego in actors and actors[ego].is_alive:
                 el = actors[ego].get_location()
                 ey = actors[ego].get_transform().rotation.yaw
@@ -725,10 +739,8 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                     c0 = hits[0]
                     ha, hb = c0["actor"], id_of.get(c0["other_id"])
                     if ha in actors and hb in actors and actors[ha].is_alive and actors[hb].is_alive:
-                        la, lb = actors[ha].get_location(), actors[hb].get_location()
                         cur_yaw = actors[ego].get_transform().rotation.yaw if ego in actors and actors[ego].is_alive else ego_yaw
-                        locked_cam_target = crash_focus_transform(
-                            0.5 * (la.x + lb.x), 0.5 * (la.y + lb.y), cur_yaw, back_m=16.0, side_m=0.0, height_m=7.5)
+                        locked_cam_target = (ha, hb, cur_yaw)
                 except Exception:
                     pass
             try:

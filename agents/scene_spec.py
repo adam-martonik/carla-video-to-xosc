@@ -4,8 +4,11 @@ Everything after this step is deterministic code (agents/scene_builder.py), so a
 pipeline: values are validated, clamped and defaulted here.
 
 {
- "road":  {"type": "straight|crossroad", "lanes_per_direction": 1-3, "traffic_signals": bool},
- "ego":   {"type": "car|motorcycle|truck", "lane": "right|left", "speed_kmh": 0-130,
+ "road":  {"type": "straight|crossroad", "lanes_per_direction": 1-6, "traffic_signals": bool,
+           "lane_profile": null or [{"d0": m|null, "d1": m|null, "n": 1-6, "m": lanes missing on the left}]},
+                                          # lane_profile: lanes along the road (agents/lane_profile.py); d from the ego start
+ "ego":   {"type": "car|motorcycle|truck", "lane": "right|left", "lane_index": null or 0-5 (from the left, see lane_profile),
+           "speed_kmh": 0-130,
            "behavior": "cruise|slow_to_stop|stopped|turn_left|turn_right"},
  "actors": [{"id": "a1", "type": "car|suv|truck|van|motorcycle|bike|pedestrian",
              "relation": "ahead|behind|oncoming|cross_left|cross_right",
@@ -28,18 +31,20 @@ EVENTS = ("collision", "near_miss", "none")
 EDGES = ("barrier", "shoulder", "open")
 TRAFFIC_LANES = ("ego_lane_ahead", "left_lane", "right_lane", "oncoming")
 MAX_TRAFFIC = 12
+MAX_LANES = 6
 
 DEFAULT = {
     "road": {"type": "straight", "lanes_per_direction": 2, "traffic_signals": False, "one_way": False,
-             "edge_right": "shoulder", "edge_left": "shoulder", "centerline": None, "curve_note": None},
+             "edge_right": "shoulder", "edge_left": "shoulder", "centerline": None, "curve_note": None,
+             "lane_profile": None},
     "traffic": {"ego_lane_ahead": 0, "left_lane": 0, "right_lane": 0, "oncoming": 0, "rel_speed_kmh": 0.0},
-    "ego": {"type": "car", "lane": "right", "speed_kmh": 50.0, "behavior": "cruise"},
+    "ego": {"type": "car", "lane": "right", "lane_index": None, "speed_kmh": 50.0, "behavior": "cruise"},
     "actors": [],
     "event": {"type": "none", "actor_id": None, "actor2_id": None, "time_s": 5.0, "description": "fallback scene"},
 }
 
 PROMPT_SCHEMA = """{
- "road": {"type": "straight" or "crossroad", "lanes_per_direction": 1, 2 or 3, "traffic_signals": true or false},
+ "road": {"type": "straight" or "crossroad", "lanes_per_direction": 1 to 6, "traffic_signals": true or false},
  "ego": {"type": "car" or "motorcycle" or "truck", "lane": "right" or "left", "speed_kmh": number,
          "behavior": "cruise" or "slow_to_stop" or "stopped" or "turn_left" or "turn_right"},
  "actors": [ {"id": "a1", "type": "car" or "suv" or "truck" or "van" or "motorcycle" or "bike" or "pedestrian",
@@ -123,6 +128,41 @@ def _centerline(v):
     return out
 
 
+def _lane_profile(v):
+    """Ordered, contiguous sections [{"d0", "d1", "n", "m"}] (first d0 and last d1 open), else None. A section may carry
+    "branch": {"side": "left"|"right", "rise_m": metres}: the lanes that leave the ego road where it starts go on as a road of
+    their own (a fork or flyover) instead of ending."""
+    if not isinstance(v, (list, tuple)) or len(v) < 2:
+        return None
+    out = []
+    for i, sc in enumerate(v):
+        if not isinstance(sc, dict):
+            return None
+        try:
+            n = int(round(float(sc.get("n"))))
+            m = int(round(float(sc.get("m", 0) or 0)))
+            d0 = None if i == 0 else float(sc.get("d0"))
+            d1 = None if i == len(v) - 1 else float(sc.get("d1"))
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= n <= MAX_LANES or not 0 <= m < MAX_LANES or n + m > MAX_LANES:
+            return None
+        if out and (d0 is None or abs(d0 - out[-1]["d1"]) > 1e-6):
+            return None
+        if d0 is not None and d1 is not None and d1 <= d0:
+            return None
+        out.append({"d0": d0, "d1": d1, "n": n, "m": m})
+        br = sc.get("branch")
+        if i > 0 and isinstance(br, dict) and br.get("side") in ("left", "right") and not any("branch" in x for x in out):
+            a = out[-2]
+            leaves = (m > a["m"]) if br["side"] == "left" else (m + n < a["m"] + a["n"])
+            if leaves:                       # only the first split is kept; it must be on the side where lanes leave
+                out[-1]["branch"] = {"side": br["side"], "rise_m": _num(br.get("rise_m"), -20.0, 20.0, 0.0)}
+    if min(s["m"] for s in out) != 0:
+        return None
+    return out
+
+
 def _traffic(obj):
     t = dict(DEFAULT["traffic"])
     obj = obj if isinstance(obj, dict) else {}
@@ -144,7 +184,7 @@ def normalize(obj):
     spec["road"]["type"] = _pick(road.get("type"), ROAD_TYPES,
                                  "crossroad" if "junction" in str(road.get("type", "")).lower() or
                                  "intersection" in str(road.get("type", "")).lower() else "straight")
-    spec["road"]["lanes_per_direction"] = int(round(_num(road.get("lanes_per_direction"), 1, 3, 2)))
+    spec["road"]["lanes_per_direction"] = int(round(_num(road.get("lanes_per_direction"), 1, MAX_LANES, 2)))
     spec["road"]["traffic_signals"] = bool(road.get("traffic_signals", False))
     spec["road"]["one_way"] = _bool(road.get("one_way", False))
     for side in ("edge_right", "edge_left"):
@@ -153,10 +193,13 @@ def normalize(obj):
     spec["road"]["centerline"] = _centerline(road.get("centerline"))
     note = road.get("curve_note")
     spec["road"]["curve_note"] = str(note)[:200] if note else None
+    spec["road"]["lane_profile"] = _lane_profile(road.get("lane_profile"))
     spec["traffic"] = _traffic(obj.get("traffic"))
     ego = obj.get("ego") or {}
     spec["ego"]["type"] = _pick(ego.get("type"), EGO_TYPES, "car")
     spec["ego"]["lane"] = "left" if str(ego.get("lane", "")).lower().startswith("l") else "right"
+    li = ego.get("lane_index")
+    spec["ego"]["lane_index"] = int(_num(li, 0, MAX_LANES - 1, 0)) if li is not None and str(li).strip() != "" else None
     spec["ego"]["speed_kmh"] = _num(ego.get("speed_kmh"), 0.0, 130.0, 50.0)
     spec["ego"]["behavior"] = _pick(ego.get("behavior"), EGO_BEHAVIORS, "cruise")
     spec["ego"]["color"] = color_rgb(ego.get("color"))
