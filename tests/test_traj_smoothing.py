@@ -93,6 +93,14 @@ class TestSmoothTrajectory(unittest.TestCase):
         with self.assertRaises(ValueError):
             ts.smooth_trajectory([0.0], [0.0], [0.0])
 
+    def test_endpoint_velocity_does_not_drop_to_zero_when_speed_overshoots_path(self):
+        t = np.arange(0.0, 2.0, 0.1)
+        x = 10.0 * t
+        x[-1] -= 0.8                         # trailing slowdown in raw sample pulls s_path[-1] below s_new[-1]
+        r = ts.smooth_trajectory(t, x, np.zeros_like(t), "car")
+        self.assertGreater(float(r["v"][-1]), 5.0)
+        self.assertGreater(float(r["x"][-1]), float(r["x"][-2]))
+
 
 if __name__ == "__main__":
     unittest.main()

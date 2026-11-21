@@ -102,5 +102,60 @@ class TestSmoothCameraPose(unittest.TestCase):
         self.assertAlmostEqual(nxt[4], 180.0)
 
 
+class TestRouteFollowerGeometryAndAvoidance(unittest.TestCase):
+    def _setup_carla(self):
+        import types
+        class _Loc:
+            def __init__(self, x=0.0, y=0.0, z=0.0): self.x, self.y, self.z = x, y, z
+            def distance(self, o): return math.sqrt((self.x - o.x)**2 + (self.y - o.y)**2 + (self.z - o.z)**2)
+        class _Rot:
+            def __init__(self, yaw=0.0): self.yaw = yaw
+        class _Tf:
+            def __init__(self, x, y, z=0.0, yaw=0.0): self.location, self.rotation = _Loc(x, y, z), _Rot(yaw)
+        class _Vec:
+            def __init__(self, vx, vy): self.x, self.y = vx, vy
+            def length(self): return math.hypot(self.x, self.y)
+        class _Ctl:
+            def __init__(self, throttle=0.0, steer=0.0, brake=0.0, hand_brake=False):
+                self.throttle, self.steer, self.brake, self.hand_brake = throttle, steer, brake, hand_brake
+        class _Car:
+            def __init__(self, x, y, z, yaw, vx, vy, type_id="vehicle.dodge.charger"):
+                self._loc, self._tf, self._vel, self.type_id = _Loc(x, y, z), _Tf(x, y, z, yaw), _Vec(vx, vy), type_id
+            def get_location(self): return self._loc
+            def get_transform(self): return self._tf
+            def get_velocity(self): return self._vel
+            def get_physics_control(self): return types.SimpleNamespace(wheels=[types.SimpleNamespace(max_steer_angle=70.0)])
+        return _Loc, _Car, _Ctl
+
+    def test_elevated_car_advances_waypoints_and_ignores_other_levels_and_adjacent_bend_cars(self):
+        import types
+        from agents.road_frame import RoadFrame
+        _Loc, _Car, _Ctl = self._setup_carla()
+        saved = sys.modules.get("carla")
+        sys.modules["carla"] = types.SimpleNamespace(Location=_Loc, VehicleControl=_Ctl)
+        try:
+            R = 187.0
+            pts = [[R * math.sin(s / R), -R * (1.0 - math.cos(s / R))] for s in range(0, 300, 4)]
+            fr = RoadFrame(pts)
+            route = [motion_runner._RoutePoint(_Loc(x, -y, 0.0)) for s in range(0, 260, 4) for x, y in [fr.to_xy(float(s), -3.5)]]
+            sx, sy = fr.to_xy(20.0, -3.5)
+            h = -fr.heading(20.0)
+            me = _Car(sx, -sy, 6.0, h, 15.0 * math.cos(math.radians(h)), 15.0 * math.sin(math.radians(h)))
+            fol = motion_runner.RouteFollower(me, route, 54.0, avoid=True, road_frame=fr)
+            # Same-s/d car on a lower bridge deck (z=0 vs z=6) must be ignored
+            under = _Car(sx + 10.0 * math.cos(math.radians(h)), -sy + 10.0 * math.sin(math.radians(h)), 0.0, h, 0.0, 0.0)
+            # Car 35 m ahead on an adjacent lane (d = -7.0 vs -3.5) on R=187 m curve must be ignored
+            ax, ay = fr.to_xy(55.0, -7.0)
+            adj = _Car(ax, -ay, 6.0, -fr.heading(55.0), 0.0, 0.0)
+            ctl = fol.control([under, adj], 0.05, 1.0, 1.0)
+            self.assertGreater(fol.i, 0)                      # waypoint index advanced despite z=6 vs z=0
+            self.assertEqual(ctl.brake, 0.0)                  # did not phantom-brake
+        finally:
+            if saved is None:
+                sys.modules.pop("carla", None)
+            else:
+                sys.modules["carla"] = saved
+
+
 if __name__ == "__main__":
     unittest.main()

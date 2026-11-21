@@ -184,9 +184,24 @@ def smooth_trajectory(times, x, y, vtype="car", dt=0.1, meas_std=0.15, process_s
 
     # integrate the feasible speed along the smoothed path (trapezoid), then read the path back at that arc length
     s_new = np.concatenate([[0.0], np.cumsum(0.5 * (v_lim[1:] + v_lim[:-1]) * np.diff(t))])
-    s_new = np.clip(s_new, 0.0, s_path[-1])
-    x_out = np.interp(s_new, s_path, xs)
-    y_out = np.interp(s_new, s_path, ys)
+    s_new = np.maximum(s_new, 0.0)
+    s_ref, x_ref, y_ref = s_path, xs, ys
+    if s_new[-1] > s_path[-1]:
+        k = len(s_path) - 2
+        while k > 0 and s_path[-1] - s_path[k] < 0.5:
+            k -= 1
+        dx, dy = float(xs[-1] - xs[k]), float(ys[-1] - ys[k])
+        norm = math.hypot(dx, dy)
+        if norm > 1e-6:
+            s_ext = float(s_new[-1]) + 1.0
+            extra = s_ext - float(s_path[-1])
+            s_ref = np.append(s_path, s_ext)
+            x_ref = np.append(xs, float(xs[-1]) + extra * dx / norm)
+            y_ref = np.append(ys, float(ys[-1]) + extra * dy / norm)
+        else:
+            s_new = np.clip(s_new, 0.0, s_path[-1])
+    x_out = np.interp(s_new, s_ref, x_ref)
+    y_out = np.interp(s_new, s_ref, y_ref)
     v_out = np.hypot(np.gradient(x_out, t), np.gradient(y_out, t))
     dev = float(np.max(np.hypot(np.interp(t, t_raw, x_raw) - x_out, np.interp(t, t_raw, y_raw) - y_out)))
     return {"times": t, "x": x_out, "y": y_out, "h": h, "v": v_out, "max_deviation_m": dev}

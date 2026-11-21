@@ -65,6 +65,26 @@ class TestCutIn(unittest.TestCase):
         for (t0, d0, _), (t1, d1, _) in zip(log, log[1:]):
             self.assertLessEqual(abs(d1 - d0) / (t1 - t0), 1.5 + 1e-6)
 
+    def test_overtake_cut_in_starts_ahead_at_lower_speed_and_contacts_in_window(self):
+        cfg = CutInConfig(lane_src_d=SRC_D, lane_dst_d=EGO_D, t_event_s=8.0, cruise_speed_ms=7.0)
+        ctl = CutInController(cfg)
+        v_ego, v_me = 17.4, 7.0
+        ego_s = 15.0
+        me_s = ego_s + (v_ego - v_me) * 8.0 + 1.0
+        me_d = SRC_D
+        touched, t_touch = False, None
+        t = 0.0
+        while t < 12.0:
+            d_t, v_t = ctl.update(t, (ego_s, EGO_D, v_ego), (me_s, me_d, v_me), touched)
+            me_d, v_me = d_t, v_t
+            ego_s += v_ego * DT
+            me_s += v_me * DT
+            t += DT
+            if not touched and abs(me_d - EGO_D) < 2.0 and abs(me_s - ego_s) < 4.5:
+                touched, t_touch = True, t
+        self.assertIsNotNone(t_touch)
+        self.assertTrue(6.5 <= t_touch <= 9.5, t_touch)
+
 
 if __name__ == "__main__":
     unittest.main()

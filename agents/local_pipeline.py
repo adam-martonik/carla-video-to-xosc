@@ -463,7 +463,10 @@ def add_curve(spec, video, duration, t_crash, caps, log_fn=log):
     if not est["t"]:
         spec["road"]["curve_note"] = "no yaw estimate: straight road"
         return spec
-    c = road_curve.centerline_from_yaw(est["t"], est["yaw_rate"], speed_series(caps, est["t"]))
+    sp_est = speed_series(caps, est["t"])
+    v_est = max([v for v in sp_est if v is not None] or [float(spec["ego"]["speed_kmh"]) / 3.6, 14.0])
+    c = road_curve.centerline_from_yaw(est["t"], est["yaw_rate"], sp_est,
+                                       length_m=max(550.0, v_est * (T + 8.0) + 250.0))
     c["confidence"] = round(c["confidence"] * est["confidence"], 3)
     c = road_curve.reconcile_with_probe(c, road_probes.curve_direction(video, duration, t0=t0, t1=t1))
     if c.get("fallback"):
@@ -742,6 +745,12 @@ def lane_profile_from_map(spec, scene, video, duration, branch_probe=None, log_f
     d_ev = s_ego(t_v0 + T)
     left0 = sorted(x["lanes_left"] for x in measured if x["t"] <= 30.0)       # the very start is barely seen yet
     s_last = max(x["t"] for x in measured)
+    if len(prof) > 1 and prof[0]["d1"] is not None and prof[0]["d1"] < 25.0:
+        prof[1]["d0"] = None                                         # a start stretch barely seen in near-field FOV: not used
+        prof.pop(0)
+        lo_m = min(sc["m"] for sc in prof)
+        for sc in prof:
+            sc["m"] -= lo_m
     if len(prof) > 1 and prof[-1]["d0"] is not None and s_last - prof[-1]["d0"] < 25.0:
         prof[-2]["d1"] = None                                        # a last change the map barely saw: not used
         prof.pop()
@@ -802,6 +811,7 @@ def apply_ego_speed(spec, scene):
 def apply_replay(spec, scene, t_crash, log_fn=log):
     """Every measured vehicle track that is not one of the crash vehicles is replayed along its path (spec.replay, in simulation
     time and metres from the ego start); the guessed background vehicles and per-lane traffic counts are dropped."""
+    import numpy as np
     from agents import vehicle_tracks
     tracks = scene["tracks"]
     if not tracks:
@@ -813,16 +823,43 @@ def apply_replay(spec, scene, t_crash, log_fn=log):
     rgb = (c1 or {}).get("color")
     color = next((k for k, v in COLORS.items() if rgb and "%d,%d,%d" % v == rgb), None)     # crash car's colour name
     skip = set(vehicle_tracks.crash_tracks(tracks, float(t_crash), ego_involved=not third, color=color)) if t_crash is not None else set()
-    t_v0, _ = sim_window(spec)
+    t_v0, T = sim_window(spec)
+    if not third and skip and c1 is not None and (c1.get("relation") == "beside" or c1.get("behavior") == "cutting_in"):
+        tr_crash = next((tr for tr in tracks if tr["id"] in skip), None)
+        if tr_crash and tr_crash.get("kind") == "same" and tr_crash.get("v"):
+            v_meas = float(np.median([abs(v) for v in tr_crash["v"]]))
+            sp_prof = spec["ego"].get("speed_profile")
+            v_ego_ev = (float(np.interp(T, [p[0] for p in sp_prof], [p[1] for p in sp_prof])) / 3.6) if sp_prof else (float(spec["ego"]["speed_kmh"]) / 3.6)
+            if v_ego_ev > 5.0 and v_meas < 0.75 * v_ego_ev:
+                v_kmh = round(max(v_meas * 3.6, 12.0), 1)
+                c1["speed_kmh"] = v_kmh
+                c1["measured"] = {"speed_kmh": v_kmh, "overtake": True}
     lane_w = next((x["lane_w"] for x in scene.get("lane_samples") or [] if x.get("lane_w")), None)
     k_d = 3.5 / lane_w if lane_w else 1.0          # positions across the road in simulation lanes (3.5 m)
+    prof = spec["road"].get("lane_profile")
+    if prof:
+        L_max = max(int(sc["m"]) + int(sc["n"]) for sc in prof)
+        idx = spec["ego"].get("lane_index")
+        k_ego = (L_max - 1 - int(idx)) if idx is not None else (0 if spec["ego"]["lane"] == "right" else L_max - 1)
+    else:
+        L_max = int(spec["road"].get("lanes_per_direction", 2))
+        k_ego = 0 if spec["ego"]["lane"] == "right" or L_max == 1 else L_max - 1
+    d_ego = -(L_max - 0.5 - k_ego) * 3.5
     rep = []
     for tr in tracks:
         if tr["id"] in skip or tr["last_t"] < t_v0:
             continue
         from agents import traj_smoothing
+        kind = tr["kind"]
+        if kind == "oncoming":
+            lat_med = d_ego + float(np.median(tr["d"])) * k_d
+            v_med = float(np.median([abs(v) for v in tr["v"]])) if tr.get("v") else 0.0
+            if spec["road"].get("one_way") or (lat_med < -1.0 and v_med < 10.0):
+                kind = "parked"
         d_s = [float(x) for x in traj_smoothing.smooth_offsets(tr["d"], window=9)]   # detection jitter across the road
         pts = list(zip(tr["t"], tr["s"], d_s))[::5]
+        if len(tr["t"]) > 1 and tr["t"][-1] - pts[-1][0] >= 0.2:
+            pts.append((tr["t"][-1], tr["s"][-1], d_s[-1]))
         # speed from the positions themselves (distance over time between samples), so that speed and path agree, then made
         # drivable (no steps, comfortable acceleration)
         spd = [abs(b[1] - a[1]) / max(b[0] - a[0], 1e-3) for a, b in zip(pts, pts[1:])]
@@ -830,7 +867,7 @@ def apply_replay(spec, scene, t_crash, log_fn=log):
         if len(spd) >= 3:
             spd = [float(x) for x in traj_smoothing.smooth_speed_series([p[0] for p in pts], spd,
                                                                           vtype=tr["type"] if tr["type"] != "bike" else "car")]
-        rep.append({"id": "r%d" % tr["id"], "type": tr["type"], "color": tr["color"], "kind": tr["kind"],
+        rep.append({"id": "r%d" % tr["id"], "type": tr["type"], "color": tr["color"], "kind": kind,
                     "path": [[round(t - t_v0, 2), round(s_, 2), round(d_ * k_d, 2)] for t, s_, d_ in pts],
                     "speed": [[round(p[0] - t_v0, 2), round(v * 3.6, 1)] for p, v in zip(pts, spd)]})
     spec["replay"] = rep

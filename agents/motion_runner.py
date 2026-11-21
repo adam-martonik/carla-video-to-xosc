@@ -205,7 +205,11 @@ def _cleanup(client, ids_fn):
         time.sleep(1)
 
 
-def build_route(cmap, start_loc, targets, step=2.0, look=15, max_len=250.0):
+def _dist2d(a, b):
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def build_route(cmap, start_loc, targets, step=2.0, look=15, max_len=800.0):
     """Waypoint route from start_loc through the target points. At every fork the branch is chosen by following
     each candidate `look` steps ahead and keeping the one that ends closest to the current target."""
     import carla
@@ -278,8 +282,9 @@ class RouteFollower:
     A_LAT = 3.0          # m/s^2 comfortable lateral acceleration in curves
     HEADWAY = 1.2        # s distance kept to an obstacle ahead when avoid=True
 
-    def __init__(self, vehicle, route, speed_kmh, avoid=False, step=2.0):
+    def __init__(self, vehicle, route, speed_kmh, avoid=False, step=2.0, road_frame=None):
         self.v, self.route, self.speed, self.avoid, self.step = vehicle, route, speed_kmh / 3.6, avoid, step
+        self.road_frame = road_frame
         self.i = 0
         self.thr = self.brk = self.str = 0.0
         self.crash_time = None
@@ -307,7 +312,7 @@ class RouteFollower:
     def pursuit_point(self, loc, spd, look, t_sim):
         """Point on the route that the steering aims at."""
         j = self.i
-        while j < len(self.route) - 1 and self.route[j].transform.location.distance(loc) < look:
+        while j < len(self.route) - 1 and _dist2d(self.route[j].transform.location, loc) < look:
             j += 1
         return self.route[j].transform.location
 
@@ -321,7 +326,7 @@ class RouteFollower:
         if self.crash_time is not None and now_abs - self.crash_time > 0.4:
             self.thr, self.brk = 0.0, 1.0
             return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
-        while self.i < len(self.route) - 1 and self.route[self.i + 1].transform.location.distance(loc) <                 self.route[self.i].transform.location.distance(loc):
+        while self.i < len(self.route) - 1 and _dist2d(self.route[self.i + 1].transform.location, loc) < _dist2d(self.route[self.i].transform.location, loc):
             self.i += 1
         spd = self.v.get_velocity().length()
         look = max(5.0, 0.8 * spd)
@@ -335,7 +340,7 @@ class RouteFollower:
         # target speed: planned speed (or the measured speed profile at this time), limited by curvature, stop at the route end
         if self.profile:
             self.speed = profile_speed(self.profile, t_sim) / 3.6
-        remaining = self.route[-1].transform.location.distance(loc)
+        remaining = _dist2d(self.route[-1].transform.location, loc)
         target = min(self.speed, self.curve_speed())
         if (remaining < spd * spd / (2 * self.DEC) + 2.0 and self.i >= len(self.route) - 3) or getattr(self, "ended", False):
             target = 0.0
@@ -348,13 +353,29 @@ class RouteFollower:
         if self.avoid:
             # nearest obstacle in the own lane corridor ahead; keep a 2 m gap with a comfortable braking curve
             fx, fy = math.cos(yaw), math.sin(yaw)
+            s_me = d_me = dir_sign = None
+            if self.road_frame is not None:
+                s_me, d_me = self.road_frame.to_sd(loc.x, -loc.y)
+                h_fr = math.radians(-self.road_frame.heading(s_me))
+                dir_sign = 1.0 if (math.cos(h_fr) * fx + math.sin(h_fr) * fy) >= 0.0 else -1.0
             best = None
             for o in others:
                 ol = o.get_location()
-                rx, ry = ol.x - loc.x, ol.y - loc.y
-                ahead = rx * fx + ry * fy
-                lateral = -rx * fy + ry * fx
-                if 0.0 < ahead < 80.0 and abs(lateral) < 2.3:
+                if abs(getattr(ol, "z", 0.0) - getattr(loc, "z", 0.0)) > 2.5:
+                    continue
+                if hasattr(o, "get_transform") and not getattr(o, "type_id", "").startswith("walker"):
+                    o_yaw = math.radians(o.get_transform().rotation.yaw)
+                    if math.cos(o_yaw) * fx + math.sin(o_yaw) * fy < -0.3:
+                        continue
+                if self.road_frame is not None:
+                    s_o, d_o = self.road_frame.to_sd(ol.x, -ol.y)
+                    ahead = (s_o - s_me) * dir_sign
+                    lateral = d_o - d_me
+                else:
+                    rx, ry = ol.x - loc.x, ol.y - loc.y
+                    ahead = rx * fx + ry * fy
+                    lateral = -rx * fy + ry * fx
+                if 0.0 < ahead < 60.0 and abs(lateral) < 1.8:
                     half = 1.0 if o.type_id.startswith("walker") else 2.4
                     gap = ahead - half - 2.4
                     if best is None or gap < best[0]:
@@ -498,10 +519,7 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             cam_writer.write(last_frame[0])
 
     try:
-        # ---- spawn
-        for aid, a in agents.items():
-            if plan["agents"].get(aid, {}).get("mode") == "skip":      # a replayed vehicle the checker took out
-                continue
+        def _spawn_one(aid, a):
             x, y, z = a["location"]
             yaw = a["rotation"][1]
             if a["type"] == "pedestrian":
@@ -511,8 +529,8 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 color = plan["agents"].get(aid, {}).get("color")
                 if color and bp.has_attribute("color"):
                     bp.set_attribute("color", color)
-            off = float(plan["agents"].get(aid, {}).get("offset_m", 0.0))
             pspec = plan["agents"].get(aid, {})
+            off = float(pspec.get("offset_m", 0.0))
             if pspec.get("polyline") and off:
                 sx, sy = polyline_shift(pspec)
                 x, y = x + sx, y - sy                         # obj coordinates are CARLA frame (y negated)
@@ -522,7 +540,6 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 cand = wp0.next(off) if off > 0 else wp0.previous(-off)
                 if cand:
                     x, y = cand[0].transform.location.x, cand[0].transform.location.y
-            actor = None
             heights = (z, 1.0, 0.5)
             if a["type"] != "pedestrian":
                 # just above the road surface under the spawn point, so that the car does not drop onto it (and is not put
@@ -534,7 +551,20 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             for zz in heights:                              # big vehicles may not fit at the first height
                 actor = world.try_spawn_actor(bp, carla.Transform(carla.Location(x, y, zz), carla.Rotation(yaw=yaw)))
                 if actor is not None:
-                    break
+                    return actor
+            return None
+
+        pending_spawns = {}
+        # ---- spawn
+        for aid, a in agents.items():
+            pspec = plan["agents"].get(aid, {})
+            if pspec.get("mode") == "skip":      # a replayed vehicle the checker took out
+                continue
+            spawn_at_s = float(pspec.get("spawn_at_s") or 0.0)
+            if spawn_at_s > 0.0:
+                pending_spawns[aid] = spawn_at_s
+                continue
+            actor = _spawn_one(aid, a)
             if actor is None:
                 print(f"[motion] spawn failed for {aid}")
                 continue
@@ -585,14 +615,17 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                     route.append(_RoutePoint(carla.Location(x, -y, 0.0)))
                     s_ += 2.0
                 cfg = CutInConfig(lane_src_d=float(ic["lane_src_d"]), lane_dst_d=float(ic["lane_dst_d"]), t_event_s=float(ic["t_event_s"]),
-                                  lead_s=float(ic.get("lead_s", 1.4)), aim_offset_m=float(ic.get("aim_offset_m", 0.0)))
+                                  lead_s=float(ic.get("lead_s", 1.4)), aim_offset_m=float(ic.get("aim_offset_m", 0.0)),
+                                  cruise_speed_ms=float(ic["cruise_speed_ms"]) if ic.get("cruise_speed_ms") is not None else None)
                 return InterceptFollower(v, route, speed, target, road_frame, CutInController(cfg))
             if spec.get("polyline"):
                 sx, sy = polyline_shift(spec)
                 route = [_RoutePoint(carla.Location(p_[0] + sx, -(p_[1] + sy), 0.0)) for p_ in spec["polyline"]]
             else:
-                route = build_route(world.get_map(), v.get_location(), [_to_carla(pt) for pt in spec["path"]])
-            return RouteFollower(v, route, speed, bool(spec.get("avoid", False)))
+                route = build_route(world.get_map(), v.get_location(), [_to_carla(pt) for pt in spec["path"]],
+                                    max_len=max(250.0, road_frame.length + 50.0))
+            return RouteFollower(v, route, speed, bool(spec.get("avoid", False)),
+                                 road_frame=(road_frame if road_pl.get("centerline") else None))
 
         for aid, spec in pa.items():
             if aid in actors and spec["mode"] == "drive":
@@ -701,6 +734,38 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
         recorder = TrajectoryRecorder()                 # raw poses of every actor, every tick -> <scene>_trajectories.json
         while tick * DT < t_end + 3.0:
             now = tick * DT
+            for aid in list(pending_spawns):
+                if now < pending_spawns[aid]:
+                    continue
+                pending_spawns.pop(aid)
+                actor = _spawn_one(aid, agents[aid])
+                if actor is None:
+                    continue
+                actors[aid] = actor
+                spawned_ids.append(actor.id)
+                id_of[actor.id] = aid
+                if actor.type_id.startswith("vehicle"):
+                    s = world.spawn_actor(bp_lib.find("sensor.other.collision"), carla.Transform(), attach_to=actor)
+                    s.listen(lambda ev, aid=aid: record_contact(ev, aid))
+                    sensors.append(s)
+                    spawned_ids.append(s.id)
+                    actor.apply_control(carla.VehicleControl(brake=0.0, hand_brake=False))
+                spec_d = pa[aid]
+                if spec_d["mode"] == "drive":
+                    fol = make_follower(aid, actor, spec_d)
+                    fol.stop_at = spec_d.get("stop_at_s")
+                    if spec_d.get("speed_profile") and not spec_d.get("intercept"):
+                        fol.profile = spec_d["speed_profile"]
+                    followers[aid] = fol
+                    peak[aid] = {"long": 0.0, "lat": 0.0}
+                    if spec_d.get("already_moving", False):
+                        tl = fol.route[min(fol.i + 3, len(fol.route) - 1)].transform.location
+                        vl = actor.get_location()
+                        dd = max(math.hypot(tl.x - vl.x, tl.y - vl.y), 1e-3)
+                        prof = spec_d.get("speed_profile")
+                        sp = (profile_speed(prof, now) if prof and not spec_d.get("intercept") else float(spec_d.get("speed_kmh", 40))) / 3.6
+                        actor.set_target_velocity(carla.Vector3D((tl.x - vl.x) / dd * sp, (tl.y - vl.y) / dd * sp, 0.0))
+                started[aid], start_time[aid] = True, round(now, 2)
             for aid, spec in pa.items():
                 if aid not in actors or spec["mode"] == "static" or aid in started:
                     continue

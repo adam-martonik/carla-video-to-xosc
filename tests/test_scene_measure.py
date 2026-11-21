@@ -382,3 +382,125 @@ class TestReplayPathDensity(unittest.TestCase):
         self.assertLessEqual(max(gaps), 4.5)                             # no long chords
         ds = [fr.to_sd(*q)[1] for q in poly]
         self.assertLess(max(ds) - min(ds), 0.2)                          # stays in its lane through the bend
+
+
+class TestSceneFixes(unittest.TestCase):
+    def test_split_branch_road_extends_past_incline_and_exports_to_xodr(self):
+        from agents import map_builder
+        from test_lane_profile import LEFT_FLYOVER, base_spec, build
+        spec = base_spec(LEFT_FLYOVER, lane_index=4)
+        tmp, plan, agents, net = build(spec)
+        self.addCleanup(tmp.cleanup)
+        fr = RoadFrame(plan["road"]["centerline"])
+        self.assertGreaterEqual(fr.length, 550.0)
+        xodr = map_builder.net_to_xodr(os.path.join(tmp.name, "lp.net.xml"), os.path.join(tmp.name, "lp.xodr"))
+        self.assertTrue(os.path.exists(xodr))
+
+    def test_on_carriageway_includes_diverging_branch_lanes(self):
+        secs = [{"s0": 0.0, "s1": 75.0, "n": 4, "m": 0},
+                {"s0": 75.0, "s1": 550.0, "n": 3, "m": 1, "branch": {"side": "left", "rise_m": 6.0}}]
+        road = scene_builder.Road("straight", 4, None, False, secs, min_length=550.0)
+        far_s = 75.0 + scene_builder.DIVERGE_LEN_M + 20.0
+        branch_lat = -0.5 * 3.5 + scene_builder.DIVERGE_D_M
+        self.assertTrue(scene_builder._on_carriageway(road, far_s, branch_lat, "same"))
+
+    def test_replay_defers_negative_start_snaps_parked_and_smooths_lane_change(self):
+        spec = spec_with(speed=60.0)
+        spec["road"]["lanes_per_direction"] = 2
+        spec["road"]["centerline"] = [[0.0, 0.0], [500.0, 0.0]]
+        # r1 starts behind road start at t=0 (s=5 at t=3 with v=10 m/s -> s0=-25, road start -10 < 3), enters later via spawn_at_s
+        # r2 is parked inside the oncoming lane (lat=+1.75) -> snapped to lane centre
+        # r3 switches lanes noisily -> ramped smoothly without instantaneous jumps > 1.0 m per 4 m step
+        spec["replay"] = [
+            {"id": "r1", "type": "car", "color": "blue", "kind": "same",
+             "path": [[3.0, 5.0, 3.5], [4.0, 15.0, 3.5]], "speed": [[3.0, 36.0], [4.0, 36.0]]},
+            {"id": "r2", "type": "car", "color": "black", "kind": "parked",
+             "path": [[0.0, 40.0, 6.2], [2.0, 40.2, 6.3]], "speed": []},
+            {"id": "r3", "type": "car", "color": "white", "kind": "same",
+             "path": [[0.0, 60.0, 0.0], [1.0, 70.0, 0.0], [2.0, 80.0, 3.4], [3.0, 90.0, 3.5]],
+             "speed": [[0.0, 36.0], [3.0, 36.0]]},
+        ]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        plan = scene_builder.build(spec, tmp.name, "fx")
+        with open(os.path.join(tmp.name, "fx_scene_obj.txt"), encoding="utf-8") as f:
+            agents = ast.literal_eval(f.readline())
+        v_r1 = plan["idmap"]["r1"]
+        self.assertGreater(plan["agents"][v_r1].get("spawn_at_s", 0.0), 0.0)
+        v_r2 = plan["idmap"]["r2"]
+        self.assertAlmostEqual(-agents[v_r2]["location"][1], -lane_offset(2, 1), delta=0.1)
+        v_r3 = plan["idmap"]["r3"]
+        fr = RoadFrame(plan["road"]["centerline"])
+        ds = [fr.to_sd(*p)[1] for p in plan["agents"][v_r3]["polyline"]]
+        max_step = max(abs(b - a) for a, b in zip(ds, ds[1:]))
+        self.assertLess(max_step, 1.2)
+
+    def test_apply_replay_marks_slow_overtake_and_reclassifies_false_oncoming(self):
+        spec = spec_with([{"id": "c1", "relation": "beside", "lane": "left", "behavior": "cutting_in", "color": "white"}],
+                         {"type": "collision", "actor_id": "c1", "time_s": 8.0}, speed=65.0)
+        spec["road"]["lanes_per_direction"] = 3
+        spec["ego"]["lane"] = "right"
+        ts = [round(7.0 + 0.1 * k, 2) for k in range(15)]
+        crash = {"id": 76, "type": "car", "color": "white", "kind": "same", "t": ts,
+                 "s": [140.0 + 5.0 * (t - 7.0) for t in ts], "z": [10.0 - 12.0 * (t - 7.0) for t in ts],
+                 "d": [3.5] * len(ts), "v": [5.0] * len(ts), "first_t": 7.0, "last_t": 8.4}
+        false_onc = {"id": 99, "type": "car", "color": "gray", "kind": "oncoming", "t": ts,
+                     "s": [200.0 - 5.0 * (t - 7.0) for t in ts], "z": [30.0] * len(ts),
+                     "d": [5.0] * len(ts), "v": [-5.0] * len(ts), "first_t": 7.0, "last_t": 8.4}
+        slower = {"id": 31, "type": "car", "color": "brown", "kind": "same", "t": [4.0 + 0.1 * k for k in range(20)],
+                  "s": [100.0 + 6.0 * 0.1 * k for k in range(20)], "z": [25.0] * 20,
+                  "d": [3.5] * 20, "v": [6.0] * 20, "first_t": 4.0, "last_t": 5.9}
+        scene = {"tracks": [crash, false_onc, slower], "speeds": [[0.0, 20.0], [20.0, 10.0]],
+                 "speed_source": "overlay", "t_v0": 1.0, "t_hi": 14.0, "lane_samples": []}
+        local_pipeline.apply_replay(spec, scene, 8.0)
+        self.assertTrue(spec["actors"][0].get("measured", {}).get("overtake"))
+        by_id = {r["id"]: r for r in spec["replay"]}
+        self.assertEqual(by_id["r99"]["kind"], "parked")
+        checked, _ = scene_spec.normalize(spec)
+        self.assertTrue(checked["actors"][0]["measured"]["overtake"])
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        plan = scene_builder.build(checked, tmp.name, "ov")
+        self.assertIn("cruise_speed_ms", plan["agents"][plan["idmap"]["c1"]]["intercept"])
+        self.assertIn("r31", plan["idmap"])
+
+    def test_lane_profile_from_map_drops_short_leading_fov_blindspot_section(self):
+        from agents import lane_lines
+        samples = []
+        for s in range(0, 200, 2):
+            nl = 0.0 if s < 16 else (3.0 if s < 105 else 2.0)
+            samples.append({"t": float(s), "lanes_left": nl, "lanes_right": 0.0, "road_lanes": 1 + nl,
+                            "probs": lane_lines.count_probs(1 + nl)})
+        scene = {"tracks": [], "speeds": [[0.0, 15.0], [20.0, 15.0]], "speed_source": "overlay",
+                 "t_v0": 1.0, "t_hi": 14.0, "lane_samples": samples}
+        spec = spec_with()
+        probe = lambda video, t, side, dur: (0.3, 0.65) if side == "left" else (0.2, 0.2)
+        self.assertTrue(local_pipeline.lane_profile_from_map(spec, scene, "v.mp4", 20.0, probe, log_fn=lambda m: None))
+        prof = spec["road"]["lane_profile"]
+        self.assertEqual([(p["n"], p["m"]) for p in prof], [(4, 0), (3, 1)])
+        self.assertEqual(prof[1]["branch"], {"side": "left", "rise_m": 6.0})
+
+    def test_parked_replay_is_not_back_extrapolated_and_late_queue_cars_slot_cleanly(self):
+        spec = spec_with(speed=60.0)
+        spec["road"]["lanes_per_direction"] = 2
+        spec["road"]["centerline"] = [[0.0, 0.0], [500.0, 0.0]]
+        spec["replay"] = [
+            {"id": "rp", "type": "car", "color": "gray", "kind": "parked",
+             "path": [[12.0, 220.0, 3.5], [13.0, 215.0, 3.5]], "speed": [[12.0, 18.0], [13.0, 18.0]]},
+            {"id": "rq1", "type": "car", "color": "white", "kind": "same",
+             "path": [[4.0, 100.0, 3.5], [5.0, 108.0, 3.5]], "speed": [[4.0, 28.8], [5.0, 28.8]]},
+            {"id": "rq2", "type": "car", "color": "brown", "kind": "same",
+             "path": [[4.0, 101.0, 3.5], [5.0, 109.0, 3.5]], "speed": [[4.0, 28.8], [5.0, 28.8]]},
+        ]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        plan = scene_builder.build(spec, tmp.name, "nq")
+        with open(os.path.join(tmp.name, "nq_scene_obj.txt"), encoding="utf-8") as f:
+            agents = ast.literal_eval(f.readline())
+        self.assertIn("rp", plan["idmap"])
+        self.assertIn("rq1", plan["idmap"])
+        self.assertIn("rq2", plan["idmap"])
+        self.assertAlmostEqual(agents[plan["idmap"]["rp"]]["location"][0], scene_builder.S_START + 220.0, delta=0.5)
+        x1 = agents[plan["idmap"]["rq1"]]["location"][0]
+        x2 = agents[plan["idmap"]["rq2"]]["location"][0]
+        self.assertGreaterEqual(abs(x2 - x1), 7.0)

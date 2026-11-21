@@ -48,17 +48,27 @@ def _read(cap, fps, t, crop=None):
 def road_bottom(path, n=12):
     """Row (at WIDTH) where the road area ends (the hood begins), and the frame height.
     The painted lines that point at the vanishing point stop at the hood edge, so the bottom is the typical lowest point of
-    those lines (hood reflections and overlays do not point at the vanishing point)."""
+    those lines (hood reflections and overlays do not point at the vanishing point). When TwinLiteNet is available, also check
+    where its drivable-area mask ends in the centre of the frame (lane lines can leave the sides above the hood)."""
     cap = cv2.VideoCapture(path)
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         dur = (cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1) / fps
-        lows, h = [], None
+        lows, da_lows, h = [], [], None
+        has_model = _model() is not None
         for i in range(n):
             f = _read(cap, fps, dur * (i + 0.5) / n)
             if f is None:
                 continue
             h, w = f.shape[:2]
+            if has_model:
+                mm = model_masks(f)
+                if mm is not None:
+                    da = mm[1]
+                    center_da = da[:, w // 4 : 3 * w // 4] > 0
+                    rows = np.where(center_da.mean(axis=1) > 0.15)[0]
+                    if len(rows):
+                        da_lows.append(int(rows[-1]))
             segs = segments(marking_mask(f, int(0.3 * h), int(0.95 * h)))
             vp = vanishing_point(segs, w, h, 0.65 * h)
             if vp is None:
@@ -67,9 +77,11 @@ def road_bottom(path, n=12):
                   if x_at_ref(sg, vp, h) is not None and math.hypot(sg[2] - sg[0], sg[3] - sg[1]) >= 0.03 * w]
             if len(ys) >= 3:
                 lows.append(float(np.percentile(ys, 85)))
-        if not lows:
-            return (int(0.62 * h), h) if h else (None, None)
-        return int(np.median(lows) - 0.01 * h), h
+        if h is None:
+            return None, None
+        hough_y = int(np.median(lows) - 0.01 * h) if lows else int(0.62 * h)
+        da_y = (int(np.median(da_lows)) - 2) if da_lows else None
+        return (max(v for v in (hough_y, da_y) if v is not None), h)
     finally:
         cap.release()
 

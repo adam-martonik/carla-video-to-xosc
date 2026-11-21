@@ -109,6 +109,36 @@ class TestInterceptFollower(unittest.TestCase):
         # after contact the cutter does not keep pushing toward the ego lane
         self.assertLess(max(ys[int((t_touch + 1.5) / DT):]) - y_at_touch, 1.0)
 
+    def test_overtake_cut_in_with_cruise_speed_ms(self):
+        from agents import motion_runner
+        from agents.intercept import CutInConfig, CutInController
+        from agents.road_frame import RoadFrame, lane_offset
+
+        frame = RoadFrame.straight(400.0)
+        d_src, d_dst = lane_offset(2, 1), lane_offset(2, 0)
+        v_ego, v_c = 17.4, 7.0
+        s0_c = 15.0 + (v_ego - v_c) * 8.0 + 1.0
+        ego = FakeCar(15.0, -d_dst, 0.0, v_ego)
+        cutter = FakeCar(s0_c, -d_src, 0.0, v_c)
+        route = [motion_runner._RoutePoint(Loc(x, -y))
+                 for s in range(int(s0_c), 390, 2)
+                 for x, y in [frame.to_xy(float(s), d_src)]]
+        cfg = CutInConfig(lane_src_d=d_src, lane_dst_d=d_dst, t_event_s=8.0, cruise_speed_ms=v_c)
+        fol = motion_runner.InterceptFollower(cutter, route, v_c * 3.6, ego, frame, CutInController(cfg))
+        t, t_touch, y_at_touch, ys = 0.0, None, None, []
+        while t < 12.0:
+            cutter.apply_control(fol.control([], DT, t, t))
+            ego.x += ego.v * DT
+            cutter.step()
+            t += DT
+            ys.append(cutter.y)
+            if t_touch is None and abs(cutter.y - ego.y) < 2.0 and abs(cutter.x - ego.x) < 4.5:
+                t_touch, y_at_touch = t, cutter.y
+                fol.crash_time = t
+        self.assertIsNotNone(t_touch, "overtake cutter never reached the ego car")
+        self.assertTrue(6.5 <= t_touch <= 9.5, t_touch)
+        self.assertLess(max(ys[int((t_touch + 1.5) / DT):]) - y_at_touch, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -247,7 +247,7 @@ def normalize(obj):
         if not isinstance(a, dict) or len(actors) >= 6:
             continue
         rel = _pick(a.get("relation"), RELATIONS, "ahead")
-        actors.append({
+        act = {
             "id": str(a.get("id") or "a%d" % (i + 1)),
             "type": _pick(a.get("type"), ACTOR_TYPES, "car"),
             "relation": rel,
@@ -256,7 +256,12 @@ def normalize(obj):
             "speed_kmh": _num(a.get("speed_kmh"), 0.0, 130.0, 30.0),
             "behavior": _pick(a.get("behavior"), BEHAVIORS, "driving"),
             "color": color_rgb(a.get("color")),
-        })
+        }
+        m = a.get("measured")
+        if isinstance(m, dict):
+            act["measured"] = {"speed_kmh": _num(m.get("speed_kmh"), 0.0, 130.0, 20.0),
+                               "overtake": _bool(m.get("overtake", False))}
+        actors.append(act)
     spec["actors"] = actors
     spec["replay"] = _replay(obj.get("replay"))
     ev = obj.get("event") or {}

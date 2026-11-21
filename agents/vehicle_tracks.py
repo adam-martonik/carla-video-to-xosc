@@ -61,7 +61,7 @@ def detect_tracks(path, t0, t1, width, fps_track=TRACK_FPS, conf=0.25):
                 h, w = fr.shape[:2]
                 fr = cv2.resize(fr, (width, int(round(h * width / w))))
                 res = model.track(fr, persist=not reset, tracker="bytetrack.yaml", classes=list(COCO), conf=conf,
-                                  verbose=False, imgsz=640)
+                                  agnostic_nms=True, verbose=False, imgsz=640)
                 reset = False
                 b = res[0].boxes
                 if b is not None and b.id is not None:
@@ -95,6 +95,8 @@ def ground_point(cam, box, vtype, y_bottom=None):
     the road (a box cut off by the hood has no usable bottom); seen from behind or in front, the centre is half a vehicle length
     further along the line of sight, seen from the side (crossing) it is about a metre further."""
     x1, y1, x2, y2 = box
+    if (x2 - x1) > 0.75 * cam.w and y2 >= 0.90 * cam.h:
+        return None
     if y_bottom is not None and y2 >= y_bottom - 2:
         return None
     g = cam.ground_from_pixel(0.5 * (x1 + x2), y2)
@@ -164,7 +166,7 @@ def to_road_tracks(raw, cam, s_ego, y_bottom=None, min_obs=MIN_OBS, curve=None, 
             if r is not None:
                 ratios.append(r)
             g = ground_point(cam, o["box"], vtype, y_bottom)
-            if g is not None and g[1] <= 60.0:
+            if g is not None and g[1] <= 75.0:
                 se = s_ego(o["t"])
                 off = float(curve.offset(se, g[1])) if curve is not None else 0.0
                 pts.append((o["t"], se + g[1], -g[0] - off))
