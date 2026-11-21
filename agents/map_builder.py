@@ -173,6 +173,27 @@ def apply_lane_sections(xodr_path, sections, frame_len, road_user_id="eastbound"
             sp = template.find("speed")
             if sp is not None:
                 lane.append(copy.deepcopy(sp))
+    if pieces:
+        road_id = road.get("id")
+        first_ids = ids(pieces[0])
+        for other_r in tree.getroot().iter("road"):
+            if other_r is road:
+                continue
+            lk = other_r.find("link/successor")
+            if lk is None or lk.get("elementType") != "road" or lk.get("elementId") != road_id:
+                continue
+            for o_lane in other_r.findall("lanes/laneSection/right/lane"):
+                slk = o_lane.find("link/successor")
+                if slk is None:
+                    continue
+                try:
+                    old_id = int(slk.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if old_id < 0:
+                    j_old = -old_id - 1
+                    new_id = first_ids[j_old] if j_old in first_ids else first_ids[nearest(j_old, list(first_ids))]
+                    slk.set("id", str(new_id))
     tree.write(xodr_path, encoding="utf-8", xml_declaration=True)
     return len(pieces)
 

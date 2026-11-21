@@ -197,6 +197,44 @@ class TestKinematicAndCleanup(unittest.TestCase):
             else:
                 sys.modules["carla"] = saved
 
+    def test_extend_route_along_frame_recovers_truncated_route(self):
+        from agents.road_frame import RoadFrame
+        class _Loc:
+            def __init__(self, x=0.0, y=0.0, z=0.0): self.x, self.y, self.z = x, y, z
+        pts = [[float(s), 0.0005 * s * s] for s in range(0, 560, 20)]
+        fr = RoadFrame(pts)
+        # Truncated route ending near s=160 at lane offset d=-15.75
+        d_lane = -15.75
+        route = [motion_runner._RoutePoint(_Loc(x, -y))
+                 for s in range(20, 162, 2)
+                 for x, y in [fr.to_xy(float(s), d_lane)]]
+        tgt_r = fr.to_xy(530.0, d_lane)
+        tgt_carla = (tgt_r[0], -tgt_r[1])
+        out = motion_runner.extend_route_along_frame(route, tgt_carla, fr, motion_runner._RoutePoint, _Loc)
+        self.assertGreater(len(out), 230)
+        end_loc = out[-1].transform.location
+        s_end, d_end = fr.to_sd(end_loc.x, -end_loc.y)
+        self.assertGreater(s_end, 520.0)
+        self.assertAlmostEqual(d_end, d_lane, delta=0.2)
+
+    def test_sanitize_straight_route_rebuilds_when_opendrive_jumps_onto_shoulder(self):
+        from agents.road_frame import RoadFrame
+        class _Loc:
+            def __init__(self, x=0.0, y=0.0, z=0.0): self.x, self.y, self.z = x, y, z
+        pts = [[float(s), 0.0005 * s * s] for s in range(0, 560, 20)]
+        fr = RoadFrame(pts)
+        d_ego, d_shoulder = -15.75, -19.0
+        bad_route = ([motion_runner._RoutePoint(_Loc(x, -y)) for s in range(20, 110, 2) for x, y in [fr.to_xy(float(s), d_ego)]] +
+                     [motion_runner._RoutePoint(_Loc(x, -y)) for s in range(110, 530, 2) for x, y in [fr.to_xy(float(s), d_shoulder)]])
+        s0_r = fr.to_xy(20.0, d_ego)
+        tgt_r = fr.to_xy(530.0, d_ego)
+        clean = motion_runner.sanitize_straight_route(bad_route, (s0_r[0], -s0_r[1]), (tgt_r[0], -tgt_r[1]),
+                                                      fr, motion_runner._RoutePoint, _Loc)
+        self.assertGreater(len(clean), 230)
+        for wp in clean:
+            _, dw = fr.to_sd(wp.transform.location.x, -wp.transform.location.y)
+            self.assertAlmostEqual(dw, d_ego, delta=0.2)
+
 
 if __name__ == "__main__":
     unittest.main()

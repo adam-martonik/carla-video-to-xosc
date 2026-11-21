@@ -551,3 +551,133 @@ class TestSceneFixes(unittest.TestCase):
         kt = plan["agents"][plan["idmap"]["free_onc"]].get("kinematic_track")
         self.assertIsNotNone(kt)
         self.assertEqual(len(kt[0]), 5)
+
+
+class TestMultiLaneCutInAndParts(unittest.TestCase):
+    def test_ground_point_recovers_side_entering_car_below_hood_row_and_keeps_center_rejected(self):
+        # Side-entering white car in far-left pixels (xc < 0.20*w) stays valid while center hood-clipped box stays None
+        self.assertIsNotNone(vehicle_tracks.ground_point(CAM, [0, 250, 130, 400], "car", y_bottom=356))
+        self.assertIsNone(vehicle_tracks.ground_point(CAM, [420, 250, 540, 400], "car", y_bottom=356))
+        self.assertIsNone(vehicle_tracks.ground_point(CAM, [10, 240, 950, 520], "car", y_bottom=356))
+
+    def test_converging_cutin_picks_far_left_cutter_and_stitches_predecessor(self):
+        # Straight middle-lane SUV closer at d=3.7..4.0 should not beat the converging far-left cutter d=6.1..3.6
+        t_suv = [7.5 + 0.1 * i for i in range(9)]
+        suv_mid = {"id": 76, "type": "car", "color": "white", "kind": "same", "t": t_suv,
+                   "s": [140 + 6.0 * 0.1 * i for i in range(9)], "z": [28.0 - 0.9 * i for i in range(9)],
+                   "d": [3.7 + 0.04 * i for i in range(9)], "v": [6.0] * 9, "first_t": 7.5, "last_t": 8.3}
+        t_prev = [7.8 + 0.1 * i for i in range(6)]
+        cutter_prev = {"id": 79, "type": "car", "color": "white", "kind": "same", "t": t_prev,
+                       "s": [100 + 6.0 * 0.1 * i for i in range(6)], "z": [16.9 - 0.8 * i for i in range(6)],
+                       "d": [6.7 + 0.1 * i for i in range(6)], "v": [6.0] * 6, "first_t": 7.8, "last_t": 8.3}
+        t_late = [8.9 + 0.1 * i for i in range(11)]
+        cutter_late = {"id": 85, "type": "car", "color": "white", "kind": "same", "t": t_late,
+                       "s": [110 + 10.5 * 0.1 * i for i in range(11)], "z": [7.2 - 0.1 * i for i in range(11)],
+                       "d": [4.8, 5.1, 5.3, 5.4, 5.35, 5.2, 5.0, 4.85, 4.7, 4.6, 4.5],
+                       "v": [11.5] * 11, "first_t": 8.9, "last_t": 9.9}
+        res = vehicle_tracks.converging_cutin_track([suv_mid, cutter_prev, cutter_late], 8.6, side="left", color="white")
+        self.assertIsNotNone(res)
+        self.assertEqual(res["skip_ids"], [79, 85])
+        self.assertEqual(res["lane_offset"], 2)
+
+        spec = spec_with([{"id": "c1", "relation": "beside", "lane": "left", "behavior": "cutting_in", "color": "white"}],
+                         {"type": "collision", "actor_id": "c1", "time_s": 8.6,
+                          "contact_parts": {"ego": "front_left", "c1": "right_side"}})
+        spec["road"]["lanes_per_direction"] = 3
+        spec["ego"]["lane"] = "right"
+        scene = {"tracks": [suv_mid, cutter_prev, cutter_late], "speeds": [[0.0, 15.0], [15.0, 15.0]],
+                 "speed_source": "overlay", "t_v0": 0.6, "t_hi": 13.6, "lane_samples": []}
+        local_pipeline.apply_replay(spec, scene, 8.6)
+        self.assertEqual(spec["actors"][0]["measured"]["lane_offset"], 2)
+        self.assertEqual([r["id"] for r in spec["replay"]], ["r76"])
+
+        # Add a middle-lane blocker during the sweep window and an early middle-lane car passing earlier
+        spec["replay"].extend([
+            {"id": "mid_blk", "type": "car", "color": "gray", "kind": "same",
+             "path": [[6.9, 118.0, 3.5], [8.8, 128.0, 3.5]], "speed": [[6.9, 19.0], [8.8, 19.0]]},
+            {"id": "mid_early", "type": "car", "color": "blue", "kind": "same",
+             "path": [[0.5, 82.0, 3.5], [4.0, 89.0, 3.5]], "speed": [[0.5, 7.2], [4.0, 7.2]]},
+        ])
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        plan = scene_builder.build(spec, tmp.name, "ml")
+        ic = plan["agents"][plan["idmap"]["c1"]]["intercept"]
+        self.assertAlmostEqual(ic["lane_src_d"], lane_offset(3, 2))
+        self.assertAlmostEqual(ic["lane_dst_d"], lane_offset(3, 0))
+        self.assertEqual(ic["max_lateral_speed_ms"], 3.2)
+        self.assertGreaterEqual(ic["lead_s"], 2.4)
+        self.assertEqual(plan["expect"]["contact_parts"], {"v1": "front_left", "v2": "right_side"})
+        self.assertNotIn("mid_blk", plan["idmap"])
+        self.assertIn("mid_early", plan["idmap"])
+        self.assertIn("r76", plan["idmap"])
+
+    def test_enforce_replay_headway_no_teleport_when_lead_clears(self):
+        ts = [round(0.2 * k, 2) for k in range(31)]  # 0.0 .. 6.0 s
+        # Lead moves slowly at 4 m/s for first 2.6 s then leaves into adjacent lane (-3.5 -> 0.0)
+        lead = {"id": "lead", "type": "car", "back": False, "ts": ts,
+                "ss": [40.0 + 4.0 * t for t in ts],
+                "ds": [-3.5 if t <= 2.6 else 0.0 for t in ts]}
+        # Follower measured cruising at 20 m/s behind lead
+        fol = {"id": "fol", "type": "car", "back": False, "ts": ts,
+               "ss": [25.0 + 20.0 * t for t in ts], "ds": [-3.5] * len(ts)}
+        scene_builder.enforce_replay_headway([lead, fol], gap_margin=3.5)
+        for t0, t1, s0, s1 in zip(ts, ts[1:], fol["ss"], fol["ss"][1:]):
+            dt = t1 - t0
+            self.assertLessEqual((s1 - s0) / dt, 30.5)
+        spds = [(s1 - s0) / (t1 - t0) for t0, t1, s0, s1 in zip(ts, ts[1:], fol["ss"], fol["ss"][1:])]
+        for v0, v1, t0, t1 in zip(spds, spds[1:], ts, ts[1:]):
+            acc = (v1 - v0) / (t1 - t0)
+            self.assertLessEqual(acc, 3.6)
+
+    def test_kinematic_track_has_smooth_heading_and_no_sideways_slide_when_stopped(self):
+        spec = spec_with([{"id": "c1", "relation": "ahead", "lane": "same", "behavior": "braking"}],
+                         {"type": "collision", "actor_id": "c1", "time_s": 5.0})
+        spec["road"]["lanes_per_direction"] = 2
+        spec["road"]["centerline"] = [[0.0, 0.0], [400.0, 0.0]]
+        # Include a brief noisy rocket track (dur 0.3s, 38 m/s) in scene -> must be filtered by apply_replay
+        rocket = {"id": 66, "type": "car", "color": "brown", "kind": "same",
+                  "t": [9.8, 9.9, 10.0, 10.1], "s": [200.0, 203.8, 207.6, 211.4],
+                  "z": [40.0] * 4, "d": [7.0] * 4, "v": [38.0] * 4, "first_t": 9.8, "last_t": 10.1}
+        slow = {"id": 20, "type": "car", "color": "blue", "kind": "same",
+                "t": [0.0 + 0.1 * i for i in range(41)],
+                "s": [40.0 + 1.0 * min(i * 0.1, 1.5) for i in range(41)],  # stops at t=1.5
+                "z": [40.0] * 41, "d": [3.5 + 0.2 * math.sin(i) for i in range(41)],
+                "v": [1.0 if i < 15 else 0.0 for i in range(41)], "first_t": 0.0, "last_t": 4.0}
+        scene = {"tracks": [rocket, slow], "speeds": [[0.0, 15.0], [10.0, 15.0]],
+                 "speed_source": "overlay", "t_v0": 0.0, "t_hi": 10.0, "lane_samples": []}
+        local_pipeline.apply_replay(spec, scene, 5.0)
+        self.assertEqual([r["id"] for r in spec["replay"]], ["r20"])
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        plan = scene_builder.build(spec, tmp.name, "smh")
+        kt = plan["agents"][plan["idmap"]["r20"]]["kinematic_track"]
+        for r0, r1 in zip(kt, kt[1:]):
+            dh = abs(((r1[3] - r0[3] + 180.0) % 360.0) - 180.0)
+            self.assertLessEqual(dh, 6.5)
+
+    def test_to_road_tracks_filters_brief_noisy_rocket_and_single_lane_drift_stays_flat(self):
+        # Raw track with 4 noisy observations moving > 25 m/s over 0.3 s must be dropped in to_road_tracks
+        obs_fast = []
+        for i in range(4):
+            u, v = CAM.pixel_from_ground(-10.0, 40.0 + 3.8 * i)
+            obs_fast.append({"t": 9.8 + 0.1 * i, "box": [u - 20, v - 20, u + 20, v], "cls": 2, "conf": 0.6, "color": "brown"})
+        obs_norm = []
+        for i in range(8):
+            u, v = CAM.pixel_from_ground(-3.5, 25.0 - 0.5 * i)
+            obs_norm.append({"t": 5.0 + 0.1 * i, "box": [u - 30, v - 30, u + 30, v], "cls": 2, "conf": 0.8, "color": "white"})
+        tracks = vehicle_tracks.to_road_tracks({66: obs_fast, 55: obs_norm}, CAM, lambda t: 15.0 * t)
+        self.assertEqual([t["id"] for t in tracks], [55])
+
+        # A track with 2.3 m lateral drift (curve/depth noise, < 2.8 m) stays locked in one lane with no swerve
+        spec = spec_with(speed=50.0)
+        spec["road"]["lanes_per_direction"] = 3
+        spec["road"]["centerline"] = [[0.0, 0.0], [400.0, 0.0]]
+        spec["replay"] = [{"id": "r34", "type": "car", "color": "black", "kind": "same",
+                           "path": [[1.0, 50.0, 3.8], [2.5, 62.0, 4.9], [4.0, 75.0, 6.1]],
+                           "speed": [[1.0, 30.0], [4.0, 30.0]]}]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        plan = scene_builder.build(spec, tmp.name, "drift")
+        kt = plan["agents"][plan["idmap"]["r34"]]["kinematic_track"]
+        ys = [row[2] for row in kt]
+        self.assertLess(max(ys) - min(ys), 0.3)

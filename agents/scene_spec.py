@@ -259,8 +259,13 @@ def normalize(obj):
         }
         m = a.get("measured")
         if isinstance(m, dict):
-            act["measured"] = {"speed_kmh": _num(m.get("speed_kmh"), 0.0, 130.0, 20.0),
-                               "overtake": _bool(m.get("overtake", False))}
+            meas = {"speed_kmh": _num(m.get("speed_kmh"), 0.0, 130.0, 20.0),
+                    "overtake": _bool(m.get("overtake", False))}
+            if m.get("lane_offset") is not None:
+                meas["lane_offset"] = int(round(_num(m.get("lane_offset"), 1, MAX_LANES - 1, 1)))
+            if m.get("t_event_s") is not None:
+                meas["t_event_s"] = round(_num(m.get("t_event_s"), 1.0, 30.0, 5.0), 2)
+            act["measured"] = meas
         actors.append(act)
     spec["actors"] = actors
     spec["replay"] = _replay(obj.get("replay"))
@@ -277,6 +282,13 @@ def normalize(obj):
     spec["event"]["actor2_id"] = str(a2) if a2 is not None and str(a2) in ids and str(a2) != str(spec["event"]["actor_id"]) else None
     spec["event"]["time_s"] = _num(ev.get("time_s"), 1.0, 30.0, 5.0)
     spec["event"]["description"] = str(ev.get("description", ""))[:200]
+    cp = ev.get("contact_parts")
+    if isinstance(cp, dict):
+        from agents.contact_analysis import ALL_ZONES
+        clean_cp = {str(k): str(v).strip().lower() for k, v in cp.items()
+                    if str(v).strip().lower() in ALL_ZONES}
+        if clean_cp:
+            spec["event"]["contact_parts"] = clean_cp
     if spec["event"]["type"] != "none" and spec["event"]["actor_id"] is None:
         spec["event"]["type"] = "none"      # an event needs an actor
     return spec, None

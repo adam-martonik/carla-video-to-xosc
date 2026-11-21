@@ -494,12 +494,14 @@ def _in_corridor(times, ss, ds, corridors):
 
 
 def enforce_replay_headway(tracks, static_obstacles=(), gap_margin=3.5):
-    """Clamp longitudinal positions along each uniform-grid replayed track so no vehicle overtakes/collides with any
-    same-lane lead or parked vehicle at any time step. Operates in-place on `tracks` [{"id", "type", "back", "ts", "ss", "ds"}]."""
+    """Integrate replayed longitudinal trajectories forward under physical speed and accel limits so no vehicle
+    teleports, exceeds plausible speed, or penetrates a same-lane lead or parked obstacle."""
+    ACC_MAX, DEC_COMF, DEC_EMERG, V_MAX_ABS = 3.0, 4.5, 7.0, 30.0
     for is_back in (False, True):
         group = [tr for tr in tracks if bool(tr.get("back")) == is_back]
         if not group:
             continue
+        dir_sign = -1.0 if is_back else 1.0
 
         def _first_s(tr):
             for sv in tr["ss"]:
@@ -511,41 +513,92 @@ def enforce_replay_headway(tracks, static_obstacles=(), gap_margin=3.5):
         leads = []
         for cur in group:
             ss, ds, ts = cur["ss"], cur["ds"], cur["ts"]
-            prev_s = None
-            for k in range(len(ts)):
-                sk, dk = ss[k], ds[k]
-                if sk is None or dk is None:
-                    continue
-                ref_s = sk if prev_s is None else prev_s
-                s_lim = -1e9 if is_back else 1e9
-                for ld in leads:
-                    ls, ld_lat = ld["ss"][k], ld["ds"][k]
-                    if ls is None or ld_lat is None or abs(ld_lat - dk) >= 2.4:
+            n_t = len(ts)
+            cur_v = [0.0] * n_t
+            active = [k for k in range(n_t) if ss[k] is not None and ds[k] is not None]
+            if not active:
+                leads.append((cur, cur_v))
+                continue
+            s_meas = [ss[k] for k in range(n_t)]
+            step_spds = []
+            for idx_p, idx_c in zip(active, active[1:]):
+                dt_raw = max(ts[idx_c] - ts[idx_p], 1e-3)
+                sp_raw = dir_sign * (s_meas[idx_c] - s_meas[idx_p]) / dt_raw
+                if 0.0 <= sp_raw <= 40.0:
+                    step_spds.append(sp_raw)
+            v_cap = min(max((max(step_spds) * 1.15 if step_spds else 15.0), 6.0), V_MAX_ABS)
+            k0 = active[0]
+            s_cur = s_meas[k0]
+
+            def _limits_at(k_idx, s_pos, d_pos):
+                s_lim = 1e9 if not is_back else -1e9
+                v_safe_min = v_cap
+                v_obs_at_lim = v_cap
+                min_gap = 1e9
+                for ld_tr, ld_v in leads:
+                    ls, ld_lat = ld_tr["ss"][k_idx], ld_tr["ds"][k_idx]
+                    if ls is None or ld_lat is None or abs(ld_lat - d_pos) >= 2.4:
                         continue
-                    need = VEHICLE_HALF_LEN.get(cur["type"], 2.4) + VEHICLE_HALF_LEN.get(ld["type"], 2.4) + gap_margin
-                    if not is_back and ls > ref_s - 0.5 * need:
-                        s_lim = min(s_lim, ls - need)
-                    elif is_back and ls < ref_s + 0.5 * need:
-                        s_lim = max(s_lim, ls + need)
+                    need = VEHICLE_HALF_LEN.get(cur["type"], 2.4) + VEHICLE_HALF_LEN.get(ld_tr["type"], 2.4) + gap_margin
+                    if dir_sign * (ls - s_pos) > -0.5 * need:
+                        cand_lim = ls - dir_sign * need
+                        if (not is_back and cand_lim < s_lim) or (is_back and cand_lim > s_lim):
+                            s_lim = cand_lim
+                            v_obs_at_lim = ld_v[k_idx]
+                        gap = dir_sign * (ls - s_pos) - need
+                        min_gap = min(min_gap, gap)
+                        v_s = (ld_v[k_idx] + math.sqrt(2.0 * 3.0 * gap)) if gap > 0.0 else 0.0
+                        v_safe_min = min(v_safe_min, max(0.0, v_s))
                 for st_s, st_d, st_type in static_obstacles:
-                    if abs(st_d - dk) >= 2.4:
+                    if abs(st_d - d_pos) >= 2.4:
                         continue
                     need = VEHICLE_HALF_LEN.get(cur["type"], 2.4) + VEHICLE_HALF_LEN.get(st_type, 2.4) + gap_margin
-                    if not is_back and st_s > ref_s - 0.5 * need:
-                        s_lim = min(s_lim, st_s - need)
-                    elif is_back and st_s < ref_s + 0.5 * need:
-                        s_lim = max(s_lim, st_s + need)
+                    if dir_sign * (st_s - s_pos) > -0.5 * need:
+                        cand_lim = st_s - dir_sign * need
+                        if (not is_back and cand_lim < s_lim) or (is_back and cand_lim > s_lim):
+                            s_lim = cand_lim
+                            v_obs_at_lim = 0.0
+                        gap = dir_sign * (st_s - s_pos) - need
+                        min_gap = min(min_gap, gap)
+                        v_s = math.sqrt(2.0 * 3.0 * gap) if gap > 0.0 else 0.0
+                        v_safe_min = min(v_safe_min, v_s)
+                return s_lim, v_safe_min, v_obs_at_lim, min_gap
+
+            s_lim0, v_safe0, v_obs0, _ = _limits_at(k0, s_cur, ds[k0])
+            if (not is_back and s_cur >= s_lim0) or (is_back and s_cur <= s_lim0):
+                s_cur = s_lim0
+                v_cur = min(step_spds[0] if step_spds else 0.0, v_obs0)
+            else:
+                v_cur = max(0.0, min(v_cap, v_safe0, step_spds[0] if step_spds else 0.0))
+            ss[k0] = s_cur
+            cur_v[k0] = v_cur
+            prev_k = k0
+            for k in active[1:]:
+                dt = max(ts[k] - ts[prev_k], 1e-3)
+                dk = ds[k]
+                v_ref = max(0.0, min(v_cap, dir_sign * (s_meas[k] - s_meas[prev_k]) / dt))
+                err = dir_sign * (s_meas[k] - s_cur)
+                v_des = max(0.0, min(v_cap, v_ref + max(-3.0, min(3.0, 0.5 * err))))
+                s_lim, v_safe_min, v_obs_at_lim, min_gap = _limits_at(k, s_cur, dk)
+                v_target = min(v_des, v_safe_min)
+                dec_lim = DEC_EMERG if min_gap < 4.0 else DEC_COMF
+                v_cur = max(0.0, min(v_cap, max(v_cur - dec_lim * dt, min(v_cur + ACC_MAX * dt, v_target))))
+                s_new = s_cur + dir_sign * v_cur * dt
                 if not is_back:
-                    s_new = min(sk, s_lim)
-                    if prev_s is not None:
-                        s_new = max(s_new, prev_s)
+                    if s_new > s_lim:
+                        s_new = s_lim
+                        v_cur = min(v_cur, max(0.0, v_obs_at_lim))
+                    s_new = max(s_new, s_cur)
                 else:
-                    s_new = max(sk, s_lim)
-                    if prev_s is not None:
-                        s_new = min(s_new, prev_s)
+                    if s_new < s_lim:
+                        s_new = s_lim
+                        v_cur = min(v_cur, max(0.0, v_obs_at_lim))
+                    s_new = min(s_new, s_cur)
                 ss[k] = s_new
-                prev_s = s_new
-            leads.append(cur)
+                cur_v[k] = v_cur
+                s_cur = s_new
+                prev_k = k
+            leads.append((cur, cur_v))
     return tracks
 
 
@@ -663,6 +716,7 @@ def _replay_agents(replay, road, lane_idx, s_ego0, agents, plan_agents, idmap, c
         sp = [p for p in r.get("speed") or [] if p[0] >= 0.0]
         v_first = (ss[1] - ss[0]) / max(ts[1] - ts[0], 1e-3)
         v_ext = ((-1.0 if back else 1.0) * (sp[0][1] / 3.6)) if sp else v_first
+        v_ext = max(-28.0, min(28.0, v_ext))
         if r["kind"] == "parked":
             s0, d0 = ss[0], ds[0]
         elif ts[0] > 0.0:
@@ -676,12 +730,21 @@ def _replay_agents(replay, road, lane_idx, s_ego0, agents, plan_agents, idmap, c
         vtype_r = r["type"] if r["type"] in VEHICLE_TYPES else "car"
         if corridors:
             v_last = (ss[-1] - ss[-2]) / max(ts[-1] - ts[-2], 1e-3)
-            post = [ts[-1] + 0.25 * k for k in range(1, 41)]
-            obs_t = [t_ for t_ in ts if t_ >= 0.0] + post
-            obs_s = [s_ for t_, s_ in zip(ts, ss) if t_ >= 0.0] + [ss[-1] + v_last * (t_ - ts[-1]) for t_ in post]
-            obs_d = [d_ for t_, d_ in zip(ts, ds) if t_ >= 0.0] + [ds[-1]] * len(post)
+            t_obs0 = max(ts[0], 0.0)
             if r["kind"] == "parked":
                 obs_t, obs_s, obs_d = [k * 0.5 for k in range(40)], [s0] * 40, [d0] * 40
+            elif ts[-1] >= t_obs0:
+                n_obs = max(int((ts[-1] - t_obs0) / 0.25) + 1, 2)
+                in_t = [t_obs0 + (ts[-1] - t_obs0) * k / (n_obs - 1) for k in range(n_obs)]
+                post = [ts[-1] + 0.25 * k for k in range(1, 41)]
+                obs_t = in_t + post
+                obs_s = [_interp(t_, ts, ss) for t_ in in_t] + [ss[-1] + v_last * (t_ - ts[-1]) for t_ in post]
+                obs_d = [_interp(t_, ts, ds) for t_ in in_t] + [ds[-1]] * len(post)
+            else:
+                post = [ts[-1] + 0.25 * k for k in range(1, 41)]
+                obs_t = post
+                obs_s = [ss[-1] + v_last * (t_ - ts[-1]) for t_ in post]
+                obs_d = [ds[-1]] * len(post)
             if _in_corridor(obs_t, obs_s, obs_d, corridors):
                 notes.append("%s: in the way of a crash vehicle before the crash, not replayed" % r["id"])
                 continue
@@ -802,6 +865,7 @@ def _replay_agents(replay, road, lane_idx, s_ego0, agents, plan_agents, idmap, c
                 plan["spawn_at_s"] = spawn_at_s
             v_last_obs = (ss[-1] - ss[-2]) / max(ts[-1] - ts[-2], 1e-3)
             v_post = ((-1.0 if back else 1.0) * max(sp[-1][1] / 3.6, 2.0)) if sp else v_last_obs
+            v_post = max(-28.0, min(28.0, v_post))
             kin_candidates.append({
                 "vid": vid, "rid": r["id"], "type": vtype_r, "back": back, "spawn_t": spawn_t,
                 "ts_raw": ts, "ss_raw": ss, "ds_raw": ds, "s0": s0, "d0": d0,
@@ -817,6 +881,8 @@ def _replay_agents(replay, road, lane_idx, s_ego0, agents, plan_agents, idmap, c
         kin_tracks = []
         for kc in kin_candidates:
             ts_r, ss_r, ds_r = kc["ts_raw"], kc["ss_raw"], kc["ds_raw"]
+            d_span = (max(ds_r) - min(ds_r)) if ds_r else 0.0
+            d_flat = sorted(ds_r)[len(ds_r) // 2] if (ds_r and d_span < 2.8) else None
             s_arr, d_arr = [None] * len(ts_grid), [None] * len(ts_grid)
             act_idx, act_s, act_d = [], [], []
             for idx_g, tg in enumerate(ts_grid):
@@ -824,13 +890,13 @@ def _replay_agents(replay, road, lane_idx, s_ego0, agents, plan_agents, idmap, c
                     continue
                 if tg <= ts_r[0]:
                     sg = s_ego0 + kc["s0"] + kc["v_ext"] * (tg - kc["spawn_t"])
-                    dg = d_ego + kc["d0"]
+                    dg = d_ego + (d_flat if d_flat is not None else kc["d0"])
                 elif tg <= ts_r[-1]:
                     sg = s_ego0 + _interp(tg, ts_r, ss_r)
-                    dg = d_ego + _interp(tg, ts_r, ds_r)
+                    dg = d_ego + (d_flat if d_flat is not None else _interp(tg, ts_r, ds_r))
                 else:
                     sg = s_ego0 + ss_r[-1] + kc["v_post"] * (tg - ts_r[-1])
-                    dg = d_ego + ds_r[-1]
+                    dg = d_ego + (d_flat if d_flat is not None else ds_r[-1])
                 if 3.0 <= sg <= road.end_s:
                     act_idx.append(idx_g)
                     act_s.append(sg)
@@ -844,8 +910,19 @@ def _replay_agents(replay, road, lane_idx, s_ego0, agents, plan_agents, idmap, c
                                "ts": ts_grid, "ss": s_arr, "ds": d_arr})
         enforce_replay_headway(kin_tracks, static_obstacles=static_obs)
         for kt_d in kin_tracks:
+            ts_k, ss_k, ds_k = kt_d["ts"], kt_d["ss"], kt_d["ds"]
+            act_k = [i for i in range(len(ts_k)) if ss_k[i] is not None and ds_k[i] is not None]
+            if len(act_k) >= 2:
+                prev_t, prev_s, d_cur = ts_k[act_k[0]], ss_k[act_k[0]], ds_k[act_k[0]]
+                for idx_k in act_k[1:]:
+                    dt_k = max(ts_k[idx_k] - prev_t, 1e-3)
+                    step_s = abs(ss_k[idx_k] - prev_s)
+                    max_dd = 0.0 if step_s < 0.4 else min(1.8 * dt_k, 0.22 * step_s)
+                    d_cur = d_cur + max(-max_dd, min(max_dd, ds_k[idx_k] - d_cur))
+                    ds_k[idx_k] = d_cur
+                    prev_t, prev_s = ts_k[idx_k], ss_k[idx_k]
             vid, rid = kt_d["vid"], kt_d["id"]
-            pts_ok = [(t_g, s_g, d_g) for t_g, s_g, d_g in zip(kt_d["ts"], kt_d["ss"], kt_d["ds"])
+            pts_ok = [(t_g, s_g, d_g) for t_g, s_g, d_g in zip(ts_k, ss_k, ds_k)
                       if s_g is not None and d_g is not None]
             if len(pts_ok) < 2:
                 notes.append("%s: blocked outside road after headway adjustment, not replayed" % rid)
@@ -861,6 +938,7 @@ def _replay_agents(replay, road, lane_idx, s_ego0, agents, plan_agents, idmap, c
                 idmap.pop(rid, None)
                 continue
             xys = [road.frame.to_xy(p[1], p[2]) for p in pts_ok]
+            _wrap = lambda a: ((a + 180.0) % 360.0) - 180.0
             kt_rows = []
             for j, (t_g, s_g, d_g) in enumerate(pts_ok):
                 x_j, y_j = xys[j]
@@ -870,9 +948,21 @@ def _replay_agents(replay, road, lane_idx, s_ego0, agents, plan_agents, idmap, c
                 else:
                     dt_j = max(t_g - pts_ok[j - 1][0], 1e-3)
                     dx_j, dy_j = x_j - xys[j - 1][0], y_j - xys[j - 1][1]
-                spd_j = math.hypot(dx_j, dy_j) / dt_j
-                h_j = math.degrees(math.atan2(dy_j, dx_j)) if math.hypot(dx_j, dy_j) > 0.05 else (
-                    road.lane_heading(s_g) + (180.0 if kt_d["back"] else 0.0))
+                step_dist = math.hypot(dx_j, dy_j)
+                spd_j = step_dist / dt_j
+                h_road = road.lane_heading(s_g) + (180.0 if kt_d["back"] else 0.0)
+                if step_dist > 0.1:
+                    h_raw = math.degrees(math.atan2(dy_j, dx_j))
+                    dh_road = max(-18.0, min(18.0, _wrap(h_raw - h_road)))
+                    blend = 1.0 if step_dist >= 0.4 else (step_dist - 0.1) / 0.3
+                    h_des = h_road + blend * dh_road
+                else:
+                    h_des = h_road
+                if kt_rows:
+                    dh = max(-30.0 * dt_j, min(30.0 * dt_j, _wrap(h_des - kt_rows[-1][3])))
+                    h_j = _wrap(kt_rows[-1][3] + dh)
+                else:
+                    h_j = _wrap(h_des)
                 kt_rows.append([round(t_g, 2), round(x_j, 2), round(y_j, 2), round(h_j, 1), round(spd_j, 2)])
             agents[vid]["x"], agents[vid]["y"], agents[vid]["heading"] = kt_rows[0][1], kt_rows[0][2], kt_rows[0][3]
             plan_agents[vid]["kinematic_track"] = kt_rows
@@ -910,6 +1000,11 @@ def _road_with_profile(spec, road, s_ego0, d_event, ev_actor, min_length=None):
             return road, (0 if spec["ego"]["lane"] == "right" or road.L == 1 else road.L - 1), \
                 "lane profile dropped: no lane on the %s of the ego car for %s's merge at the event" % (
                     "left" if step > 0 else "right", ev_actor["id"])
+        lane_off = max(1, int(((ev_actor.get("measured") or {}).get("lane_offset")) or 1))
+        if lane_off >= 2:
+            ok_multi = [q for q in ok if new.has_lane(s_ego0, q + step * lane_off) and new.has_lane(s_ego0 + d_event, q + step * lane_off)]
+            if ok_multi:
+                ok = ok_multi
         if k not in ok:
             k = min(ok, key=lambda q: abs(q - k))
     note = "lane profile: %s lanes along the road, ego in lane %d of %d from the left at the start" % (
@@ -946,7 +1041,11 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
         and ev_actor["relation"] in ("cross_left", "cross_right")
         and ev2["relation"] in ("behind", "beside")
     )
-    T = min(max(event["time_s"], 3.0), 8.0) if ev_actor is not None else 6.0       # simulated time of the event
+    t_ev_meas = ((ev_actor.get("measured") or {}).get("t_event_s")) if (ev_actor is not None and not third_party) else None
+    if t_ev_meas is not None:
+        T = min(max(float(t_ev_meas), 3.0), 12.0)
+    else:
+        T = min(max(event["time_s"], 3.0), 8.0) if ev_actor is not None else 6.0       # simulated time of the event
     s_ego0_est = 65.0 if straight_tp_cross else S_START
     min_len = _required_road_length(spec, s_ego0_est, v_e, T)
     road = Road(spec["road"]["type"], spec["road"]["lanes_per_direction"], spec["road"].get("centerline"), spec["road"].get("one_way", False), min_length=min_len)
@@ -1105,11 +1204,20 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
             spec_p = {"mode": "walk", "speed_ms": speed, "path": [list(dest)],
                       "start": {"type": "time", "t": round(max(t_arrive - t_ped_at_lane, 0.0), 2)}}
         elif a["relation"] == "beside" or beh == "cutting_in":
-            # a vehicle in the neighbouring lane that changes into the ego lane (side contact or close pass)
+            # a vehicle in the neighbouring (or outer) lane that changes into the ego lane (side contact or close pass)
             left = a["lane"] != "right"
-            k_src = min(lane_idx + 1, road.L - 1) if left else max(lane_idx - 1, 0)
-            if road.kind == "straight" and not road.has_lane(S_START, k_src):
-                k_src = lane_idx                                         # the neighbouring lane does not exist here
+            meas = a.get("measured") if isinstance(a.get("measured"), dict) else None
+            lane_off = max(1, int(meas.get("lane_offset", 1))) if meas else 1
+            k_src = lane_idx
+            d_check = _ego_travel(plan_ego, v_e)(T)
+            for off in range(lane_off, 0, -1):
+                kc = min(lane_idx + off, road.L - 1) if left else max(lane_idx - off, 0)
+                if kc == lane_idx:
+                    continue
+                if road.kind == "straight" and not (road.has_lane(S_START, kc) and road.has_lane(S_START + d_check, kc)):
+                    continue
+                k_src = kc
+                break
             if k_src == lane_idx:
                 notes.append("%s: the road has no neighbouring lane, placed ahead in the ego lane" % a["id"])
                 if road.kind == "straight":
@@ -1137,9 +1245,9 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 s0 = 1.0                                                 # starts alongside the ego car, 1 m ahead of its centre
                 if is_ev and road.kind == "straight":
                     # closed loop: the motion runner steers this car from the live ego position (agents/intercept.py)
+                    lanes_crossed = abs(k_src - lane_idx)
                     cruise_ms = None
                     head_i = head
-                    meas = a.get("measured")
                     if isinstance(meas, dict) and meas.get("overtake"):
                         v_c = max(float(meas.get("speed_kmh", 20.0)) / 3.6, 5.0)
                         if v_e > 6.0:
@@ -1151,6 +1259,8 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                             s0, v = s0_cand, v_c
                             cruise_ms = round(v_c, 2)
                             head_i = road.lane_heading(S_START + s0)
+                    if lanes_crossed >= 2:
+                        lead = round(lead + 0.5 * (lanes_crossed - 1), 2)
                     x_i, y_i = lane_pt(k_src, s0)
                     agents[vid] = {"type": a["type"], "x": x_i, "y": y_i, "heading": head_i}
                     d_src, d_dst = lane_offset(road.L, k_src), lane_offset(road.L, lane_idx)
@@ -1159,6 +1269,8 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                              "lane_src_d": d_src, "lane_dst_d": d_dst}
                     if cruise_ms is not None:
                         icp_d["cruise_speed_ms"] = cruise_ms
+                    if lanes_crossed >= 2:
+                        icp_d["max_lateral_speed_ms"] = 3.2
                     spec_p = {"mode": "drive", "speed_kmh": round(v * 3.6, 1), "already_moving": True, "avoid": False,
                               "intercept": icp_d}
                 else:
@@ -1373,14 +1485,29 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
             if event["type"] == "collision":
                 expect = {"type": "collision", "actors": pair, "time_s": round(t_exp, 2), "window_s": 1.5,
                           "contact": "side" if (spec_p or {}).get("intercept") else "any"}
+                cp_raw = event.get("contact_parts")
+                if isinstance(cp_raw, dict):
+                    mapped = {}
+                    for k_cp, v_cp in cp_raw.items():
+                        mk = "v1" if k_cp in ("ego", "v1") else idmap.get(k_cp)
+                        if mk in pair:
+                            mapped[mk] = v_cp
+                    if mapped:
+                        expect["contact_parts"] = mapped
             elif event["type"] == "near_miss":
                 expect = {"type": "near_miss", "actors": pair, "time_s": round(t_exp, 2), "window_s": 1.5, "contact": "any",
                           "max_dist_m": 8.0 if (road.kind == "straight" or a["relation"] in ("ahead", "behind")) else 6.0}
     if third_party:
         t_third = tp_t_cross if straight_tp_cross else T
+        tp_pair = [idmap[ev_actor["id"]], idmap[ev2["id"]]]
         expect = {"type": "collision" if event["type"] == "collision" else "near_miss",
-                  "actors": [idmap[ev_actor["id"]], idmap[ev2["id"]]], "time_s": round(t_third, 2), "max_dist_m": 6.0,
+                  "actors": tp_pair, "time_s": round(t_third, 2), "max_dist_m": 6.0,
                   "window_s": 1.5, "contact": "any"}
+        cp_raw = event.get("contact_parts")
+        if event["type"] == "collision" and isinstance(cp_raw, dict):
+            mapped = {idmap[k_cp]: v_cp for k_cp, v_cp in cp_raw.items() if k_cp in idmap and idmap[k_cp] in tp_pair}
+            if mapped:
+                expect["contact_parts"] = mapped
     if expect is None:
         expect = {"type": "none", "actors": ["v1"], "time_s": round(T, 2)}
 
@@ -1402,9 +1529,23 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     s_ic_fn = lambda t, s0_=s_c0, vc_=vc: s0_ + vc_ * t
                 else:
                     s_ic_fn = lambda t: s_ego_t(t) + 1.0
-                corridors.append((ic["lane_src_d"] - d_ego_off, s_ic_fn, T + 2.0))
-                corridors.append((ic["lane_dst_d"] - d_ego_off, s_ic_fn, T + 2.0,
-                                  max(0.0, T - float(ic.get("lead_s", 1.4)) - 0.5)))
+                if abs(ic["lane_dst_d"] - ic["lane_src_d"]) > 4.0:
+                    lead_ic = float(ic.get("lead_s", 1.4))
+                    t_lc0 = max(0.0, T - lead_ic)
+                    n_lanes = max(2, int(round(abs(ic["lane_dst_d"] - ic["lane_src_d"]) / W)))
+                    lat_spd = max(float(ic.get("max_lateral_speed_ms", 1.5)), 2.2 if ic.get("cruise_speed_ms") is not None else 1.5)
+                    dt_lane = W / max(lat_spd, 1.0)
+                    corridors.append((ic["lane_src_d"] - d_ego_off, s_ic_fn, min(T + 2.0, t_lc0 + 0.8 * dt_lane), 0.0))
+                    for m_i in range(1, n_lanes):
+                        d_mid = ic["lane_src_d"] + (ic["lane_dst_d"] - ic["lane_src_d"]) * m_i / n_lanes
+                        corridors.append((d_mid - d_ego_off, s_ic_fn, min(T + 2.0, t_lc0 + (m_i + 0.8) * dt_lane),
+                                          max(0.0, t_lc0 + (m_i - 0.6) * dt_lane)))
+                    corridors.append((ic["lane_dst_d"] - d_ego_off, s_ic_fn, T + 2.0,
+                                      max(0.0, t_lc0 + (n_lanes - 0.8) * dt_lane)))
+                else:
+                    t_sweep0 = max(0.0, T - float(ic.get("lead_s", 1.4)) - 0.5)
+                    corridors.append((ic["lane_src_d"] - d_ego_off, s_ic_fn, T + 2.0))
+                    corridors.append((ic["lane_dst_d"] - d_ego_off, s_ic_fn, T + 2.0, t_sweep0))
             elif vid_c in agents and vid_c in (idmap.get(ev_actor["id"]) if ev_actor else None,
                                                idmap.get(ev2["id"]) if ev2 else None):
                 s_ev0, d_ev0 = road.frame.to_sd(agents[vid_c]["x"], agents[vid_c]["y"])

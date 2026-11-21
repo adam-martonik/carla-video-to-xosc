@@ -210,6 +210,34 @@ MANEUVER_Q = (FRAME_PREFIX + "Look at the closest vehicle ahead of the ego vehic
               "B) Its REAR end (taillights and rear bumper visible), facing forward in the same direction as the road and driving along or changing lanes\n"
               "C) Its FRONT end (headlights and grille visible), facing head-on toward the ego vehicle")
 MANEUVER_KEYS = {"A": "crossing", "B": "merging", "C": "oncoming"}
+PART_KEYS = {"A": "front", "B": "front_left", "C": "front_right", "D": "left_side", "E": "right_side", "F": "rear"}
+EGO_PART_Q = (FRAME_PREFIX + "Which part of the EGO vehicle (the camera car) is closest to impact or gets hit?\n"
+              "A) front bumper / hood center\nB) front-left corner / fender\nC) front-right corner / fender\n"
+              "D) left side\nE) right side\nF) rear")
+OTHER_PART_Q = (FRAME_PREFIX + "Which part of the OTHER vehicle involved in the crash gets hit or makes contact?\n"
+                "A) front bumper / grille\nB) front-left corner\nC) front-right corner\n"
+                "D) left side\nE) right side\nF) rear bumper / back")
+
+
+def infer_contact_parts(first_approach, ego_involved=True, second_approach=None):
+    """Expected impacted zones of each vehicle inferred from their approach geometry in the dashcam video."""
+    a1 = str(first_approach or "").lower().replace(" ", "_").replace("-", "_")
+    if not ego_involved:
+        if "left" in a1:
+            return {"c1": "right_side", "c2": "front"}
+        if "right" in a1:
+            return {"c1": "left_side", "c2": "front"}
+        return {"c1": "side", "c2": "front"}
+    mapping = {
+        "merging_from_left": {"ego": "front_left", "c1": "right_side"},
+        "merging_from_right": {"ego": "front_right", "c1": "left_side"},
+        "crossing_from_left": {"ego": "front", "c1": "right_side"},
+        "crossing_from_right": {"ego": "front", "c1": "left_side"},
+        "ahead": {"ego": "front", "c1": "rear"},
+        "from_behind": {"ego": "rear", "c1": "front"},
+        "oncoming": {"ego": "front", "c1": "front"},
+    }
+    return dict(mapping.get(a1, {"ego": "front", "c1": "side"}))
 
 
 def _weighted_avg(dicts, weights):
@@ -270,14 +298,36 @@ def analyse_crash_window(video, t_crash, duration, roads=None, fps=3.0, span=1.2
                 "right": "crossing_from_right" if crossing else "merging_from_right"}[pos]
     typ = TYPE_KEYS[max(pt, key=pt.get)]
     col = COLOR_KEYS.get(max(pc, key=pc.get))
+    parts = infer_contact_parts(approach, ego_involved=True)
+    probs = {"position": {POS_KEYS[k]: round(v, 2) for k, v in pp.items()},
+             "type": {TYPE_KEYS[k]: round(v, 2) for k, v in pt.items()},
+             "color": {COLOR_KEYS.get(k, "other"): round(v, 2) for k, v in pc.items()},
+             "maneuver": {MANEUVER_KEYS[k]: round(v, 2) for k, v in pm.items()},
+             "entry_flow": {"left_to_right": round(l2r, 1), "right_to_left": round(r2l, 1)}}
+    try:
+        from agents.contact_analysis import zones_compatible
+        pe_list, po_list = [], []
+        for t in times[-2:]:
+            fr = video_events.grab_frames(video, [t], width=width)
+            if not fr:
+                continue
+            pe_list.append(llm_backend.choice_probabilities(EGO_PART_Q, fr, "ABCDEF"))
+            po_list.append(llm_backend.choice_probabilities(OTHER_PART_Q, fr, "ABCDEF"))
+        if pe_list and po_list:
+            pe, po = _avg(pe_list), _avg(po_list)
+            probs["ego_part"] = {PART_KEYS[k]: round(v, 2) for k, v in pe.items()}
+            probs["other_part"] = {PART_KEYS[k]: round(v, 2) for k, v in po.items()}
+            for who, pdict in (("ego", pe), ("c1", po)):
+                top_k = max(pdict, key=pdict.get)
+                if pdict[top_k] >= 0.55 and zones_compatible(PART_KEYS[top_k], parts[who]):
+                    parts[who] = PART_KEYS[top_k]
+    except Exception:
+        pass
     word = {"merging_from_left": "changes from the left lane into the lane of", "merging_from_right": "changes from the right lane into the lane of"}
     crash = {"collision": True, "ego_involved": True,
              "first_vehicle": {"type": typ, "color": col, "approach": approach, "speed": "slow"}, "second_vehicle": None,
-             "probabilities": {"position": {POS_KEYS[k]: round(v, 2) for k, v in pp.items()},
-                               "type": {TYPE_KEYS[k]: round(v, 2) for k, v in pt.items()},
-                               "color": {COLOR_KEYS.get(k, "other"): round(v, 2) for k, v in pc.items()},
-                               "maneuver": {MANEUVER_KEYS[k]: round(v, 2) for k, v in pm.items()},
-                               "entry_flow": {"left_to_right": round(l2r, 1), "right_to_left": round(r2l, 1)}},
+             "contact_parts": parts,
+             "probabilities": probs,
              "description": "a %s %s %s the ego vehicle (%s)" % (col or "", typ, word.get(approach, "meets"), approach)}
     return crash, None, times
 
@@ -382,6 +432,18 @@ def apply_crash(spec, crash, t_crash, ego_speed=None, tracked=None):
             actors.append(a)
         elif a["relation"] == "ahead" and a["lane"] != first.get("lane"):
             actors.append(a)
+    if collision:
+        if not ego_inv:
+            v1_app = (crash.get("first_vehicle") or {}).get("approach")
+            if tracked and (tracked.get("first_vehicle") or {}).get("approach"):
+                v1_app = tracked["first_vehicle"]["approach"]
+            v2_app = second["behavior"] if isinstance(second, dict) else None
+            parts = infer_contact_parts(v1_app, ego_involved=False, second_approach=v2_app)
+        else:
+            cp_raw = crash.get("contact_parts")
+            parts = dict(cp_raw) if isinstance(cp_raw, dict) else infer_contact_parts((crash.get("first_vehicle") or {}).get("approach"))
+        if parts:
+            event["contact_parts"] = parts
     spec["actors"] = actors[:8] if bg_tracked else actors[:7]
     spec["event"] = event
     return reconcile_traffic(spec)
@@ -822,20 +884,45 @@ def apply_replay(spec, scene, t_crash, log_fn=log):
     c1 = next((a for a in spec["actors"] if a["id"] == ev.get("actor_id")), None)
     rgb = (c1 or {}).get("color")
     color = next((k for k, v in COLORS.items() if rgb and "%d,%d,%d" % v == rgb), None)     # crash car's colour name
-    skip = set(vehicle_tracks.crash_tracks(tracks, float(t_crash), ego_involved=not third, color=color)) if t_crash is not None else set()
-    t_v0, T = sim_window(spec)
-    if not third and skip and c1 is not None and (c1.get("relation") == "beside" or c1.get("behavior") == "cutting_in"):
-        tr_crash = next((tr for tr in tracks if tr["id"] in skip), None)
-        if tr_crash and tr_crash.get("kind") == "same" and tr_crash.get("v"):
-            v_meas = float(np.median([abs(v) for v in tr_crash["v"]]))
-            sp_prof = spec["ego"].get("speed_profile")
-            v_ego_ev = (float(np.interp(T, [p[0] for p in sp_prof], [p[1] for p in sp_prof])) / 3.6) if sp_prof else (float(spec["ego"]["speed_kmh"]) / 3.6)
-            if v_ego_ev > 5.0 and v_meas < 0.75 * v_ego_ev:
-                v_kmh = round(max(v_meas * 3.6, 12.0), 1)
-                c1["speed_kmh"] = v_kmh
-                c1["measured"] = {"speed_kmh": v_kmh, "overtake": True}
     lane_w = next((x["lane_w"] for x in scene.get("lane_samples") or [] if x.get("lane_w")), None)
     k_d = 3.5 / lane_w if lane_w else 1.0          # positions across the road in simulation lanes (3.5 m)
+    t_v0, T = sim_window(spec)
+    conv = None
+    if not third and t_crash is not None and c1 is not None and (c1.get("relation") == "beside" or c1.get("behavior") == "cutting_in"):
+        conv = vehicle_tracks.converging_cutin_track(tracks, float(t_crash), side=c1.get("lane", "left"),
+                                                     color=color, lane_w=lane_w or 3.5)
+    if conv is not None:
+        skip = set(conv["skip_ids"])
+        tr_crash = conv["track"]
+        lane_off = max(1, int(round(conv["d_start"] * k_d / 3.5)))
+        v_meas = conv["v_meas"]
+        t_sim_ev = round(conv["t_impact"] - t_v0, 2)
+        c_msg = "cut-in track matched: ids %s, starts %.1f m (%d lane(s)) from ego, impact at video %.1f s (sim %.1f s)" % (
+            conv["skip_ids"], conv["d_start"], lane_off, conv["t_impact"], t_sim_ev)
+        spec.setdefault("notes", []).append(c_msg)
+        log_fn(c_msg)
+    else:
+        skip = set(vehicle_tracks.crash_tracks(tracks, float(t_crash), ego_involved=not third, color=color)) if t_crash is not None else set()
+        tr_crash = next((tr for tr in tracks if tr["id"] in skip), None)
+        lane_off = max(1, int(round(abs(tr_crash["d"][0]) * k_d / 3.5))) if (tr_crash and tr_crash.get("d")) else 1
+        v_meas = float(np.median([abs(v) for v in tr_crash["v"]])) if (tr_crash and tr_crash.get("v")) else None
+        t_sim_ev = None
+    if not third and skip and c1 is not None and (c1.get("relation") == "beside" or c1.get("behavior") == "cutting_in"):
+        sp_prof = spec["ego"].get("speed_profile")
+        t_eval = t_sim_ev if (t_sim_ev is not None and 2.5 <= t_sim_ev <= 12.0) else T
+        v_ego_ev = (float(np.interp(t_eval, [p[0] for p in sp_prof], [p[1] for p in sp_prof])) / 3.6) if sp_prof else (float(spec["ego"]["speed_kmh"]) / 3.6)
+        ratio = 0.90 if conv is not None else 0.75
+        overtake = bool(tr_crash and tr_crash.get("kind") == "same" and v_meas is not None and v_ego_ev > 5.0 and v_meas < ratio * v_ego_ev)
+        if overtake or lane_off >= 2 or (t_sim_ev is not None and 2.5 <= t_sim_ev <= 12.0):
+            v_kmh = round(max((v_meas or 0.0) * 3.6, 12.0), 1) if overtake else round(float(c1["speed_kmh"]), 1)
+            if overtake:
+                c1["speed_kmh"] = v_kmh
+            meas = {"speed_kmh": v_kmh, "overtake": overtake}
+            if lane_off >= 2:
+                meas["lane_offset"] = lane_off
+            if t_sim_ev is not None and 2.5 <= t_sim_ev <= 12.0:
+                meas["t_event_s"] = t_sim_ev
+            c1["measured"] = meas
     prof = spec["road"].get("lane_profile")
     if prof:
         L_max = max(int(sc["m"]) + int(sc["n"]) for sc in prof)
@@ -848,6 +935,10 @@ def apply_replay(spec, scene, t_crash, log_fn=log):
     rep = []
     for tr in tracks:
         if tr["id"] in skip or tr["last_t"] < t_v0:
+            continue
+        dur_tr = float(tr["last_t"]) - float(tr["first_t"])
+        v_tr_med = float(np.median([abs(v) for v in tr["v"]])) if tr.get("v") else 0.0
+        if tr["kind"] != "parked" and dur_tr < 0.6 and v_tr_med > 25.0:
             continue
         from agents import traj_smoothing
         kind = tr["kind"]
@@ -1217,6 +1308,8 @@ def report(out, spec, ready):
                 a["id"], a.get("color") or "", a["type"], a["relation"], a["lane"], "", a["behavior"], a["distance_m"], a["speed_kmh"]))
         ev = spec["event"]
         lines.append("Event: %s at %.1fs (%s) %s" % (ev["type"], ev["time_s"], ", ".join(x for x in (ev.get("actor_id"), ev.get("actor2_id")) if x) or "no actor", ev["description"]))
+        if ev.get("contact_parts"):
+            lines.append("  expected contact parts: " + ", ".join("%s=%s" % (k, v) for k, v in ev["contact_parts"].items()))
         for n in spec.get("notes", []):
             lines.append("  note: " + n)
         if spec.get("degraded"):
@@ -1227,6 +1320,8 @@ def report(out, spec, ready):
         last = hist[-1]["detail"] if hist else {}
         if last.get("direction"):
             lines.append("  contact: %s at %.1f s" % (last["direction"], last.get("contact_t_sim") or 0.0))
+        if last.get("contact_parts"):
+            lines.append("  simulated contact parts: " + ", ".join("%s=%s" % (k, v) for k, v in last["contact_parts"].items()) + " at %.1f s" % (last.get("contact_t_sim") or 0.0))
         for r in last.get("reasons", []):
             lines.append("  failed rule: " + r)
         if ready.get("map_fallback"):

@@ -81,6 +81,37 @@ class TestShoulders(unittest.TestCase):
                               for w in l.findall("width"))
             self.assertGreaterEqual(abs(float(sig.get("t"))), right_width + 3.5 - 1e-4)
 
+    def test_apply_lane_sections_remaps_incoming_junction_connector_links(self):
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<OpenDRIVE>
+  <road name="" length="8.0" id="64" junction="1">
+    <link><predecessor elementType="road" elementId="61" contactPoint="end"/><successor elementType="road" elementId="62" contactPoint="start"/></link>
+    <lanes><laneSection s="0"><center><lane id="0" type="none"/></center><right>
+      <lane id="-1" type="driving"><link><predecessor id="-3"/><successor id="-2"/></link><width sOffset="0" a="3.5" b="0" c="0" d="0"/></lane>
+      <lane id="-2" type="driving"><link><predecessor id="-4"/><successor id="-3"/></link><width sOffset="0" a="3.5" b="0" c="0" d="0"/></lane>
+      <lane id="-3" type="driving"><link><predecessor id="-5"/><successor id="-4"/></link><width sOffset="0" a="3.5" b="0" c="0" d="0"/></lane>
+    </right></laneSection></lanes>
+  </road>
+  <road name="" length="450.0" id="62" junction="-1">
+    <userData code="sumoId" value="eastbound_after"/>
+    <lanes><laneSection s="0"><center><lane id="0" type="none"/></center><right>
+      <lane id="-1" type="driving"><link/><width sOffset="0" a="3.5" b="0" c="0" d="0"/></lane>
+      <lane id="-2" type="driving"><link/><width sOffset="0" a="3.5" b="0" c="0" d="0"/></lane>
+      <lane id="-3" type="driving"><link/><width sOffset="0" a="3.5" b="0" c="0" d="0"/></lane>
+      <lane id="-4" type="driving"><link/><width sOffset="0" a="3.5" b="0" c="0" d="0"/></lane>
+    </right></laneSection></lanes>
+  </road>
+</OpenDRIVE>"""
+        with tempfile.TemporaryDirectory() as tmp:
+            x = os.path.join(tmp, "m.xodr")
+            Path(x).write_text(xml, encoding="utf-8")
+            secs = [{"s0": 113.0, "s1": 161.0, "n": 3, "m": 1}, {"s0": 161.0, "s1": 563.0, "n": 4, "m": 0}]
+            map_builder.apply_lane_sections(x, secs, 450.0, road_user_id="eastbound_after", s0=113.0)
+            root = ET.parse(x).getroot()
+            r64 = next(r for r in root.iter("road") if r.get("id") == "64")
+            succs = [int(l.find("link/successor").get("id")) for l in r64.findall("lanes/laneSection/right/lane")]
+            self.assertEqual(succs, [-1, -2, -3])
+
 
 if __name__ == "__main__":
     unittest.main()

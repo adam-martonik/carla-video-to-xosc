@@ -85,6 +85,31 @@ class TestCutIn(unittest.TestCase):
         self.assertIsNotNone(t_touch)
         self.assertTrue(6.5 <= t_touch <= 9.5, t_touch)
 
+    def test_multi_lane_overtake_cut_in_crosses_middle_lane_and_contacts(self):
+        ego_d, mid_d, far_left_d = -12.25, -8.75, -5.25
+        v_ego, v_me = 15.0, 8.0
+        t_ev = 9.5
+        cfg = CutInConfig(lane_src_d=far_left_d, lane_dst_d=ego_d, t_event_s=t_ev,
+                          lead_s=2.5, max_lateral_speed_ms=3.2, cruise_speed_ms=v_me)
+        ctl = CutInController(cfg)
+        ego_s = 15.0
+        me_s = ego_s + (v_ego - v_me) * t_ev + 1.0
+        me_d = far_left_d
+        touched, t_touch, ds_seen = False, None, []
+        t = 0.0
+        while t < 13.0:
+            d_t, v_t = ctl.update(t, (ego_s, ego_d, v_ego), (me_s, me_d, v_me), touched)
+            me_d, v_me = d_t, v_t
+            ego_s += v_ego * DT
+            me_s += v_me * DT
+            t += DT
+            ds_seen.append(me_d)
+            if not touched and abs(me_d - ego_d) < 2.0 and abs(me_s - ego_s) < 4.5:
+                touched, t_touch = True, t
+        self.assertIsNotNone(t_touch)
+        self.assertTrue(8.0 <= t_touch <= 11.0, t_touch)
+        self.assertTrue(any(abs(d - mid_d) < 0.25 for d in ds_seen))
+
 
 if __name__ == "__main__":
     unittest.main()

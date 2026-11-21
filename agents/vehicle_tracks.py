@@ -98,7 +98,10 @@ def ground_point(cam, box, vtype, y_bottom=None):
     if (x2 - x1) > 0.75 * cam.w and y2 >= 0.90 * cam.h:
         return None
     if y_bottom is not None and y2 >= y_bottom - 2:
-        return None
+        xc = 0.5 * (x1 + x2)
+        in_center = 0.20 * cam.w <= xc <= 0.80 * cam.w
+        if in_center or y2 >= 0.92 * cam.h or (x2 - x1) >= 0.45 * cam.w:
+            return None
     g = cam.ground_from_pixel(0.5 * (x1 + x2), y2)
     if g is None:
         return None
@@ -182,6 +185,10 @@ def to_road_tracks(raw, cam, s_ego, y_bottom=None, min_obs=MIN_OBS, curve=None, 
         cols = [o.get("color") for o in sorted(obs, key=lambda o_: -(o_["box"][2] - o_["box"][0]))[:5] if o.get("color")]
         color = max(set(cols), key=cols.count) if cols else None
         kind = classify(t_s, s_s, d_s, None)
+        dur = float(t_s[-1] - t_s[0]) if len(t_s) >= 2 else 0.0
+        v_med = float(np.median(np.abs(v_s))) if len(v_s) else 0.0
+        if kind != "parked" and dur < 0.6 and v_med > 25.0:
+            continue
         sign = -1.0 if kind == "oncoming" else 1.0
         out.append({"id": int(tid), "type": vtype, "color": color, "kind": kind,
                     "t": [round(float(x), 2) for x in t_s], "s": [round(float(x), 2) for x in s_s],
@@ -222,6 +229,57 @@ def crash_tracks(tracks, t_crash, ego_involved=True, window=(-2.0, 0.5), max_ego
             if dist <= max_pair_m and (best is None or dist < best[0]):
                 best = (dist, [a["id"], b["id"]])
     return best[1] if best else []
+
+
+def converging_cutin_track(tracks, t_crash, side="left", window=(-2.5, 2.5), color=None, lane_w=3.5):
+    """Find the track actively cutting into the ego lane around `t_crash` (starting on `side` >= 0.4 lanes away and
+    moving laterally toward d = 0), plus an optional occluded predecessor track slightly earlier on the same path."""
+    sign = 1.0 if side != "right" else -1.0
+    lo_t, hi_t = t_crash + window[0], t_crash + window[1]
+    cands = []
+    for tr in tracks:
+        ts, ds, zs = tr.get("t") or [], tr.get("d") or [], tr.get("z") or []
+        if len(ts) < 2 or not ds or not zs:
+            continue
+        if tr.get("last_t", ts[-1]) < lo_t or tr.get("first_t", ts[0]) > hi_t:
+            continue
+        i_pk = max(range(len(ds)), key=lambda i: ds[i] * sign)
+        d_pk = ds[i_pk]
+        if d_pk * sign < 0.4 * lane_w:
+            continue
+        d_inward = (d_pk - ds[-1]) * sign
+        dur = max(ts[-1] - ts[i_pk], 0.1)
+        min_z = min(zs)
+        if d_inward >= 0.7 and d_inward / dur >= 0.8 and min_z <= 18.0 and abs(ds[-1]) <= 6.5:
+            score = abs(ds[-1]) + 0.3 * min_z - 0.5 * d_inward
+            cands.append((0 if (color and tr.get("color") == color) else 1, score, tr["id"], tr, d_pk))
+    if not cands:
+        return None
+    _, _, _, tr, d_pk = min(cands)
+    prev_cands = []
+    for p in tracks:
+        if p["id"] == tr["id"] or not p.get("d") or not p.get("z") or not p.get("t"):
+            continue
+        dt_gap = tr["t"][0] - p["t"][-1]
+        if 0.05 <= dt_gap <= 1.8 and p["d"][0] * sign >= 0.4 * lane_w and p["d"][-1] * sign >= d_pk * sign - 0.5:
+            d_gap = min(abs(p["d"][-1] - tr["d"][0]), abs(p["d"][-1] - d_pk))
+            if d_gap <= 3.0 and abs(p["z"][-1] - tr["z"][0]) <= 12.0:
+                col_pen = 0 if (tr.get("color") and p.get("color") == tr.get("color")) else 1
+                prev_cands.append((col_pen, d_gap, p["id"], p))
+    prev = min(prev_cands)[-1] if prev_cands else None
+    skip_ids = ([prev["id"]] if prev else []) + [tr["id"]]
+    d_start = max(abs(d_pk), abs(prev["d"][0]) if prev else 0.0)
+    lane_offset = max(1, int(round(d_start / max(lane_w, 1.0))))
+    v_tr = [abs(v) for v in (tr.get("v") or [])]
+    v_prev = [abs(v) for v in (prev.get("v") or [])] if prev else []
+    if len(v_prev) >= 4 and v_tr:
+        v_meas = min(float(np.median(v_prev)), float(np.median(v_tr)))
+    else:
+        v_vals = v_tr + v_prev
+        v_meas = float(np.median(v_vals)) if v_vals else 0.0
+    t_impact = round(float(tr["t"][-1]) + 0.15, 2)
+    return {"track": tr, "prev_track": prev, "skip_ids": skip_ids, "d_start": round(float(d_start), 2),
+            "lane_offset": lane_offset, "v_meas": round(v_meas, 2), "t_impact": t_impact}
 
 
 def ego_relative(track, ts):

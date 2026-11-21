@@ -12,7 +12,7 @@ import math
 import os
 import time
 
-from agents.contact_analysis import contact_direction
+from agents.contact_analysis import contact_direction, pair_contact_zones, zones_compatible
 
 # deltas applied to the event actor's controller; the first run uses the plan as built
 # "offset_m" is used only for event actors without a closed-loop controller (crossing, ahead): it moves their spawn point along the lane
@@ -66,6 +66,9 @@ def evaluate(expect, result):
             t_exp = expect.get("time_s")
             if t_first is not None and t_exp is not None and abs(t_first - float(t_exp)) > window:
                 reasons.append("time: contact at %.1f s, expected %.1f s +-%.1f" % (t_first, float(t_exp), window))
+            zones = pair_contact_zones(pair, a, b)
+            if zones:
+                detail["contact_parts"] = zones
             want = expect.get("contact", "any")
             if want != "any":
                 own = next((e for e in pair if e.get("actor") == a), pair[0])
@@ -76,6 +79,12 @@ def evaluate(expect, result):
                     detail["direction"] = got
                     if got != want:
                         reasons.append("direction: %s contact, expected %s" % (got, want))
+            want_parts = expect.get("contact_parts")
+            if isinstance(want_parts, dict):
+                for aid, want_part in want_parts.items():
+                    got_part = zones.get(aid)
+                    if got_part is not None and not zones_compatible(got_part, want_part):
+                        reasons.append("contact part: %s hit on %s, expected %s" % (aid, got_part, want_part))
     else:   # near_miss
         thr = float(expect.get("max_dist_m", 6.0))
         if pair:

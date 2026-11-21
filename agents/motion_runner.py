@@ -245,6 +245,58 @@ def _dist2d(a, b):
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
+def extend_route_along_frame(route, target_xy_carla, road_frame, route_point_cls=_RoutePoint, loc_cls=None, step=2.0):
+    """Extend a CARLA waypoint route that stops early at a road-section change along `road_frame` at its lane offset."""
+    if not route or road_frame is None:
+        return route
+    if loc_cls is None:
+        loc_cls = type(route[-1].transform.location)
+    last_loc = route[-1].transform.location
+    tx, ty = float(target_xy_carla[0]), float(target_xy_carla[1])
+    if math.hypot(tx - last_loc.x, ty - last_loc.y) <= 15.0:
+        return route
+    s_last, d_last = road_frame.to_sd(last_loc.x, -last_loc.y)
+    s_tgt, _ = road_frame.to_sd(tx, -ty)
+    if s_tgt <= s_last + 10.0:
+        return route
+    s_ = s_last + step
+    s_cap = min(s_tgt, road_frame.length - 2.0)
+    while s_ <= s_cap:
+        rx, ry = road_frame.to_xy(s_, d_last)
+        route.append(route_point_cls(loc_cls(rx, -ry, 0.0)))
+        s_ += step
+    return route
+
+
+def sanitize_straight_route(route, start_xy_carla, target_xy_carla, road_frame, route_point_cls=_RoutePoint, loc_cls=None, step=2.0):
+    """Ensure a straight-road route stays in its starting lane (rebuilding along `road_frame` if CARLA's OpenDRIVE
+    waypoint graph jumps laterally > 2 m onto a shoulder or neighbouring lane) and reaches the target."""
+    if road_frame is None:
+        return route
+    if loc_cls is None and route:
+        loc_cls = type(route[-1].transform.location)
+    s0, d0 = road_frame.to_sd(float(start_xy_carla[0]), -float(start_xy_carla[1]))
+    s_tgt, _ = road_frame.to_sd(float(target_xy_carla[0]), -float(target_xy_carla[1]))
+    jumped = not route
+    if route:
+        for wp in route:
+            loc = wp.transform.location
+            _, dw = road_frame.to_sd(loc.x, -loc.y)
+            if abs(dw - d0) > 2.0:
+                jumped = True
+                break
+    if jumped and loc_cls is not None and s_tgt > s0 + 5.0:
+        out = []
+        s_ = s0
+        s_cap = min(s_tgt, road_frame.length - 2.0)
+        while s_ <= s_cap:
+            rx, ry = road_frame.to_xy(s_, d0)
+            out.append(route_point_cls(loc_cls(rx, -ry, 0.0)))
+            s_ += step
+        return out
+    return extend_route_along_frame(route, target_xy_carla, road_frame, route_point_cls, loc_cls, step)
+
+
 def build_route(cmap, start_loc, targets, step=2.0, look=15, max_len=800.0):
     """Waypoint route from start_loc through the target points. At every fork the branch is chosen by following
     each candidate `look` steps ahead and keeping the one that ends closest to the current target."""
@@ -528,8 +580,13 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
         try:
             me, ot = ev.transform.location, ev.other_actor.get_location()
             rec["rel"] = [round(v, 2) for v in rel_in_frame(ot.x - me.x, ot.y - me.y, ev.transform.rotation.yaw)]
+            ot_yaw = ev.other_actor.get_transform().rotation.yaw
+            rec["other_yaw"] = round(ot_yaw, 1)
+            rec["other_rel"] = [round(v, 2) for v in rel_in_frame(me.x - ot.x, me.y - ot.y, ot_yaw)]
         except Exception:
-            rec["rel"] = None
+            rec.setdefault("rel", None)
+            rec.setdefault("other_yaw", None)
+            rec.setdefault("other_rel", None)
         if len(collisions) < MAX_CONTACTS:
             collisions.append(rec)
         else:
@@ -662,14 +719,19 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                     s_ += 2.0
                 cfg = CutInConfig(lane_src_d=float(ic["lane_src_d"]), lane_dst_d=float(ic["lane_dst_d"]), t_event_s=float(ic["t_event_s"]),
                                   lead_s=float(ic.get("lead_s", 1.4)), aim_offset_m=float(ic.get("aim_offset_m", 0.0)),
+                                  max_lateral_speed_ms=float(ic.get("max_lateral_speed_ms", 1.5)),
                                   cruise_speed_ms=float(ic["cruise_speed_ms"]) if ic.get("cruise_speed_ms") is not None else None)
                 return InterceptFollower(v, route, speed, target, road_frame, CutInController(cfg))
             if spec.get("polyline"):
                 sx, sy = polyline_shift(spec)
                 route = [_RoutePoint(carla.Location(p_[0] + sx, -(p_[1] + sy), 0.0)) for p_ in spec["polyline"]]
             else:
-                route = build_route(world.get_map(), v.get_location(), [_to_carla(pt) for pt in spec["path"]],
+                tgt_carla = [_to_carla(pt) for pt in spec["path"]]
+                v_loc = v.get_location()
+                route = build_route(world.get_map(), v_loc, tgt_carla,
                                     max_len=max(250.0, road_frame.length + 50.0))
+                if road_pl.get("centerline") and tgt_carla:
+                    route = sanitize_straight_route(route, (v_loc.x, v_loc.y), tgt_carla[-1], road_frame, _RoutePoint, carla.Location)
             return RouteFollower(v, route, speed, bool(spec.get("avoid", False)),
                                  road_frame=(road_frame if road_pl.get("centerline") else None))
 

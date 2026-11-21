@@ -378,6 +378,20 @@ class TestPipelineHelpers(unittest.TestCase):
         self.assertFalse(m1["ego_stopped"], m1)
         self.assertFalse(m1["camera_steady"], m1)
 
+    def test_contact_parts_inferred_stored_on_event_and_reported(self):
+        self.assertEqual(local_pipeline.infer_contact_parts("merging_from_left"), {"ego": "front_left", "c1": "right_side"})
+        self.assertEqual(local_pipeline.infer_contact_parts("crossing_from_left", ego_involved=False),
+                         {"c1": "right_side", "c2": "front"})
+        spec = local_pipeline.apply_crash(self._spec({}), dict(self.CRASH), 7.0)
+        self.assertEqual(spec["event"]["contact_parts"], {"ego": "front_left", "c1": "right_side"})
+        ready = {"status": "ready", "iterations": 1, "expect": {"type": "collision", "actors": ["v1", "v2"]},
+                 "history": [{"detail": {"direction": "side", "contact_t_sim": 7.1,
+                                         "contact_parts": {"v1": "front_left", "v2": "right_side"}, "reasons": []}}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            txt = local_pipeline.report(tmp, spec, ready)
+        self.assertIn("expected contact parts: ego=front_left, c1=right_side", txt)
+        self.assertIn("simulated contact parts: v1=front_left, v2=right_side", txt)
+
 
 if __name__ == "__main__":
     unittest.main()

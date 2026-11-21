@@ -67,6 +67,21 @@ class TestEvaluate(unittest.TestCase):
         self.assertFalse(ok)
 
 
+    def test_contact_parts_verified_and_reported_for_both_actors(self):
+        exp = dict(EXPECT, contact_parts={"v1": "front_left", "v2": "right_side"})
+        r_ok = {"events": [ev("v1", "v2", 7.2, impulse=(200, 800, 0), rel=(1.8, -1.4)),
+                           ev("v2", "v1", 7.2, impulse=(200, 800, 0), rel=(-0.3, 1.9))]}
+        ok, detail = scenario_check.evaluate(exp, r_ok)
+        self.assertTrue(ok, detail)
+        self.assertEqual(detail["contact_parts"], {"v1": "front_left", "v2": "right_side"})
+
+        r_wrong_side = {"events": [ev("v1", "v2", 7.2, impulse=(0, 800, 0), rel=(0.2, 1.9)),
+                                   ev("v2", "v1", 7.2, impulse=(0, 800, 0), rel=(-0.2, -1.9))]}
+        ok_bad, detail_bad = scenario_check.evaluate(exp, r_wrong_side)
+        self.assertFalse(ok_bad)
+        self.assertTrue(any("contact part" in x for x in detail_bad["reasons"]), detail_bad)
+
+
 class TestSearch(unittest.TestCase):
     def _setup(self, tmp):
         plan = {"ego": "v1", "expect": dict(EXPECT),

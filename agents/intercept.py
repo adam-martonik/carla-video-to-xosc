@@ -46,13 +46,15 @@ class CutInController:
         if cfg.cruise_speed_ms is not None:
             rem = cfg.t_event_s - t
             cutting = t >= cfg.t_event_s - cfg.lead_s
+            multi = abs(cfg.lane_dst_d - cfg.lane_src_d) > 4.0
             if rem > 0.3:
                 target_s_ev = ego_s + ego_v * rem + 1.0
                 v_req = (target_s_ev - me_s) / rem
-                v_lo = max(cfg.cruise_speed_ms, 5.5) if cutting else max(3.0, 0.65 * cfg.cruise_speed_ms)
+                cut_floor = 6.5 if multi else 5.5
+                v_lo = max(cfg.cruise_speed_ms, cut_floor) if cutting else max(3.0, 0.65 * cfg.cruise_speed_ms)
                 v_target = max(v_lo, min(max(ego_v, 2.0 * cfg.cruise_speed_ms), v_req))
             else:
-                v_target = max(cfg.cruise_speed_ms, 5.5 if cutting else min(ego_v, me_v))
+                v_target = max(cfg.cruise_speed_ms, (6.5 if multi else 5.5) if cutting else min(ego_v, me_v))
         else:
             if self._gap0 is None:
                 self._gap0 = me_s - ego_s
