@@ -125,6 +125,23 @@ def _apply_variant(plan, expect, variant):
             spec["offset_m"] = float(variant["offset_m"])
 
 
+MAX_REPLAY_DROPS = 4      # reruns per variant that take out replayed vehicles in the way of the crash
+
+
+def replay_in_the_way(plan, expect, result):
+    """Replayed vehicles (plan agents with "replay") that the ego car or a crash vehicle hit before the expected event: they
+    come from the video, but the crash comes first. [vehicle ids]."""
+    watch = set(expect.get("actors", [])) | {"v1"}
+    t_ref = float(expect.get("time_s", 1e9)) + float(expect.get("window_s", 1.5))
+    out = []
+    for e in result.get("events", []):
+        o = e.get("other_actor")
+        if e.get("actor") in watch and o not in watch and (plan["agents"].get(o) or {}).get("replay") and e.get("t_sim", 0.0) <= t_ref:
+            if o not in out:
+                out.append(o)
+    return out
+
+
 def search(out_dir, scene_id, run_fn, max_iter=MAX_ITER, log=print):
     """run_fn(load_map: bool) runs the scenario currently stored in <scene>_motion.json and returns the result dict."""
     plan_fn = os.path.join(out_dir, scene_id + "_motion.json")
@@ -133,16 +150,27 @@ def search(out_dir, scene_id, run_fn, max_iter=MAX_ITER, log=print):
     expect = base.get("expect", {"type": "none", "actors": ["v1"]})
     variants = NONE_VARIANTS if expect.get("type") == "none" else VARIANTS
     history, best, it = [], None, 0
+    dropped = []                                   # replayed vehicles taken out because they were in the way of the crash
     for variant in variants[:max_iter]:
-        plan = copy.deepcopy(base)
-        _apply_variant(plan, expect, variant)
-        _dump(plan, plan_fn)
-        t0 = time.time()
-        result = run_fn(load_map=(it == 0))
-        ok, detail = evaluate(expect, result)
-        it += 1
-        history.append({"iteration": it, "variant": variant, "ok": ok, "detail": detail, "seconds": round(time.time() - t0, 1)})
-        log("iteration %d variant=%s ok=%s %s" % (it, variant, ok, detail))
+        for _ in range(MAX_REPLAY_DROPS + 1):
+            plan = copy.deepcopy(base)
+            _apply_variant(plan, expect, variant)
+            for vid in dropped:
+                plan["agents"][vid] = {"mode": "skip", "replay": plan["agents"][vid].get("replay")}
+            _dump(plan, plan_fn)
+            t0 = time.time()
+            result = run_fn(load_map=(it == 0))
+            ok, detail = evaluate(expect, result)
+            it += 1
+            history.append({"iteration": it, "variant": variant, "ok": ok, "detail": detail, "dropped_replay": list(dropped),
+                            "seconds": round(time.time() - t0, 1)})
+            log("iteration %d variant=%s ok=%s %s" % (it, variant, ok, detail))
+            new = [v for v in replay_in_the_way(plan, expect, result) if v not in dropped] if not ok else []
+            if not new:
+                break
+            dropped += new
+            log("replayed vehicles in the way of the crash, taken out: %s" % ", ".join(
+                "%s (%s)" % (v, plan["agents"][v].get("replay")) for v in new))
         score = (0 if ok else 1, len(detail["reasons"]), detail.get("min_dist_m") if detail.get("min_dist_m") is not None else 1e9)
         if best is None or score < best[0]:
             best = (score, plan, result, detail)

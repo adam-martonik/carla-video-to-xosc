@@ -192,7 +192,7 @@ def _shoulder_lane(lane_id, width_m):
     return lane
 
 
-def add_shoulders(xodr_path, width_m=3.0, sides=("right", "left"), one_way=None):
+def add_shoulders(xodr_path, width_m=3.0, sides=("right", "left"), one_way=None, skip_roads=()):
     """Add a paved shoulder as the outermost lane on the given sides, so that a pushed car stays on pavement.
     SUMO exports every carriageway as its own road with right lanes only: 'right' is the outer edge of each carriageway; 'left'
     is the outer edge only when the road is one-way (with two carriageways the left side is the median, which stays as it is).
@@ -200,7 +200,11 @@ def add_shoulders(xodr_path, width_m=3.0, sides=("right", "left"), one_way=None)
     if not sides:
         return 0
     tree = ET.parse(xodr_path)
-    roads = [r for r in tree.getroot().iter("road") if r.find("lanes/laneSection/right") is not None and r.get("junction") == "-1"]
+    def sumo_id(r):
+        ud = r.find("userData")
+        return ud.get("value") if ud is not None else None
+    roads = [r for r in tree.getroot().iter("road") if r.find("lanes/laneSection/right") is not None and r.get("junction") == "-1"
+             and sumo_id(r) not in skip_roads]
     changed = 0
     for road in roads:
         for sec in road.findall("lanes/laneSection"):
@@ -240,7 +244,8 @@ def build_and_load_map(client, net_xml, out_dir=None, plan_road=None):
     n = move_signals_off_lanes(xodr_path)
     sides = shoulder_sides(plan_road)
     one_way = bool(plan_road.get("one_way")) if (plan_road or {}).get("sections") else None
-    w = add_shoulders(xodr_path, float((plan_road or {}).get("shoulder_m", 3.0)), sides, one_way=one_way) if sides else 0
+    w = add_shoulders(xodr_path, float((plan_road or {}).get("shoulder_m", 3.0)), sides, one_way=one_way,
+                      skip_roads=tuple((plan_road or {}).get("no_shoulder") or ())) if sides else 0
     world = load_xodr(client, xodr_path)
     print(f"[map] loaded {world.get_map().name} from {os.path.basename(xodr_path)} ({n} signals moved off the lanes, {w} shoulder(s) added)")
     return world

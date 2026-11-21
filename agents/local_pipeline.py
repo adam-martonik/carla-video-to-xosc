@@ -535,22 +535,23 @@ def _move_leaving_lanes(prof, k, side):
         sc["m"] -= lo
 
 
-def tag_branches(prof, t_v0, v, video, duration, probe=None):
+def tag_branches(prof, t_v0, v, video, duration, probe=None, time_of=None):
     """Mark the first place where lanes leave the ego road as a branch when the frames after it show lanes going on as a road of
     their own: rising (a flyover or ramp) or, with a stronger cue, flat. Both sides are asked; a clearly stronger cue on the
     other side than the one the road width points to wins (a paved shoulder can make the wrong side look narrower).
+    time_of(d) -> the video time at which the ego car passed distance d (default: constant speed v from t_v0).
     Returns a note or None."""
     from agents import road_probes
     probe = probe or road_probes.branch_evidence
     for k in range(1, len(prof)):
         a, b = prof[k - 1], prof[k]
-        if b["n"] >= a["n"] or v < 1.0:
+        if b["n"] >= a["n"] or (time_of is None and v < 1.0):
             continue
         side = "left" if b["m"] > a["m"] else "right"
-        t_b = t_v0 + b["d0"] / v
+        t_b = time_of(b["d0"]) if time_of else t_v0 + b["d0"] / v
         ev = {sd: probe(video, t_b, sd, duration) for sd in ("left", "right")}
         other = "right" if side == "left" else "left"
-        if max(ev[other]) >= max(road_probes.RISE_P, road_probes.SPLIT_P) and max(ev[other]) > max(ev[side]) + 0.1:
+        if max(ev[other]) >= max(road_probes.RISE_P, road_probes.SPLIT_P) and max(ev[other]) > max(ev[side]) + 0.2:
             side = other
             _move_leaving_lanes(prof, k, side)
         p_split, p_rise = ev[side]
@@ -562,6 +563,284 @@ def tag_branches(prof, t_v0, v, video, duration, probe=None):
         return "lanes leaving on the %s at %.0f m (video %.1f s): %s (split/rise left %.2f/%.2f, right %.2f/%.2f)" % (
             side, b["d0"], t_b, what, ev["left"][0], ev["left"][1], ev["right"][0], ev["right"][1])
     return None
+
+
+# ----------------------------------------------------------------------------------------- measured scene: tracks + lane map
+def overlay_speeds(caps, times):
+    """[(t, m/s or None)]: the ego speed printed in the video overlay near each time (from the frame descriptions)."""
+    out = []
+    for t in times:
+        v = ego_speed_near(caps, t, 0.75) if caps else None
+        out.append((t, None if v is None else v / 3.6))
+    return out
+
+
+def measure_scene(spec, video, duration, caps, lane_rows=None, log_fn=log):
+    """Camera, ego travel, vehicle tracks and the bird's-eye lane map of the simulated stretch (agents/camera_geom,
+    vehicle_tracks, bev_lanes). Returns a JSON-able dict {"camera", "speeds", "speed_source", "tracks", "lane_samples", "t_v0",
+    "t_hi", "note"} or None when the tracker or the lane model is not available."""
+    from agents import bev_lanes, camera_geom, lane_lines, vehicle_tracks
+    t_v0, T = sim_window(spec)
+    t_lo, t_hi = max(t_v0 - 0.5, 0.0), min(max(duration - 0.1, 0.0), t_v0 + T + 5.0)
+    try:
+        if lane_rows is None:
+            lane_rows = lane_lines.lane_timeline(video, t_lo, t_hi)
+        y_b, h = lane_lines.road_bottom(video)
+        cam, cnote = camera_geom.calibrate(lane_rows, (h, lane_lines.WIDTH))
+        times = [round(t_lo + 0.5 * i, 2) for i in range(int((t_hi - t_lo) / 0.5) + 2)]
+        ov = overlay_speeds(caps, times)
+        known = [v for _, v in ov if v is not None]
+        stopped = spec["ego"]["behavior"] == "stopped"
+        if known and len(known) >= 0.5 * len(ov) and not stopped:
+            speeds = [(t, v) for t, v in ov if v is not None]
+            source = "overlay"
+        else:
+            v0 = 0.0 if stopped else float(spec["ego"]["speed_kmh"]) / 3.6
+            speeds, source = [(t_lo, v0), (t_hi, v0)], "scene speed (no overlay)"
+        s_ego = camera_geom.travel(speeds, t_v0)
+        curve = camera_geom.RoadCurve(spec["road"].get("centerline"))
+        vx_at = camera_geom.vx_series(lane_rows, cam.vx)
+        if source == "overlay":                    # distances ahead (and so other cars' speeds) depend on the focal length
+            import numpy as np
+            sp_t, sp_v = [t for t, _ in speeds], [v for _, v in speeds]
+            f_est, n_dash = camera_geom.focal_from_dashes(video, cam, times, lambda t: float(np.interp(t, sp_t, sp_v)), y_b, vx_at)
+            if f_est:
+                cnote += "; focal %.0f px measured from %d dashed-line matches against the overlay speed (default %.0f)" % (
+                    f_est, n_dash, cam.f)
+                cam.f = f_est
+            else:
+                cnote += "; focal length could not be measured (%d dashed-line matches), default kept" % n_dash
+        raw = vehicle_tracks.detect_tracks(video, t_lo, t_hi, lane_lines.WIDTH)
+        tracks = vehicle_tracks.to_road_tracks(raw, cam, s_ego, y_b, curve=curve, vx_at=vx_at)
+        obs = [(o["t"], o["box"]) for v_ in raw.values() for o in v_]
+        grid = bev_lanes.accumulate(video, cam, s_ego, t_lo, t_hi, y_b, lambda t: [b for tt, b in obs if abs(tt - t) < 0.06],
+                                    curve=curve, vx_at=vx_at)
+        samples = bev_lanes.lane_samples(grid, 0.0, s_ego(t_hi), tracks) if grid is not None else []    # beyond: only seen from afar
+    except Exception as e:
+        log_fn("measured scene not available: %s" % e)
+        return None
+    counts = ", ".join("%d %s" % (sum(1 for t in tracks if t["kind"] == k), k) for k in ("same", "oncoming", "parked", "crossing"))
+    note = "%s; ego speed from the %s; %d vehicle tracks (%s)" % (cnote, source, len(tracks), counts)
+    return {"camera": cam.to_dict(), "speeds": [[round(t, 2), round(v, 2)] for t, v in speeds], "speed_source": source,
+            "tracks": tracks, "lane_samples": samples, "t_v0": t_v0, "t_hi": t_hi, "note": note}
+
+
+def _travel_fns(scene):
+    """(s_ego(t), time_of(d)) of a measured scene: the ego car's travel since the start of the simulated stretch and back."""
+    import numpy as np
+    from agents import camera_geom
+    s_ego = camera_geom.travel([tuple(x) for x in scene["speeds"]], scene["t_v0"])
+    ts = np.arange(scene["t_v0"], scene["t_hi"] + 5.0, 0.05)
+    ss = np.array([s_ego(t) for t in ts])
+    if ss[-1] > ss[0] + 1.0:
+        return s_ego, (lambda d: float(np.interp(d, ss, ts)))
+    return s_ego, (lambda d: scene["t_v0"])
+
+
+MIN_MAP_TRAVEL_M = 30.0      # the lane map needs the ego car to drive along the road; a stopped car keeps the earlier count
+
+
+FORK_SLOPE = 0.15            # m sideways per m along the road: a car on lanes that leave as a branch pulls away at least this fast
+FORK_MIN_SPAN_M = 8.0        # ... over at least this much road
+FORK_MIN_TRACKS = 2
+CLIMB_RATIO = 1.2            # ground / size distance of cars on the branch above which it climbs (flat: about 0.8 .. 1.2)
+CLIMB_REL = 1.15             # ... and at least this much above the cars on the ego road (the same ratio on flat ground)
+
+
+def diverging_tracks(tracks, lane_w):
+    """Same-direction tracks that pull away sideways from the ego road (outward slope of d over s), with their side."""
+    import numpy as np
+    out = []
+    for t in tracks:
+        if t.get("kind") != "same" or len(t["s"]) < 6:
+            continue
+        s, d = np.array(t["s"]), np.array(t["d"])
+        if s[-1] - s[0] < FORK_MIN_SPAN_M or abs(d.mean()) < 0.5 * lane_w:
+            continue
+        side = 1.0 if d.mean() > 0 else -1.0
+        if np.polyfit(s, d, 1)[0] * side >= FORK_SLOPE:
+            out.append((t, "left" if side > 0 else "right"))
+    return out
+
+
+def fork_from_tracks(tracks, lane_w):
+    """A fork seen in the traffic itself: FORK_MIN_TRACKS or more cars on one side pulling away from the ego road. The split is
+    where those cars were first seen (median). Returns {"side", "s_split", "ids"} or None."""
+    import numpy as np
+    div = diverging_tracks(tracks, lane_w)
+    for side in ("left", "right"):
+        ts = [t for t, sd in div if sd == side]
+        if len(ts) >= FORK_MIN_TRACKS:
+            return {"side": side, "s_split": float(np.median([t["s"][0] for t in ts])), "ids": [t["id"] for t in ts]}
+    return None
+
+
+def branch_climbs(tracks, side, beyond_m, ids=()):
+    """Whether the lanes that leave on `side` climb: the cars beyond the lanes that stay (|d| > beyond_m on that side) or pulling
+    away (ids) measure further by where their wheels are than by their size (vehicle_tracks.elevation_ratio), median at least
+    CLIMB_RATIO, with at least two such cars. (climbs, median ratio, number of cars)."""
+    import numpy as np
+    sign = 1.0 if side == "left" else -1.0
+    cars = [t for t in tracks if t.get("elev_ratio") and t.get("kind") == "same"]
+    rs = [t["elev_ratio"] for t in cars if float(np.median(t["d"])) * sign > beyond_m]
+    base = [t["elev_ratio"] for t in cars if float(np.median(t["d"])) * sign <= beyond_m]   # cars on the ego road
+    if len(rs) < 2:
+        return False, None, len(rs)
+    med = float(np.median(rs))
+    ref = float(np.median(base)) if len(base) >= 3 else 1.0        # the ratio on flat ground in this video (car mix, calibration)
+    return med >= CLIMB_RATIO and med >= CLIMB_REL * ref, med, len(rs)
+
+
+def apply_fork(prof, fork, tracks, lane_w, ego_j=None):
+    """Put a fork seen in the traffic into the lane profile: the place where lanes leave on the fork's side moves to the measured
+    split, those lanes become a branch, climbing when the cars on it show it. Returns a note, or None when the profile has no
+    lanes leaving to attach the fork to. ego_j: the ego lane counted from the left of the widest extent (lane_profile "m" frame),
+    so that the lanes that stay beside the ego car are told apart from the ones that leave."""
+    drops = [k for k in range(1, len(prof)) if prof[k]["n"] < prof[k - 1]["n"]]
+    if not drops:
+        return None
+    k = min(drops, key=lambda i: abs(prof[i]["d0"] - fork["s_split"]))
+    a, b = prof[k - 1], prof[k]
+    side = fork["side"]
+    if (side == "left") != (b["m"] > a["m"]):
+        _move_leaving_lanes(prof, k, side)
+    lo = (a["d0"] if a["d0"] is not None else 0.0) + 15.0
+    hi = (b["d1"] - 15.0) if b["d1"] is not None else fork["s_split"]
+    new_s = min(max(fork["s_split"], lo), max(hi, lo))
+    a["d1"] = b["d0"] = round(new_s, 2)
+    if ego_j is None:
+        ego_j = b["m"] + b["n"] - 1                                  # unknown: assume the right-most lane
+    # lanes that stay beside the ego car on the fork's side: past them (in the video's lane widths) the cars are on the branch
+    stay = (ego_j - b["m"]) if side == "left" else (b["m"] + b["n"] - 1 - ego_j)
+    beyond = (max(stay, 0) + 0.5) * lane_w
+    climbs, med, n = branch_climbs(tracks, side, beyond, fork["ids"])
+    b["branch"] = {"side": side, "rise_m": 6.0 if climbs else 0.0}
+    return "fork seen in the traffic: %d cars pull away on the %s from %.0f m; %s (ground/size distance %s over %d cars)" % (
+        len(fork["ids"]), side, new_s, "the branch climbs" if climbs else "level branch", "-" if med is None else "%.2f" % med, n)
+
+
+def lane_profile_from_map(spec, scene, video, duration, branch_probe=None, log_fn=log):
+    """Lane profile from the bird's-eye lane map (a count every few metres along the road): smoothed into sections directly in
+    metres, the side of every change from where lanes left, branches tagged like in add_lane_profile. Returns True when the map
+    gave a usable count."""
+    from agents import lane_profile, lane_lines
+    road = spec["road"]
+    s_ego, time_of = _travel_fns(scene)
+    if s_ego(scene["t_hi"]) < MIN_MAP_TRAVEL_M:
+        spec.setdefault("notes", []).append("lane map not used: the ego car covers only %.0f m (a stopped car sees one stretch)" % (
+            s_ego(scene["t_hi"])))
+        return False
+    measured = [x for x in scene["lane_samples"] if x.get("probs")]
+    segs = lane_profile.segment_counts(measured, switch_cost=4.0, min_dur_s=10.0)          # "t" is metres here
+    if not segs:
+        return False
+    t_v0, T = sim_window(spec)
+    need = 2 if any(a["relation"] == "beside" for a in spec["actors"]) else 1
+    bounds = lane_profile.boundary_times(segs, measured)
+    sides = [lane_lines.change_side(measured, a["t1"], b["t0"], span=15.0) for a, b in zip(segs, segs[1:])]
+    prof = lane_profile.build_profile(segs, bounds, sides, 0.0, 1.0)
+    d_ev = s_ego(t_v0 + T)
+    left0 = sorted(x["lanes_left"] for x in measured if x["t"] <= 30.0)       # the very start is barely seen yet
+    s_last = max(x["t"] for x in measured)
+    if len(prof) > 1 and prof[-1]["d0"] is not None and s_last - prof[-1]["d0"] < 25.0:
+        prof[-2]["d1"] = None                                        # a last change the map barely saw: not used
+        prof.pop()
+    only = prof[0]["n"] if len(prof) == 1 else None
+    if len(prof) < 2:
+        prof = []
+    if not prof:
+        n = only or next((sg["n"] for sg in segs if sg["t1"] >= d_ev), segs[-1]["n"])
+        road["lanes_per_direction"] = max(n, need)
+        road["lane_profile"] = None
+        if left0:
+            spec["ego"]["lane_index"] = int(round(left0[len(left0) // 2]))
+        spec.setdefault("notes", []).append("lane map: %d lanes along the simulated stretch" % road["lanes_per_direction"])
+        return True
+    sec_ev = lane_profile.section_at(prof, d_ev)
+    if sec_ev["n"] < need:
+        sec_ev["n"] = need
+    lane_w = next((x["lane_w"] for x in measured if x.get("lane_w")), 3.5)
+    sec0_ = lane_profile.section_at(prof, 0.0) if prof else None
+    ego_j = (sec0_["m"] + min(int(round(left0[len(left0) // 2])), sec0_["n"] - 1)) if (left0 and sec0_) else None
+    fork = fork_from_tracks(scene.get("tracks") or [], lane_w)
+    bnote = apply_fork(prof, fork, scene["tracks"], lane_w, ego_j) if fork and len(prof) > 1 else None   # traffic first
+    if bnote is None:                                                            # else ask the vision model
+        bnote = tag_branches(prof, t_v0, 0.0, video, duration, branch_probe, time_of=time_of)
+    if bnote:
+        spec.setdefault("notes", []).append(bnote)
+        log_fn(bnote)
+    road["lane_profile"] = prof
+    road["lanes_per_direction"] = sec_ev["n"]
+    sec0 = lane_profile.section_at(prof, 0.0)
+    j = min(int(round(left0[len(left0) // 2])), sec0["n"] - 1) if left0 else None
+    spec["ego"]["lane_index"] = None if j is None else sec0["m"] + j
+    txt = ", ".join("%d lanes%s" % (sc["n"], "" if sc["d0"] is None else " from %.0f m" % sc["d0"]) for sc in prof)
+    spec.setdefault("notes", []).append("lane map: %s (changes on the %s); ego lane %s from the left at the start" % (
+        txt, "/".join(sides) or "-", "?" if j is None else j + 1))
+    log_fn("lane map: " + txt)
+    return True
+
+
+def apply_ego_speed(spec, scene):
+    """With the ego speed from the overlay: spec.ego.speed_profile [[sim time, km/h], ...] for the simulation, and speed_kmh =
+    the mean speed until the event, so that the scene builder's timing puts the ego car where the video had it."""
+    if scene.get("speed_source") != "overlay" or spec["ego"]["behavior"] == "stopped":
+        return
+    import numpy as np
+    t_v0, T = sim_window(spec)
+    s_ego, _ = _travel_fns(scene)
+    from agents import traj_smoothing
+    ts = [t for t, _ in scene["speeds"]]
+    vs = [v for _, v in scene["speeds"]]
+    grid = np.arange(t_v0, max(scene["t_hi"], t_v0 + T) + 0.01, 0.5)
+    v_grid = traj_smoothing.smooth_speed_series(grid, np.interp(grid, ts, vs))      # misread digits, steps -> drivable
+    spec["ego"]["speed_profile"] = [[round(t - t_v0, 2), round(float(v) * 3.6, 1)] for t, v in zip(grid, v_grid)]
+    if T > 0.5:
+        spec["ego"]["speed_kmh"] = round(s_ego(t_v0 + T) / T * 3.6, 1)
+
+
+def apply_replay(spec, scene, t_crash, log_fn=log):
+    """Every measured vehicle track that is not one of the crash vehicles is replayed along its path (spec.replay, in simulation
+    time and metres from the ego start); the guessed background vehicles and per-lane traffic counts are dropped."""
+    from agents import vehicle_tracks
+    tracks = scene["tracks"]
+    if not tracks:
+        return
+    ev = spec.get("event") or {}
+    third = bool(ev.get("actor2_id"))
+    from agents.scene_spec import COLORS
+    c1 = next((a for a in spec["actors"] if a["id"] == ev.get("actor_id")), None)
+    rgb = (c1 or {}).get("color")
+    color = next((k for k, v in COLORS.items() if rgb and "%d,%d,%d" % v == rgb), None)     # crash car's colour name
+    skip = set(vehicle_tracks.crash_tracks(tracks, float(t_crash), ego_involved=not third, color=color)) if t_crash is not None else set()
+    t_v0, _ = sim_window(spec)
+    lane_w = next((x["lane_w"] for x in scene.get("lane_samples") or [] if x.get("lane_w")), None)
+    k_d = 3.5 / lane_w if lane_w else 1.0          # positions across the road in simulation lanes (3.5 m)
+    rep = []
+    for tr in tracks:
+        if tr["id"] in skip or tr["last_t"] < t_v0:
+            continue
+        from agents import traj_smoothing
+        d_s = [float(x) for x in traj_smoothing.smooth_offsets(tr["d"], window=9)]   # detection jitter across the road
+        pts = list(zip(tr["t"], tr["s"], d_s))[::5]
+        # speed from the positions themselves (distance over time between samples), so that speed and path agree, then made
+        # drivable (no steps, comfortable acceleration)
+        spd = [abs(b[1] - a[1]) / max(b[0] - a[0], 1e-3) for a, b in zip(pts, pts[1:])]
+        spd = spd + spd[-1:] if spd else [0.0]
+        if len(spd) >= 3:
+            spd = [float(x) for x in traj_smoothing.smooth_speed_series([p[0] for p in pts], spd,
+                                                                          vtype=tr["type"] if tr["type"] != "bike" else "car")]
+        rep.append({"id": "r%d" % tr["id"], "type": tr["type"], "color": tr["color"], "kind": tr["kind"],
+                    "path": [[round(t - t_v0, 2), round(s_, 2), round(d_ * k_d, 2)] for t, s_, d_ in pts],
+                    "speed": [[round(p[0] - t_v0, 2), round(v * 3.6, 1)] for p, v in zip(pts, spd)]})
+    spec["replay"] = rep
+    spec["actors"] = [a for a in spec["actors"] if not a["id"].startswith("b")]
+    if isinstance(spec.get("traffic"), dict):
+        for k in ("ego_lane_ahead", "left_lane", "right_lane", "oncoming"):
+            spec["traffic"][k] = 0
+    msg = "replaying %d measured vehicles (crash vehicles excluded: %s)" % (len(rep), sorted(skip) or "none matched")
+    spec.setdefault("notes", []).append(msg)
+    log_fn(msg)
 
 
 def add_lane_profile(spec, video, duration, t_crash=None, samples=None, step=0.5, log_fn=log, branch_probe=None):
@@ -800,11 +1079,23 @@ def phase1(video, out, spec_path=None, fps=6.0, assume_crash=True, reuse=False):
                 spec = add_curve(spec, video, dur, t_crash, caps)
                 t_stages["curve"] = time.time() - ts
                 ts = time.time()
-                lane_samples = add_lane_profile(spec, video, dur, t_crash=t_crash,
-                                                samples=_cached(out, "lane_timeline.json", reuse))
-                if lane_samples:
-                    _save(lane_samples, os.path.join(out, "lane_timeline.json"))
-                t_stages["lane_profile"] = time.time() - ts
+                scene = _cached(out, "scene_measure.json", reuse) or measure_scene(spec, video, dur, caps, log_fn=log)
+                from_map = False
+                if scene:
+                    _save(scene, os.path.join(out, "scene_measure.json"))
+                    log(scene["note"])
+                    spec.setdefault("notes", []).append(scene["note"])
+                    apply_ego_speed(spec, scene)
+                    from_map = lane_profile_from_map(spec, scene, video, dur)
+                    apply_replay(spec, scene, t_crash)
+                t_stages["measured_scene"] = time.time() - ts
+                if not from_map:                       # no tracker / lane model: lane count from the per-window detector
+                    ts = time.time()
+                    lane_samples = add_lane_profile(spec, video, dur, t_crash=t_crash,
+                                                    samples=_cached(out, "lane_timeline.json", reuse))
+                    if lane_samples:
+                        _save(lane_samples, os.path.join(out, "lane_timeline.json"))
+                    t_stages["lane_profile"] = time.time() - ts
     spec["degraded"] = degraded
     if not spec_path and os.environ.get("LLM_KEEP") != "1":
         llm_backend.stop_server()            # free the memory for CARLA

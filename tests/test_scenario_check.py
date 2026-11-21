@@ -123,3 +123,15 @@ class TestSearch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReplayInTheWay(unittest.TestCase):
+    def test_only_replayed_vehicles_hit_by_the_crash_vehicles_before_the_event(self):
+        from agents.scenario_check import replay_in_the_way
+        plan = {"agents": {"v1": {}, "v2": {}, "v5": {"replay": "r3"}, "v6": {"replay": "r4"}, "v7": {}}}
+        expect = {"actors": ["v1", "v2"], "time_s": 8.0, "window_s": 1.5}
+        events = [{"actor": "v2", "other_actor": "v5", "t_sim": 4.5},     # the cut-in car hits a replayed car: out
+                  {"actor": "v6", "other_actor": "v7", "t_sim": 3.0},     # replayed cars among themselves: not our business
+                  {"actor": "v1", "other_actor": "v7", "t_sim": 2.0},     # not a replayed vehicle
+                  {"actor": "v1", "other_actor": "v6", "t_sim": 12.0}]    # after the event
+        self.assertEqual(replay_in_the_way(plan, expect, {"events": events}), ["v5"])

@@ -163,6 +163,44 @@ def _lane_profile(v):
     return out
 
 
+def _series(v, lo, hi, width=2):
+    """[[t, value, ...], ...] with finite numbers, t increasing and the values clamped to lo..hi; None when unusable."""
+    import math
+    if not isinstance(v, (list, tuple)) or len(v) < 2:
+        return None
+    out = []
+    for p in v:
+        try:
+            row = [float(x) for x in p[:width]]
+        except (TypeError, ValueError, IndexError):
+            return None
+        if len(row) < width or not all(math.isfinite(x) for x in row) or (out and row[0] <= out[-1][0]):
+            return None
+        out.append([row[0]] + [max(lo, min(hi, x)) for x in row[1:]] if width == 2 else row)
+    return out
+
+
+REPLAY_KINDS = ("same", "oncoming", "parked", "crossing")
+MAX_REPLAY = 30
+
+
+def _replay(v):
+    """Measured vehicles to replay: [{"id", "type", "color", "kind", "path": [[t, s, d], ...], "speed": [[t, km/h], ...]}]."""
+    if not isinstance(v, (list, tuple)):
+        return []
+    out = []
+    for r in v:
+        if not isinstance(r, dict) or len(out) >= MAX_REPLAY:
+            continue
+        path = _series(r.get("path"), -1e6, 1e6, width=3)
+        if not path:
+            continue
+        out.append({"id": str(r.get("id") or "r%d" % len(out)), "type": _pick(r.get("type"), ACTOR_TYPES, "car"),
+                    "color": color_rgb(r.get("color")), "kind": r.get("kind") if r.get("kind") in REPLAY_KINDS else "same",
+                    "path": path, "speed": _series(r.get("speed"), 0.0, 200.0) or []})
+    return out
+
+
 def _traffic(obj):
     t = dict(DEFAULT["traffic"])
     obj = obj if isinstance(obj, dict) else {}
@@ -203,6 +241,7 @@ def normalize(obj):
     spec["ego"]["speed_kmh"] = _num(ego.get("speed_kmh"), 0.0, 130.0, 50.0)
     spec["ego"]["behavior"] = _pick(ego.get("behavior"), EGO_BEHAVIORS, "cruise")
     spec["ego"]["color"] = color_rgb(ego.get("color"))
+    spec["ego"]["speed_profile"] = _series(ego.get("speed_profile"), 0.0, 130.0)
     actors = []
     for i, a in enumerate(obj.get("actors") or []):
         if not isinstance(a, dict) or len(actors) >= 6:
@@ -219,6 +258,7 @@ def normalize(obj):
             "color": color_rgb(a.get("color")),
         })
     spec["actors"] = actors
+    spec["replay"] = _replay(obj.get("replay"))
     ev = obj.get("event") or {}
     spec["event"]["type"] = _pick(ev.get("type"), EVENTS, "none")
     ids = {a["id"] for a in actors}

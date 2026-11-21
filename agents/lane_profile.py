@@ -116,7 +116,9 @@ def build_profile(segs, t_bounds, sides, t_start, speed_ms, min_section_m=15.0):
     while changed and len(secs) > 1:
         changed = False
         for i, sc in enumerate(secs):
-            if sc["d0"] is not None and sc["d1"] is not None and sc["d1"] - sc["d0"] < min_section_m:
+            # the simulation starts at d = 0, so a first section that ends within min_section_m is just as short
+            start = sc["d0"] if sc["d0"] is not None else (0.0 if sc["d1"] is not None and i == 0 else None)
+            if start is not None and sc["d1"] is not None and sc["d1"] - start < min_section_m:
                 j = i - 1 if i > 0 else i + 1
                 keep = secs[j]
                 lo, hi = min(i, j), max(i, j)

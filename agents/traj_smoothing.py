@@ -190,3 +190,34 @@ def smooth_trajectory(times, x, y, vtype="car", dt=0.1, meas_std=0.15, process_s
     v_out = np.hypot(np.gradient(x_out, t), np.gradient(y_out, t))
     dev = float(np.max(np.hypot(np.interp(t, t_raw, x_raw) - x_out, np.interp(t, t_raw, y_raw) - y_out)))
     return {"times": t, "x": x_out, "y": y_out, "h": h, "v": v_out, "max_deviation_m": dev}
+
+
+COMFORT = {"max_accel": 2.5, "max_decel": 4.0, "max_jerk": 3.0}      # m/s^2, m/s^2, m/s^3: everyday driving
+
+
+def smooth_speed_series(times, speeds, vtype="car", window_s=1.5):
+    """A measured speed series (m/s) made fit for a driver to follow: single misreadings (e.g. an overlay digit read wrong)
+    replaced by the local median, a centred moving average over window_s, then comfortable acceleration, braking and jerk
+    limits. Returns an array of speeds (m/s) at the same times."""
+    t = np.asarray(times, dtype=float)
+    v = np.asarray(speeds, dtype=float)
+    if len(v) < 3:
+        return v.copy()
+    v = hampel(v, window=7, thresh=2.5)
+    dt = float(np.median(np.diff(t))) if len(t) > 1 else 0.5
+    k = max(int(round(window_s / max(dt, 1e-3))), 1)
+    if k > 1:
+        pad = np.concatenate([np.full(k // 2, v[0]), v, np.full(k - 1 - k // 2, v[-1])])
+        v = np.convolve(pad, np.ones(k) / k, mode="valid")
+    lim = limits_for(vtype)
+    return limit_speed_profile(t, v, lim["max_speed"], COMFORT["max_accel"], COMFORT["max_decel"], COMFORT["max_jerk"])
+
+
+def smooth_offsets(values, window=5):
+    """Lateral offsets with spikes removed and a short moving average (a car keeps its lane line; detection jitter does not)."""
+    v = hampel(np.asarray(values, dtype=float), window=7, thresh=2.5)
+    if len(v) < 3:
+        return v
+    k = min(window, len(v))
+    pad = np.concatenate([np.full(k // 2, v[0]), v, np.full(k - 1 - k // 2, v[-1])])
+    return np.convolve(pad, np.ones(k) / k, mode="valid")

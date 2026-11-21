@@ -1,0 +1,384 @@
+"""Camera geometry, vehicle tracks in road coordinates, the bird's-eye lane map, and replaying measured vehicles."""
+import ast
+import math
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from agents import bev_lanes, camera_geom, local_pipeline, motion_runner, scene_builder, scene_spec, vehicle_tracks
+from agents.road_frame import RoadFrame, lane_offset
+
+CAM = camera_geom.Camera(960, 540, 480.0, 480.0, 230.0, 1.3)
+
+
+class TestCamera(unittest.TestCase):
+    def test_ground_and_pixel_are_inverse(self):
+        for X, Z in ((0.0, 10.0), (-3.5, 20.0), (5.0, 7.5)):
+            u, v = CAM.pixel_from_ground(X, Z)
+            X2, Z2 = CAM.ground_from_pixel(u, v)
+            self.assertAlmostEqual(X, X2, places=6)
+            self.assertAlmostEqual(Z, Z2, places=6)
+        self.assertIsNone(CAM.ground_from_pixel(400, 229))                 # above the horizon
+
+    def test_lateral_position_does_not_depend_on_the_focal_length(self):
+        other = camera_geom.Camera(960, 540, 300.0, 480.0, 230.0, 1.3)
+        u, v = 300.0, 300.0
+        self.assertAlmostEqual(CAM.ground_from_pixel(u, v)[0], other.ground_from_pixel(u, v)[0], places=9)
+
+    def test_height_from_the_lane_ratio_is_clamped(self):
+        self.assertAlmostEqual(camera_geom.height_from_ratio(2.5), 1.4)
+        self.assertEqual(camera_geom.height_from_ratio(10.0), camera_geom.H_RANGE[0])
+        self.assertEqual(camera_geom.height_from_ratio(None), 1.3)
+
+    def test_top_view_puts_a_ground_point_where_it_belongs(self):
+        Hm, size = camera_geom.bev_homography(CAM, (-10.0, 10.0), (5.0, 25.0), 0.1)
+        i, j = (2.0 - (-10.0)) / 0.1, (25.0 - 12.0) / 0.1                 # X = 2 m right, Z = 12 m ahead
+        p = Hm @ np.array([i, j, 1.0])
+        u, v = CAM.pixel_from_ground(2.0, 12.0)
+        self.assertAlmostEqual(p[0] / p[2], u, places=6)
+        self.assertAlmostEqual(p[1] / p[2], v, places=6)
+
+    def test_travel_integrates_the_speed(self):
+        s = camera_geom.travel([(0.0, 10.0), (2.0, 10.0), (4.0, 20.0)], 1.0)
+        self.assertAlmostEqual(s(1.0), 0.0)
+        self.assertAlmostEqual(s(2.0), 10.0)
+        self.assertAlmostEqual(s(4.0), 10.0 + 30.0)
+        self.assertAlmostEqual(s(5.0), 40.0 + 20.0)                         # constant speed after the series
+
+    def test_road_curve_offset_on_a_left_bend(self):
+        R = 200.0
+        arc = [[R * math.sin(a), R * (1 - math.cos(a))] for a in np.linspace(0.0, 1.2, 241)]
+        curve = camera_geom.RoadCurve(arc)
+        for Z in (10.0, 20.0, 30.0):
+            self.assertAlmostEqual(float(curve.offset(50.0, Z)), Z * Z / (2 * R), delta=0.05 * Z * Z / (2 * R) + 0.01)
+        self.assertEqual(float(camera_geom.RoadCurve(None).offset(10.0, 20.0)), 0.0)
+
+
+class TestVehicleTracks(unittest.TestCase):
+    def test_box_bottom_is_the_ground_contact_and_the_centre_is_half_a_car_further(self):
+        u, v = CAM.pixel_from_ground(-3.5, 15.0)
+        X, Z = vehicle_tracks.ground_point(CAM, [u - 40, v - 50, u + 40, v], "car")
+        self.assertAlmostEqual(Z, 15.0 + vehicle_tracks.HALF_LEN["car"], places=6)
+        self.assertAlmostEqual(X, -3.5 * Z / 15.0, places=6)
+        self.assertIsNone(vehicle_tracks.ground_point(CAM, [u - 40, v - 50, u + 40, 400], "car", y_bottom=400))   # cut by the hood
+
+    def test_kinds(self):
+        t = [0.0, 1.0, 2.0]
+        self.assertEqual(vehicle_tracks.classify(t, [10, 25, 40], [3.5, 3.5, 3.6], None), "same")
+        self.assertEqual(vehicle_tracks.classify(t, [60, 45, 30], [-7, -7, -7], None), "oncoming")
+        self.assertEqual(vehicle_tracks.classify(t, [30, 30.5, 31], [6, 6, 6], None), "parked")
+        self.assertEqual(vehicle_tracks.classify(t, [20, 20.5, 21], [8, 3, -2], None), "crossing")
+
+    def test_crash_tracks_with_and_without_the_ego_car(self):
+        def tr(i, z, d):
+            ts = [round(4.0 + 0.1 * k, 2) for k in range(21)]
+            return {"id": i, "t": ts, "s": [50.0 + z] * 21, "z": [z] * 21, "d": [d] * 21}
+        tracks = [tr(1, 3.0, 2.0), tr(2, 20.0, 3.5), tr(3, 21.0, 6.0)]
+        self.assertEqual(vehicle_tracks.crash_tracks(tracks, 5.0, ego_involved=True), [1])
+        self.assertEqual(sorted(vehicle_tracks.crash_tracks(tracks, 5.0, ego_involved=False)), [1, 2] if False else [2, 3])
+
+
+def synthetic_grid(lanes_left, lanes_right, w=3.5, s_max=60.0, cars_hide=()):
+    """A lane map seen everywhere: lines between lanes, road over the lanes, grass beyond; cars_hide: (d0, d1) not seen."""
+    g = bev_lanes.LaneGrid(s_max)
+    d = np.array([g.d_of(j) for j in range(g.nd)])
+    left_edge, right_edge = (lanes_left + 0.5) * w, -(lanes_right + 0.5) * w
+    road = (d <= left_edge) & (d >= right_edge)
+    edges = (np.abs(d - left_edge) < 0.25) | (np.abs(d - right_edge) < 0.25)          # solid edge lines
+    inner = np.zeros(g.nd, bool)                                                    # dashed lines between lanes
+    for k in range(-lanes_right, lanes_left):
+        inner |= np.abs(d - (k + 0.5) * w) < 0.25
+    inner &= ~edges
+    seen = np.ones(g.nd, bool)
+    for a, b in cars_hide:
+        seen &= ~((d >= a) & (d <= b))
+    dash_rows = (np.arange(g.ns) % 6) < 2                                           # 1 m of dash in every 3 m
+    g.seen[:] = 10.0 * seen
+    g.seen_r[:] = 10.0 * seen
+    g.line[:] = 10.0 * ((edges[None, :] | (inner[None, :] & dash_rows[:, None])) & seen[None, :])
+    g.road[:] = 10.0 * (road & seen)
+    return g
+
+
+class TestLaneMap(unittest.TestCase):
+    def test_counts_lanes_from_lines_and_road(self):
+        g = synthetic_grid(2, 1)
+        nl, nr, det = bev_lanes.count_slice(g, 30.0, 3.5)
+        self.assertEqual((nl, nr), (2, 1))
+
+    def test_lane_width_from_the_ego_lane(self):
+        g = synthetic_grid(2, 0, w=3.7)
+        self.assertAlmostEqual(bev_lanes.lane_width(g, [10.0, 20.0, 30.0, 40.0, 50.0]), 3.7, delta=0.25)
+
+    def test_cars_show_lanes_whose_road_they_hide(self):
+        g = synthetic_grid(0, 0, cars_hide=[(2.0, 12.0)])                 # left of the ego lane: hidden by a queue
+        self.assertEqual(bev_lanes.count_slice(g, 30.0, 3.5)[0], 0)
+        self.assertEqual(bev_lanes.count_slice(g, 30.0, 3.5, vehicles_d=[3.6, 7.1])[0], 2)
+
+    def test_cars_on_ground_seen_as_off_road_do_not_count(self):
+        g = synthetic_grid(1, 0)
+        self.assertTrue(bev_lanes.seen_off_road(g, 30.0, -12.0))          # beyond the road edge: seen, not road
+        self.assertFalse(bev_lanes.seen_off_road(g, 30.0, 3.5))
+
+    def test_a_lane_seen_is_carried_where_nothing_is_seen_but_not_onto_seen_grass(self):
+        g = synthetic_grid(2, 0, s_max=120.0)
+        rows = [{"t": float(s), "lanes_left": 2.0 if s < 40 else 0.0, "lanes_right": 0.0, "detail": {}} for s in range(0, 100, 5)]
+        g.seen[int((50 - g.s0) / bev_lanes.S_RES):] = 0.0                 # nothing seen beyond 50 m
+        g.seen_r[int((50 - g.s0) / bev_lanes.S_RES):] = 0.0
+        bev_lanes.carry_lanes(g, rows, 3.5)
+        by_s = {r["t"]: r["lanes_left"] for r in rows}
+        self.assertEqual(by_s[60.0], 2.0)                                  # carried into the unseen stretch
+        self.assertEqual(by_s[95.0], 0.0)                                  # but not further than CARRY_M
+        g2 = synthetic_grid(0, 0, s_max=120.0)                             # grass seen left of the ego lane everywhere
+        rows2 = [{"t": float(s), "lanes_left": 2.0 if s < 20 else 0.0, "lanes_right": 0.0, "detail": {}} for s in range(0, 60, 5)]
+        bev_lanes.carry_lanes(g2, rows2, 3.5)
+        self.assertEqual(rows2[-1]["lanes_left"], 0.0)
+
+
+def spec_with(actors=(), event=None, behavior="cruise", speed=50.0):
+    spec, _ = scene_spec.normalize({"road": {"type": "straight", "lanes_per_direction": 2},
+                                    "ego": {"speed_kmh": speed, "behavior": behavior},
+                                    "actors": list(actors), "event": event or {"type": "none"}})
+    return spec
+
+
+class TestPipelineScene(unittest.TestCase):
+    def scene(self, tracks=(), speeds=None, source="overlay"):
+        return {"tracks": list(tracks), "speeds": speeds or [[0.0, 20.0], [20.0, 10.0]], "speed_source": source,
+                "t_v0": 1.0, "t_hi": 14.0, "lane_samples": []}
+
+    def test_ego_speed_profile_and_mean_speed_until_the_event(self):
+        spec = spec_with([{"id": "c1", "relation": "ahead", "behavior": "braking"}], {"type": "collision", "actor_id": "c1", "time_s": 9.0})
+        local_pipeline.apply_ego_speed(spec, self.scene())
+        self.assertEqual(spec["ego"]["speed_profile"][0][0], 0.0)
+        # speed falls linearly from 20 m/s at 0 s to 10 m/s at 20 s: mean over video 1..9 s = 17.5 m/s
+        self.assertAlmostEqual(spec["ego"]["speed_kmh"], 17.5 * 3.6, delta=0.2)
+        stopped = spec_with(behavior="stopped", speed=0.0)
+        local_pipeline.apply_ego_speed(stopped, self.scene())
+        self.assertIsNone(stopped["ego"].get("speed_profile"))
+
+    def test_replay_drops_guessed_background_and_the_crash_vehicle(self):
+        actors = [{"id": "c1", "relation": "beside", "lane": "left", "behavior": "cutting_in"},
+                  {"id": "b1", "relation": "ahead", "lane": "left", "behavior": "driving"}]
+        spec = spec_with(actors, {"type": "collision", "actor_id": "c1", "time_s": 9.0})
+        spec["traffic"]["left_lane"] = 3
+        ts = [round(7.0 + 0.1 * k, 2) for k in range(41)]
+        crash = {"id": 5, "type": "car", "color": "white", "kind": "same", "t": ts, "s": [100.0] * 41, "z": [2.0] * 41,
+                 "d": [1.0] * 41, "v": [15.0] * 41, "first_t": 7.0, "last_t": 11.0}
+        other = dict(crash, id=6, z=[25.0] * 41, d=[3.5] * 41, color="red")
+        local_pipeline.apply_replay(spec, self.scene([crash, other]), 9.0)
+        self.assertEqual([r["id"] for r in spec["replay"]], ["r6"])
+        self.assertEqual([a["id"] for a in spec["actors"]], ["c1"])
+        self.assertEqual(spec["traffic"]["left_lane"], 0)
+        self.assertEqual(spec["replay"][0]["path"][0][0], 6.0)            # video 7 s = 6 s after the simulation starts
+        checked, _ = scene_spec.normalize(spec)
+        self.assertEqual(len(checked["replay"]), 1)
+
+    def test_lane_profile_from_the_map_in_metres(self):
+        from agents import lane_lines
+        samples = []
+        for s in range(0, 200, 2):
+            nl = 4.0 if s < 100 else 2.0
+            samples.append({"t": float(s), "lanes_left": nl, "lanes_right": 0.0, "road_lanes": 1 + nl,
+                            "probs": lane_lines.count_probs(1 + nl)})
+        scene = self.scene(speeds=[[0.0, 15.0], [20.0, 15.0]])
+        scene["lane_samples"] = samples
+        spec = spec_with()
+        probe = lambda video, t, side, dur: (0.3, 0.65) if side == "left" else (0.2, 0.2)
+        self.assertTrue(local_pipeline.lane_profile_from_map(spec, scene, "v.mp4", 20.0, probe, log_fn=lambda m: None))
+        prof = spec["road"]["lane_profile"]
+        self.assertEqual([(p["n"], p["m"]) for p in prof], [(5, 0), (3, 2)])
+        self.assertAlmostEqual(prof[0]["d1"], 99.0, delta=2.0)
+        self.assertEqual(prof[1]["branch"], {"side": "left", "rise_m": 6.0})
+        self.assertEqual(spec["ego"]["lane_index"], 4)                    # the right-most of five
+
+
+class TestReplayInBuilder(unittest.TestCase):
+    def build(self, replay, profile=None):
+        spec = spec_with(speed=54.0)
+        spec["replay"] = replay
+        if profile:
+            spec["ego"]["speed_profile"] = profile
+        tmp = tempfile.TemporaryDirectory()
+        plan = scene_builder.build(spec, tmp.name, "rp")
+        with open(os.path.join(tmp.name, "rp_scene_obj.txt"), encoding="utf-8") as f:
+            agents = ast.literal_eval(f.readline())
+        tmp.cleanup()
+        return plan, agents
+
+    def test_vehicle_first_seen_later_starts_where_its_speed_puts_it_and_follows_its_path(self):
+        rep = [{"id": "r1", "type": "car", "color": "red", "kind": "same",
+                "path": [[2.0, 60.0, 3.5], [3.0, 70.0, 3.5], [4.0, 80.0, 3.6]], "speed": [[2.0, 36.0], [4.0, 36.0]]}]
+        plan, agents = self.build(rep)
+        vid = plan["idmap"]["r1"]
+        fr = RoadFrame(plan["road"]["centerline"])
+        s, d = fr.to_sd(agents[vid]["location"][0], -agents[vid]["location"][1])
+        self.assertAlmostEqual(s, scene_builder.S_START + 40.0, delta=0.05)   # 60 m at 2 s, 10 m/s -> 40 m at 0 s
+        self.assertAlmostEqual(d, lane_offset(2, 0) + 3.5, delta=0.05)
+        p = plan["agents"][vid]
+        self.assertEqual(p["mode"], "drive")
+        self.assertAlmostEqual(p["speed_kmh"], 36.0, delta=0.1)
+        self.assertEqual(p["speed_profile"][0], [0.0, 36.0])
+        end = fr.to_sd(*p["polyline"][-1])
+        self.assertGreater(end[0], fr.length - 20.0)                     # keeps its lane to the end of the road
+        self.assertEqual(p["color"], scene_spec.color_rgb("red"))
+
+    def test_parked_vehicle_stands_and_a_vehicle_on_the_ego_car_is_skipped(self):
+        rep = [{"id": "r1", "type": "truck", "color": None, "kind": "parked", "path": [[0.0, 30.0, -4.0], [3.0, 30.2, -4.0]], "speed": []},
+               {"id": "r2", "type": "car", "color": None, "kind": "same", "path": [[0.0, 1.0, 0.0], [1.0, 15.0, 0.0]], "speed": []}]
+        plan, agents = self.build(rep)
+        self.assertEqual(plan["agents"][plan["idmap"]["r1"]]["mode"], "static")
+        self.assertNotIn("r2", plan["idmap"])
+        self.assertTrue(any("r2" in n for n in plan["notes"]))
+
+    def test_ego_gets_the_measured_speed_profile(self):
+        plan, _ = self.build([], profile=[[0.0, 60.0], [5.0, 40.0]])
+        self.assertEqual(plan["agents"]["v1"]["speed_profile"], [[0.0, 60.0], [5.0, 40.0]])
+
+    def test_runner_profile_speed(self):
+        prof = [[0.0, 60.0], [5.0, 40.0]]
+        self.assertEqual(motion_runner.profile_speed(prof, -1.0), 60.0)
+        self.assertAlmostEqual(motion_runner.profile_speed(prof, 2.5), 50.0)
+        self.assertEqual(motion_runner.profile_speed(prof, 9.0), 40.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestDrivableMotion(unittest.TestCase):
+    def test_speed_smoothing_drops_a_misread_value_and_keeps_acceleration_comfortable(self):
+        from agents import traj_smoothing as ts
+        t = [0.5 * i for i in range(14)]
+        kmh = [80.5, 70.8, 70.8, 70.8, 66, 66, 66, 40.2, 62.7, 62.7, 59.5, 59.5, 59.5, 56.3]
+        v = ts.smooth_speed_series(t, [x / 3.6 for x in kmh])
+        self.assertGreater(min(v) * 3.6, 55.0)                           # the 40 km/h misreading is gone
+        acc = np.diff(v) / 0.5
+        self.assertLessEqual(acc.max(), ts.COMFORT["max_accel"] + 1e-6)
+        self.assertGreaterEqual(acc.min(), -ts.COMFORT["max_decel"] - 1e-6)
+
+    def test_vehicles_off_the_scene_roads_are_not_replayed(self):
+        road = scene_builder.Road("straight", 2)
+        self.assertTrue(scene_builder._on_carriageway(road, 50.0, -5.0, "same"))
+        self.assertFalse(scene_builder._on_carriageway(road, 50.0, -14.0, "same"))     # frontage road beyond the barrier
+        self.assertFalse(scene_builder._on_carriageway(road, 50.0, 3.0, "same"))       # that is the opposite carriageway
+        self.assertTrue(scene_builder._on_carriageway(road, 50.0, 3.0, "oncoming"))
+        self.assertTrue(scene_builder._on_carriageway(road, 50.0, -9.5, "parked"))     # on the shoulder
+
+
+class TestForkGeometry(unittest.TestCase):
+    def test_branch_stays_level_until_it_has_pulled_away_and_has_no_inner_shoulder(self):
+        import re
+        from test_lane_profile import LEFT_FLYOVER, base_spec, build
+        tmp, plan, agents, net = build(base_spec(LEFT_FLYOVER, lane_index=4))
+        s_b = plan["road"]["sections"][1]["s0"]
+        fr = RoadFrame(plan["road"]["centerline"])
+        pts = re.search(r'<lane id="branch_0"[^>]*shape="([^"]+)"', net).group(1).split()
+        for p in pts:
+            v = [float(x) for x in p.split(",")]
+            s, d = fr.to_sd(v[0], v[1])
+            z = v[2] if len(v) > 2 else 0.0
+            if s < s_b + scene_builder.RISE_START_M - 1.0:
+                self.assertAlmostEqual(z, 0.0, places=2)
+        self.assertEqual(plan["road"]["no_shoulder"], ["branch"])
+
+
+class TestDashFocal(unittest.TestCase):
+    def test_dash_pattern_shift_between_frames(self):
+        z = np.arange(400) * camera_geom.DASH_RES                    # 20 m of road
+        dash = lambda off: ((z + off) % 12.0 < 3.0).astype(float) * 40.0 + 2.0   # 3 m dashes every 12 m
+        a = dash(0.0)
+        b = np.concatenate([np.full(17, 2.0), a[:-17]])              # marks moved 17 rows toward the camera
+        k, r = camera_geom.dash_shift(a, b, 80)
+        self.assertEqual(k, 17)
+        self.assertGreater(r, 0.95)
+
+
+class TestLaneSnapping(unittest.TestCase):
+    def test_replayed_positions_snap_to_lanes_that_exist(self):
+        road = scene_builder.Road("straight", 3, None, False,
+                                  [{"s0": 0, "s1": 100, "n": 3, "m": 0}, {"s0": 100, "s1": 300, "n": 2, "m": 1}])
+        self.assertAlmostEqual(scene_builder.snap_lane(road, 50.0, -4.0), lane_offset(3, 1))      # between lanes -> nearest
+        self.assertAlmostEqual(scene_builder.snap_lane(road, 150.0, -1.8), lane_offset(3, 1))     # left lane ended: next one
+        self.assertAlmostEqual(scene_builder.snap_lane(road, 150.0, 4.0, oncoming=True), -lane_offset(3, 1))
+
+    def test_branch_lanes_count_after_a_fork(self):
+        from test_lane_profile import LEFT_FLYOVER
+        secs = [{"s0": 0.0, "s1": 75.0, "n": 5, "m": 0}, {"s0": 75.0, "s1": 300.0, "n": 3, "m": 2, "branch": {"side": "left", "rise_m": 6.0}}]
+        road = scene_builder.Road("straight", 3, None, False, secs)
+        far = 75.0 + scene_builder.DIVERGE_LEN_M + 10.0
+        c = scene_builder.lane_centres(road, far)
+        self.assertEqual(len(c), 5)                                    # three ego-road lanes and the two branch lanes
+        self.assertAlmostEqual(max(c), -0.5 * 3.5 + scene_builder.DIVERGE_D_M, places=6)
+
+
+def drift_track(i, d0, slope, s0=90.0, n=30, ratio=None, kind="same"):
+    s = [s0 + 1.0 * k for k in range(n)]
+    return {"id": i, "kind": kind, "type": "car", "s": s, "d": [d0 + slope * (x - s0) for x in s], "elev_ratio": ratio,
+            "t": [0.1 * k for k in range(n)]}
+
+
+class TestForkFromTraffic(unittest.TestCase):
+    def test_elevation_ratio_is_one_on_flat_ground_and_grows_on_a_rise(self):
+        Z = 20.0
+        u, v = CAM.pixel_from_ground(-3.0, Z)
+        h = CAM.f * vehicle_tracks.CAR_HEIGHT_M / Z
+        self.assertAlmostEqual(vehicle_tracks.elevation_ratio(CAM, [u - 30, v - h, u + 30, v], "car"), 1.0, places=6)
+        v_up = CAM.vy + CAM.f * (CAM.H - 0.5) / Z                          # the same car 0.5 m higher up
+        self.assertAlmostEqual(vehicle_tracks.elevation_ratio(CAM, [u - 30, v_up - h, u + 30, v_up], "car"),
+                               CAM.H / (CAM.H - 0.5), places=6)
+        self.assertIsNone(vehicle_tracks.elevation_ratio(CAM, [u - 30, v - h, u + 30, v], "truck"))
+
+    def test_cars_pulling_away_on_one_side_make_a_fork(self):
+        tracks = [drift_track(1, 8.0, 0.25, s0=100.0), drift_track(2, 15.0, 0.2, s0=110.0), drift_track(3, 4.0, 0.0),
+                  drift_track(4, -4.0, -0.01)]
+        fork = local_pipeline.fork_from_tracks(tracks, 3.5)
+        self.assertEqual(fork["side"], "left")
+        self.assertAlmostEqual(fork["s_split"], 105.0)
+        self.assertEqual(sorted(fork["ids"]), [1, 2])
+        self.assertIsNone(local_pipeline.fork_from_tracks(tracks[:1] + tracks[2:], 3.5))   # one car is not a fork
+
+    def test_branch_climbs_when_its_cars_read_higher_than_the_ego_road(self):
+        base = [drift_track(10 + k, 3.5, 0.0, ratio=1.0) for k in range(4)]
+        high = [drift_track(1, 12.0, 0.2, ratio=1.5), drift_track(2, 13.0, 0.2, ratio=1.3)]
+        self.assertTrue(local_pipeline.branch_climbs(base + high, "left", 9.0)[0])
+        flat = [drift_track(1, 12.0, 0.2, ratio=1.05), drift_track(2, 13.0, 0.2, ratio=1.1)]
+        self.assertFalse(local_pipeline.branch_climbs(base + flat, "left", 9.0)[0])
+
+    def test_fork_moves_the_change_to_the_split_and_makes_a_branch(self):
+        prof = [{"d0": None, "d1": 60.0, "n": 4, "m": 0}, {"d0": 60.0, "d1": None, "n": 3, "m": 1}]
+        tracks = [drift_track(1, 12.0, 0.25, s0=100.0, ratio=1.5), drift_track(2, 14.0, 0.2, s0=110.0, ratio=1.4)] + \
+                 [drift_track(10 + k, 3.5, 0.0, ratio=1.0) for k in range(4)]
+        fork = local_pipeline.fork_from_tracks(tracks, 3.5)
+        note = local_pipeline.apply_fork(prof, fork, tracks, 3.5, ego_j=3)
+        self.assertAlmostEqual(prof[1]["d0"], 105.0)
+        self.assertEqual(prof[0]["d1"], prof[1]["d0"])
+        self.assertEqual(prof[1]["branch"], {"side": "left", "rise_m": 6.0})
+        self.assertIn("climbs", note)
+
+
+class TestReplayPathDensity(unittest.TestCase):
+    def test_replayed_path_follows_a_bend_instead_of_cutting_it(self):
+        import math as m
+        R = 190.0
+        arc = [[R * m.sin(a), -R * (1 - m.cos(a))] for a in np.linspace(0.0, 1.5, 301)]      # bends right
+        spec = spec_with(speed=54.0)
+        spec["road"]["centerline"] = arc
+        spec["replay"] = [{"id": "r1", "type": "car", "color": None, "kind": "same",
+                           "path": [[3.0, 120.0, 3.5], [4.0, 130.0, 3.5]], "speed": [[3.0, 36.0], [4.0, 36.0]]}]
+        tmp = tempfile.TemporaryDirectory()
+        plan = scene_builder.build(spec, tmp.name, "bend")
+        tmp.cleanup()
+        fr = RoadFrame(plan["road"]["centerline"])
+        poly = plan["agents"][plan["idmap"]["r1"]]["polyline"]
+        gaps = [m.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(poly, poly[1:])]
+        self.assertLessEqual(max(gaps), 4.5)                             # no long chords
+        ds = [fr.to_sd(*q)[1] for q in poly]
+        self.assertLess(max(ds) - min(ds), 0.2)                          # stays in its lane through the bend

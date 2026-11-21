@@ -107,6 +107,16 @@ def _predict_point_at(actor, follower, speed_kmh, t_s):
     return x, y
 
 
+def profile_speed(profile, t):
+    """Speed in km/h of a speed profile [[t, km/h], ...] at time t (linear in between, held before and after)."""
+    if t <= profile[0][0]:
+        return float(profile[0][1])
+    for (t0, v0), (t1, v1) in zip(profile, profile[1:]):
+        if t <= t1:
+            return float(v0 + (v1 - v0) * (t - t0) / max(t1 - t0, 1e-6))
+    return float(profile[-1][1])
+
+
 def barrier_offsets(road_plan, s=None):
     """Lateral offsets d (+ = left) of the barrier lines: just outside the shoulder, on the ego carriageway's outer edges.
     When the lane count changes along the road (road_plan["sections"]), the offsets are those of the section at distance s."""
@@ -302,6 +312,7 @@ class RouteFollower:
         return self.route[j].transform.location
 
     stop_at = None          # simulation time after which the vehicle brakes to a stop (braking lead vehicle)
+    profile = None          # [[t_sim, km/h], ...]: speed measured in the video (ego overlay speed, replayed vehicles)
 
     def control(self, others, dt, now_abs, t_sim=0.0):
         import carla
@@ -321,7 +332,9 @@ class RouteFollower:
         steer_t = max(-1.0, min(1.0, steer_t))
         self.str += max(-2.0 * dt, min(2.0 * dt, steer_t - self.str))     # steering rate limit (2 / s)
 
-        # target speed: planned speed, limited by curvature, stop at the route end
+        # target speed: planned speed (or the measured speed profile at this time), limited by curvature, stop at the route end
+        if self.profile:
+            self.speed = profile_speed(self.profile, t_sim) / 3.6
         remaining = self.route[-1].transform.location.distance(loc)
         target = min(self.speed, self.curve_speed())
         if (remaining < spd * spd / (2 * self.DEC) + 2.0 and self.i >= len(self.route) - 3) or getattr(self, "ended", False):
@@ -385,9 +398,24 @@ class InterceptFollower(RouteFollower):
         return carla.Location(x, -y, 0.0)
 
 
-def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost", port=2000, seed=0, record_video=None):
+def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost", port=2000, seed=0, record_video=None,
+               real_time=True):
+    """real_time: every simulation step takes at least DT of wall time, so the scene plays at the speed of the video in the CARLA
+    window (synchronous mode would otherwise run it as fast as the server can step)."""
     import carla
     from agents.map_builder import build_and_load_map
+
+    pace = {"last": None}
+
+    def paced_tick(world):
+        world.tick()
+        if real_time:
+            now = time.perf_counter()
+            if pace["last"] is not None:
+                wait = DT - (now - pace["last"])
+                if wait > 0:
+                    time.sleep(wait)
+            pace["last"] = time.perf_counter()
 
     if record_video is None:
         env_rec = os.getenv("AS_RECORD_VIDEO")
@@ -472,6 +500,8 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
     try:
         # ---- spawn
         for aid, a in agents.items():
+            if plan["agents"].get(aid, {}).get("mode") == "skip":      # a replayed vehicle the checker took out
+                continue
             x, y, z = a["location"]
             yaw = a["rotation"][1]
             if a["type"] == "pedestrian":
@@ -493,7 +523,15 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 if cand:
                     x, y = cand[0].transform.location.x, cand[0].transform.location.y
             actor = None
-            for zz in (z, 1.0, 0.5):                        # big vehicles may not fit at the generated height
+            heights = (z, 1.0, 0.5)
+            if a["type"] != "pedestrian":
+                # just above the road surface under the spawn point, so that the car does not drop onto it (and is not put
+                # under a road that climbs)
+                wp_z = world.get_map().get_waypoint(carla.Location(x, y, 0.0), project_to_road=True)
+                if wp_z is not None and math.hypot(wp_z.transform.location.x - x, wp_z.transform.location.y - y) < 4.0:
+                    gz = wp_z.transform.location.z
+                    heights = (gz + 0.25, gz + 0.5, gz + 1.0, z)
+            for zz in heights:                              # big vehicles may not fit at the first height
                 actor = world.try_spawn_actor(bp, carla.Transform(carla.Location(x, y, zz), carla.Rotation(yaw=yaw)))
                 if actor is not None:
                     break
@@ -560,6 +598,8 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             if aid in actors and spec["mode"] == "drive":
                 followers[aid] = make_follower(aid, actors[aid], spec)
                 followers[aid].stop_at = spec.get("stop_at_s")
+                if spec.get("speed_profile") and not spec.get("intercept"):
+                    followers[aid].profile = spec["speed_profile"]
                 print(f"[motion] {aid}: route of {len(followers[aid].route)} waypoints" + (" (closed-loop cut-in)" if spec.get("intercept") else ""))
 
         # focus spectator camera smoothly along the approach and glide onto the impact site
@@ -652,7 +692,8 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 tl = fol.route[min(fol.i + 3, len(fol.route) - 1)].transform.location
                 vl = v.get_location()
                 dd = max(math.hypot(tl.x - vl.x, tl.y - vl.y), 1e-3)
-                sp = float(pa[aid].get("speed_kmh", 40)) / 3.6
+                prof = pa[aid].get("speed_profile")
+                sp = (profile_speed(prof, 0.0) if prof and not pa[aid].get("intercept") else float(pa[aid].get("speed_kmh", 40))) / 3.6
                 v.set_target_velocity(carla.Vector3D((tl.x - vl.x) / dd * sp, (tl.y - vl.y) / dd * sp, 0.0))
                 started[aid], start_time[aid] = True, 0.0
         t_end, first_hit = float(plan.get("duration_s", 15)), None
@@ -711,7 +752,7 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                             w.apply_control(carla.WalkerControl(direction=carla.Vector3D(dx / d, dy / d, 0.0), speed=cur))
                     else:
                         w.apply_control(carla.WalkerControl(speed=0.0))
-            world.tick()
+            paced_tick(world)
             _capture_tick()
             tick += 1
             recorder.record(tick * DT, actors)
@@ -781,7 +822,7 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                     _apply_cam_pose(cur_cam_pose)
             except Exception:
                 pass
-            world.tick()
+            paced_tick(world)
             _capture_tick()
         result["actors_alive_at_end"] = sorted(k for k, a in actors.items() if a.is_alive)
         for aid, a in actors.items():

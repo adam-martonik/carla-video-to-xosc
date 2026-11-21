@@ -192,3 +192,6 @@ secrets.json
 *.gif
 *.bmp
 *.tiff
+
+# YOLO detector weights (AGPL-3.0, downloaded on first use by agents/vehicle_tracks.py)
+models/yolo/*.pt

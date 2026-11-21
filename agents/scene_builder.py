@@ -144,7 +144,9 @@ class Road:
 SPLIT_GAP_M = 4.0          # half length of the junction where a branch leaves
 DIVERGE_LEN_M = 120.0      # a branch moves this far along the road while it pulls away sideways
 DIVERGE_D_M = 6.0          # ... by this much (the strip between the ego road and the branch)
-RISE_LEN_M = 150.0         # a branch reaches its full height after this far along the road
+RISE_LEN_M = 100.0         # a branch reaches its full height this far after it starts to climb (6 m: ~6 % average)
+RISE_START_M = 84.0        # ... which it does only once it has pulled away (70 % of DIVERGE_LEN_M: about 4.7 m apart), so the
+                           # two roads never meet at different heights
 
 
 def _smooth(x):
@@ -195,7 +197,7 @@ def _split_net(road):
     leave = list(range(a_sec["m"], b_sec["m"])) if left else list(range(b_sec["m"] + b_sec["n"], a_sec["m"] + a_sec["n"]))
     rise = float(br.get("rise_m", 0.0))
     f = lambda s: DIVERGE_D_M * _smooth((s - s_b) / DIVERGE_LEN_M) * (1.0 if left else -1.0)
-    z = lambda s: rise * _smooth((s - s_b) / RISE_LEN_M)
+    z = lambda s: rise * _smooth((s - s_b - RISE_START_M) / RISE_LEN_M)
     nodes = ['<node id="west" x="%.3f" y="%.3f" type="priority"/>' % fr.pts[0]]
     x, y = fr.to_xy(s_b, -(a_sec["m"] + 0.5 * a_sec["n"]) * W)
     nodes.append('<node id="split" x="%.3f" y="%.3f" type="priority"/>' % (x, y))
@@ -408,6 +410,163 @@ def crossroad_traffic_actors(traffic, ego_kmh, lane_idx, road, existing, ego_y0)
     return out, notes
 
 
+# ----------------------------------------------------------------------------------------- measured vehicles
+REPLAY_GAP_M = 5.5           # a replayed vehicle is not spawned closer than this (centre to centre) to one already placed
+
+
+def _interp(t, ts, vs):
+    import numpy as np
+    return float(np.interp(t, ts, vs))
+
+
+CORRIDOR_HALF_D = 2.0        # a replayed vehicle closer than this across the road ...
+CORRIDOR_HALF_S = 8.0        # ... and this along it to where a crash vehicle will be is in its way
+
+
+def _ego_travel(plan_ego, v_e):
+    """s(t): distance the ego car drives in the simulation, from its speed profile or its constant speed."""
+    prof = plan_ego.get("speed_profile")
+    if not prof or plan_ego.get("mode") != "drive":
+        return (lambda t: v_e * t) if plan_ego.get("mode") == "drive" else (lambda t: 0.0)
+    ts = [p[0] for p in prof]
+    vs = [p[1] / 3.6 for p in prof]
+
+    def s(t, dt=0.1):
+        n = int(max(t, 0.0) / dt)
+        total = sum(_interp((k + 0.5) * dt, ts, vs) * dt for k in range(n))
+        return total + _interp(n * dt, ts, vs) * (max(t, 0.0) - n * dt)
+    return s
+
+
+def _in_corridor(times, ss, ds, corridors):
+    """Whether a path (sampled at times) comes within CORRIDOR_HALF_D / _S of a crash vehicle's planned position."""
+    for d_c, s_c, t_end in corridors:
+        for t, s_, d_ in zip(times, ss, ds):
+            if 0.0 <= t <= t_end and abs(d_ - d_c) < CORRIDOR_HALF_D and abs(s_ - s_c(t)) < CORRIDOR_HALF_S:
+                return True
+    return False
+
+
+def lane_centres(road, s, oncoming=False):
+    """Lateral offsets (road frame, + left) of the centres of the lanes that exist at distance s: the ego direction's lanes
+    there and, after a fork, the branch's lanes pulled away to their side; the opposite carriageway's lanes for oncoming cars."""
+    if oncoming:
+        return [-lane_offset(road.Lw, k) for k in range(road.Lw)] if not road.one_way else []
+    out = [lane_offset(road.L, k) for k in road.lanes_at(s)]
+    b = split_index(road)
+    if b is not None and s > road.sections[b]["s0"]:
+        a_sec, b_sec = road.sections[b - 1], road.sections[b]
+        br = b_sec["branch"]
+        left = br["side"] == "left"
+        leave = range(a_sec["m"], b_sec["m"]) if left else range(b_sec["m"] + b_sec["n"], a_sec["m"] + a_sec["n"])
+        f = DIVERGE_D_M * _smooth((s - b_sec["s0"]) / DIVERGE_LEN_M) * (1.0 if left else -1.0)
+        out += [-(j + 0.5) * W + f for j in leave]
+    return out
+
+
+def snap_lane(road, s, lat, oncoming=False):
+    """A measured lateral position moved to the centre of the nearest lane that exists at s, so that a replayed car neither
+    straddles two lanes nor drives where its lane has ended (a measured lane change still happens where the position crosses
+    over to the other lane)."""
+    cents = lane_centres(road, s, oncoming)
+    return min(cents, key=lambda c: abs(c - lat)) if cents else lat
+
+
+def _on_carriageway(road, s, lat, kind, margin=1.0, shoulder=3.5):
+    """Whether a measured vehicle at lateral offset `lat` (road frame, + left) at distance s stands on a road of the scene:
+    same direction: on the ego carriageway's lanes there; oncoming: on the opposite carriageway; parked: on either or on a
+    shoulder beside them. A car on a frontage road or in a car park beyond the barrier is not."""
+    right = road.right_edge_d(s)
+    left = -road.section(s)["m"] * W if road.sections else 0.0
+    opp = 0.0 if road.one_way else road.Lw * W
+    if kind == "same":
+        return right - margin <= lat <= left + margin
+    if kind == "oncoming":
+        return not road.one_way and -margin <= lat <= opp + margin
+    return right - shoulder - margin <= lat <= max(opp, left) + shoulder + margin
+
+
+def _replay_agents(replay, road, lane_idx, s_ego0, agents, plan_agents, idmap, corridors=()):
+    """Vehicles measured in the video (agents/vehicle_tracks via spec.replay) replayed along their paths: path [t, s, d] in
+    simulation time, metres along the road from the ego start and metres left of the ego lane centre. A vehicle first seen after
+    the start is put where its first speed says it was at t = 0; it drives its measured path and speed and then keeps its lane
+    to the end of the road (oncoming: to its start). Parked vehicles stand where they were. Returns notes."""
+    from agents.scene_spec import color_rgb
+    notes = []
+    d_ego = lane_offset(road.L, lane_idx)
+    placed = [(a["x"], a["y"]) for a in agents.values()]
+    n = len(agents) + 1
+    for r in replay:
+        path = [p for p in r["path"] if p[0] >= -0.5]
+        if len(path) < 2:
+            continue
+        ts, ss, ds = [p[0] for p in path], [p[1] for p in path], [p[2] for p in path]
+        v_first = (ss[1] - ss[0]) / max(ts[1] - ts[0], 1e-3)
+        if ts[0] > 0.0:
+            s0, d0 = ss[0] - v_first * ts[0], ds[0]
+        else:
+            s0, d0 = _interp(0.0, ts, ss), _interp(0.0, ts, ds)
+        back = r["kind"] == "oncoming" or (r["kind"] != "parked" and ss[-1] < ss[0])
+        if corridors:                          # its path from t = 0 (back-extrapolated before it was seen) and while seen
+            pre = [k * 0.25 for k in range(int(max(ts[0], 0.0) / 0.25) + 1)] if ts[0] > 0.0 else []
+            v_last = (ss[-1] - ss[-2]) / max(ts[-1] - ts[-2], 1e-3)
+            post = [ts[-1] + 0.25 * k for k in range(1, 41)]          # after it was last seen: same lane and speed
+            cts = pre + [t_ for t_ in ts if t_ >= 0.0] + post
+            css = [s0 + v_first * t_ for t_ in pre] + [s_ for t_, s_ in zip(ts, ss) if t_ >= 0.0] + \
+                [ss[-1] + v_last * (t_ - ts[-1]) for t_ in post]
+            cds = [d0] * len(pre) + [d_ for t_, d_ in zip(ts, ds) if t_ >= 0.0] + [ds[-1]] * len(post)
+            if r["kind"] == "parked":
+                cts, css, cds = [k * 0.5 for k in range(40)], [s0] * 40, [d0] * 40
+            if _in_corridor(cts, css, cds, corridors):
+                notes.append("%s: in the way of a crash vehicle before the crash, not replayed" % r["id"])
+                continue
+        s_road = s_ego0 + s0
+        if not 3.0 <= s_road <= road.length - 5.0:
+            notes.append("%s: measured start outside the road, not replayed" % r["id"])
+            continue
+        lat = d_ego + d0
+        if not _on_carriageway(road, s_road, lat, r["kind"]):
+            notes.append("%s: off the roads of the scene (%.1f m across), not replayed" % (r["id"], lat))
+            continue
+        lat0 = d_ego + d0 if r["kind"] == "parked" else snap_lane(road, s_road, d_ego + d0, back)
+        x0, y0 = road.frame.to_xy(s_road, lat0)
+        if any(math.hypot(x0 - px, y0 - py) < REPLAY_GAP_M for px, py in placed):
+            notes.append("%s: too close to a vehicle already placed, not replayed" % r["id"])
+            continue
+        heading = road.lane_heading(s_road) + (180.0 if back else 0.0)
+        vid = "v%d" % n
+        n += 1
+        agents[vid] = {"type": r["type"] if r["type"] in VEHICLE_TYPES else "car", "x": x0, "y": y0, "heading": heading}
+        placed.append((x0, y0))
+        idmap[r["id"]] = vid
+        if r["kind"] == "parked":
+            plan = {"mode": "static"}
+        else:
+            pts = [(s0, d0)] + [(s_, d_) for t_, s_, d_ in zip(ts, ss, ds) if t_ > 0.0]
+            s_end, d_end = pts[-1]
+            step = -4.0 if back else 4.0
+            s_c = s_end
+            while (s_c + step >= 3.0 - s_ego0) if back else (s_c + step <= road.end_s - s_ego0):
+                s_c += step
+                pts.append((s_c, d_end))
+            dense = [pts[0]]                       # a point every 4 m along the road: a long chord would cut a bend
+            for (sa, da), (sb, db) in zip(pts, pts[1:]):
+                n_in = max(int(math.ceil(abs(sb - sa) / 4.0)), 1)
+                dense += [(sa + (sb - sa) * i / n_in, da + (db - da) * i / n_in) for i in range(1, n_in + 1)]
+            poly = [list(road.frame.to_xy(s_ego0 + s_, snap_lane(road, s_ego0 + s_, d_ego + d_, back))) for s_, d_ in dense]
+            sp = [p for p in r.get("speed") or [] if p[0] >= 0.0]
+            v0 = abs(v_first) * 3.6 if ts[0] > 0.0 or not sp else sp[0][1]
+            prof = [[0.0, round(v0, 1)]] + [p for p in sp if p[0] > 0.0]
+            v0 = float(v0)
+            plan = {"mode": "drive", "speed_kmh": round(v0, 1), "already_moving": bool(v0 > 3.0), "avoid": True,
+                    "polyline": [[round(x, 2), round(y, 2)] for x, y in poly], "speed_profile": prof}
+        if r.get("color"):
+            plan["color"] = color_rgb(r["color"])
+        plan["replay"] = r["id"]
+        plan_agents[vid] = plan
+    return notes
+
+
 # ----------------------------------------------------------------------------------------- the builder
 def _road_with_profile(spec, road, s_ego0, d_event, ev_actor):
     """Straight road whose lane count follows spec.road.lane_profile (distances from the ego start, agents/lane_profile.py).
@@ -573,6 +732,8 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
             plan_ego["avoid"] = False
     if ego.get("color"):
         plan_ego["color"] = ego["color"]
+    if ego.get("speed_profile") and plan_ego.get("mode") == "drive":
+        plan_ego["speed_profile"] = ego["speed_profile"]          # the ego speed the video overlay printed, in sim time
     plan_agents["v1"] = plan_ego
     ego_start = (agents["v1"]["x"], agents["v1"]["y"])
     if any(tr.get(k, 0) for k in TRAFFIC_LANES):
@@ -892,6 +1053,18 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
     if expect is None:
         expect = {"type": "none", "actors": ["v1"], "time_s": round(T, 2)}
 
+    if road.kind == "straight" and spec.get("replay"):
+        s_ego_t = _ego_travel(plan_agents["v1"], v_e)
+        corridors = []                       # (d left of the ego lane centre, s(t) from the ego start, until when)
+        if plan_agents["v1"].get("mode") == "drive":
+            corridors.append((0.0, s_ego_t, T + 1.5))
+        for p in plan_agents.values():
+            ic = (p or {}).get("intercept")
+            if ic:                           # the cut-in car drives beside the ego car in its source lane until the event
+                corridors.append((ic["lane_src_d"] - lane_offset(road.L, lane_idx), lambda t: s_ego_t(t) + 1.0, T + 1.5))
+        notes += _replay_agents(spec["replay"], road, lane_idx, 65.0 if straight_tp_cross else S_START, agents, plan_agents, idmap,
+                                corridors)
+
     # ---- write files ----------------------------------------------------------------------------------
     ag_dict = {}
     for vid, a in agents.items():
@@ -907,6 +1080,10 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
         road_plan["sections"] = [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in sc.items()} for sc in road.sections]
         road_plan["lanes_opposite"] = road.Lw
         road_plan["xodr_pieces"] = xodr_pieces(road)
+        b_i = split_index(road)
+        if b_i is not None:
+            # the roads on the inner side of a fork face each other: no shoulder there, it would lie on the other road
+            road_plan["no_shoulder"] = ["branch"] if road.sections[b_i]["branch"]["side"] == "left" else ["eastbound_after"]
     plan = {"ego": "v1", "duration_s": round(T + 5.0, 1), "expect": expect, "agents": plan_agents, "idmap": idmap,
             "notes": notes, "source": "scene_builder", "road": road_plan}
     _write_json(os.path.join(out_dir, scene_id + "_motion.json"), plan)
