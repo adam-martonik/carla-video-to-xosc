@@ -504,3 +504,50 @@ class TestSceneFixes(unittest.TestCase):
         x1 = agents[plan["idmap"]["rq1"]]["location"][0]
         x2 = agents[plan["idmap"]["rq2"]]["location"][0]
         self.assertGreaterEqual(abs(x2 - x1), 7.0)
+
+    def test_enforce_replay_headway_prevents_truck_car_and_parked_overlaps(self):
+        ts = [0.0, 0.5, 1.0, 1.5, 2.0]
+        tracks = [
+            {"id": "lead_car", "type": "car", "back": False, "ts": ts,
+             "ss": [50.0, 52.0, 54.0, 56.0, 58.0], "ds": [-3.5] * 5},
+            {"id": "fast_truck", "type": "truck", "back": False, "ts": ts,
+             "ss": [42.0, 48.0, 54.0, 60.0, 66.0], "ds": [-3.5] * 5},
+            {"id": "car_vs_parked", "type": "car", "back": False, "ts": ts,
+             "ss": [20.0, 26.0, 32.0, 38.0, 44.0], "ds": [-7.0] * 5},
+        ]
+        static_obs = [(35.0, -7.0, "car")]
+        scene_builder.enforce_replay_headway(tracks, static_obstacles=static_obs, gap_margin=3.5)
+        truck_need = scene_builder.VEHICLE_HALF_LEN["truck"] + scene_builder.VEHICLE_HALF_LEN["car"] + 3.5
+        for ls, ts_ in zip(tracks[0]["ss"], tracks[1]["ss"]):
+            self.assertGreaterEqual(ls - ts_, truck_need - 1e-6)
+        parked_need = scene_builder.VEHICLE_HALF_LEN["car"] * 2 + 3.5
+        for cs in tracks[2]["ss"]:
+            self.assertLessEqual(cs, 35.0 - parked_need + 1e-6)
+
+    def test_kinematic_track_emitted_and_corridors_protect_third_party(self):
+        spec = {
+            "road": {"type": "straight", "lanes_per_direction": 2, "traffic_signals": False, "one_way": False,
+                     "centerline": [[0.0, 0.0], [500.0, 0.0]]},
+            "ego": {"type": "car", "lane": "left", "speed_kmh": 0.0, "behavior": "stopped"},
+            "actors": [
+                {"id": "c1", "type": "car", "relation": "cross_left", "lane": "same", "distance_m": 7.0,
+                 "speed_kmh": 20.0, "behavior": "crossing", "color": "black"},
+                {"id": "c2", "type": "van", "relation": "behind", "lane": "right", "distance_m": 9.0,
+                 "speed_kmh": 50.0, "behavior": "driving", "color": "brown"},
+            ],
+            "event": {"type": "collision", "actor_id": "c1", "actor2_id": "c2", "time_s": 14.2, "description": "tp"},
+            "replay": [
+                {"id": "blocker", "type": "car", "color": "white", "kind": "parked",
+                 "path": [[0.0, 7.0, 0.0], [1.0, 7.0, 0.0]], "speed": []},
+                {"id": "free_onc", "type": "car", "color": "gray", "kind": "oncoming",
+                 "path": [[0.0, 90.0, 5.25], [2.0, 70.0, 5.25]], "speed": [[0.0, 36.0], [2.0, 36.0]]},
+            ],
+        }
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        plan = scene_builder.build(spec, tmp.name, "tpk")
+        self.assertNotIn("blocker", plan["idmap"])
+        self.assertIn("free_onc", plan["idmap"])
+        kt = plan["agents"][plan["idmap"]["free_onc"]].get("kinematic_track")
+        self.assertIsNotNone(kt)
+        self.assertEqual(len(kt[0]), 5)

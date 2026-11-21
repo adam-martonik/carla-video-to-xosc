@@ -45,12 +45,14 @@ class CutInController:
             return self._frozen, 0.0
         if cfg.cruise_speed_ms is not None:
             rem = cfg.t_event_s - t
+            cutting = t >= cfg.t_event_s - cfg.lead_s
             if rem > 0.3:
                 target_s_ev = ego_s + ego_v * rem + 1.0
                 v_req = (target_s_ev - me_s) / rem
-                v_target = max(max(1.5, 0.5 * cfg.cruise_speed_ms), min(max(ego_v, 2.0 * cfg.cruise_speed_ms), v_req))
+                v_lo = max(cfg.cruise_speed_ms, 5.5) if cutting else max(3.0, 0.65 * cfg.cruise_speed_ms)
+                v_target = max(v_lo, min(max(ego_v, 2.0 * cfg.cruise_speed_ms), v_req))
             else:
-                v_target = max(cfg.cruise_speed_ms, min(ego_v, me_v))
+                v_target = max(cfg.cruise_speed_ms, 5.5 if cutting else min(ego_v, me_v))
         else:
             if self._gap0 is None:
                 self._gap0 = me_s - ego_s
@@ -58,6 +60,7 @@ class CutInController:
         if t >= cfg.t_event_s - cfg.lead_s:
             lo, hi = sorted((cfg.lane_src_d, cfg.lane_dst_d))
             goal = max(lo, min(hi, ego_d + cfg.aim_offset_m))
-            step = cfg.max_lateral_speed_ms * dt
+            lat_spd = max(cfg.max_lateral_speed_ms, 2.2) if cfg.cruise_speed_ms is not None else cfg.max_lateral_speed_ms
+            step = lat_spd * dt
             self._d += max(-step, min(step, goal - self._d))
         return self._d, v_target

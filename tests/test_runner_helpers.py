@@ -157,5 +157,46 @@ class TestRouteFollowerGeometryAndAvoidance(unittest.TestCase):
                 sys.modules["carla"] = saved
 
 
+class TestKinematicAndCleanup(unittest.TestCase):
+    def test_sample_kinematic_track_interpolates_pose_and_wraps_heading(self):
+        track = [[0.0, 10.0, 0.0, 175.0, 10.0], [2.0, 30.0, 4.0, -175.0, 14.0]]
+        self.assertIsNone(motion_runner.sample_kinematic_track(track, -0.1))
+        self.assertIsNone(motion_runner.sample_kinematic_track(track, 2.1))
+        x, y, h, s = motion_runner.sample_kinematic_track(track, 1.0)
+        self.assertAlmostEqual(x, 20.0)
+        self.assertAlmostEqual(y, 2.0)
+        self.assertAlmostEqual(h, 180.0)
+        self.assertAlmostEqual(s, 12.0)
+
+    def test_cleanup_destroys_orphaned_world_actors(self):
+        import json, tempfile, os, types
+        destroyed = []
+        class _Destroy:
+            def __init__(self, aid): self.aid = aid
+        class _Client:
+            def apply_batch(self, cmds): destroyed.extend(c.aid for c in cmds)
+        class _Actor:
+            def __init__(self, aid, tid): self.id, self.type_id = aid, tid
+        class _World:
+            def get_actors(self):
+                return [_Actor(10, "vehicle.dodge.charger"), _Actor(11, "vehicle.nissan.patrol"),
+                        _Actor(12, "sensor.other.collision"), _Actor(13, "static.prop.streetbarrier"),
+                        _Actor(99, "traffic.traffic_light")]
+        saved = sys.modules.get("carla")
+        sys.modules["carla"] = types.SimpleNamespace(command=types.SimpleNamespace(DestroyActor=_Destroy))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ids_fn = os.path.join(tmp, "ids.json")
+                with open(ids_fn, "w") as f:
+                    json.dump([10], f)
+                motion_runner._cleanup(_Client(), ids_fn, _World())
+            self.assertEqual(destroyed, [10, 11, 12, 13])
+        finally:
+            if saved is None:
+                sys.modules.pop("carla", None)
+            else:
+                sys.modules["carla"] = saved
+
+
 if __name__ == "__main__":
     unittest.main()

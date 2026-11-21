@@ -196,13 +196,49 @@ def _to_carla(p):
     return (float(p[0]), -float(p[1]))
 
 
-def _cleanup(client, ids_fn):
+def _cleanup(client, ids_fn, world=None):
+    import carla
+    ids = []
     if os.path.exists(ids_fn):
-        old = json.load(open(ids_fn))
-        import carla
-        client.apply_batch([carla.command.DestroyActor(i) for i in old])
-        print(f"[motion] removed {len(old)} actors of the previous run")
+        ids.extend(json.load(open(ids_fn)))
+    seen = set(ids)
+    if world is not None:
+        try:
+            for a in world.get_actors():
+                tid = getattr(a, "type_id", "")
+                if tid.startswith(("vehicle.", "walker.", "sensor.", "static.prop.streetbarrier")) and a.id not in seen:
+                    ids.append(a.id)
+                    seen.add(a.id)
+        except Exception:
+            pass
+    if ids:
+        client.apply_batch([carla.command.DestroyActor(i) for i in ids])
+        print(f"[motion] removed {len(ids)} actors of the previous run")
         time.sleep(1)
+
+
+def sample_kinematic_track(track, t):
+    """Interpolate (x, y, heading_deg, speed_ms) along [[t, x, y, heading_deg, speed_ms], ...] at time t, or None outside."""
+    if not track or t < track[0][0] - 1e-6 or t > track[-1][0] + 1e-6:
+        return None
+    if t <= track[0][0]:
+        _, x, y, h, s = track[0]
+        return float(x), float(y), float(h), float(s)
+    if t >= track[-1][0]:
+        _, x, y, h, s = track[-1]
+        return float(x), float(y), float(h), float(s)
+    lo, hi = 0, len(track) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if track[mid][0] <= t:
+            lo = mid
+        else:
+            hi = mid
+    t0, x0, y0, h0, s0 = track[lo]
+    t1, x1, y1, h1, s1 = track[hi]
+    f = (t - t0) / max(t1 - t0, 1e-6)
+    dh = ((h1 - h0 + 180.0) % 360.0) - 180.0
+    return (x0 + f * (x1 - x0), y0 + f * (y1 - y0), h0 + f * dh, s0 + f * (s1 - s0))
 
 
 def _dist2d(a, b):
@@ -415,7 +451,8 @@ class InterceptFollower(RouteFollower):
         s_m, d_m = self.frame.to_sd(loc.x, -loc.y)
         d_t, v_t = self.ctl.update(t_sim, (s_e, d_e, self.ego.get_velocity().length()), (s_m, d_m, spd), self.crash_time is not None)
         self.speed = v_t
-        x, y = self.frame.to_xy(s_m + look, d_t)
+        look_eff = max(3.5, 0.55 * spd) if (abs(d_t - d_m) > 0.25 and spd < 10.0) else look
+        x, y = self.frame.to_xy(s_m + look_eff, d_t)
         return carla.Location(x, -y, 0.0)
 
 
@@ -466,7 +503,7 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
     if load_map:
         world = build_and_load_map(client, net_fn, out_dir, plan.get("road"))
     else:
-        _cleanup(client, ids_fn)
+        _cleanup(client, ids_fn, world)
     bp_lib = world.get_blueprint_library()
     tm = client.get_trafficmanager()
 
@@ -555,6 +592,8 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             return None
 
         pending_spawns = {}
+        kin_z, kin_spd = {}, {}
+        is_kinematic = lambda aid_: bool((plan["agents"].get(aid_) or {}).get("kinematic_track"))
         # ---- spawn
         for aid, a in agents.items():
             pspec = plan["agents"].get(aid, {})
@@ -568,6 +607,13 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             if actor is None:
                 print(f"[motion] spawn failed for {aid}")
                 continue
+            if is_kinematic(aid):
+                try:
+                    actor.set_simulate_physics(False)
+                except Exception:
+                    pass
+                kin_z[aid] = actor.get_location().z
+                kin_spd[aid] = float(pspec["kinematic_track"][0][4])
             actors[aid] = actor
             spawned_ids.append(actor.id)
         for oid, o in statics.items():
@@ -581,7 +627,7 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
         if n_bar or n_bar_failed:
             print(f"[motion] barrier props: {n_bar} placed, {n_bar_failed} could not be spawned")
         for aid, actor in actors.items():
-            if actor.type_id.startswith("vehicle"):
+            if actor.type_id.startswith("vehicle") and not is_kinematic(aid):
                 actor.apply_control(carla.VehicleControl(brake=1.0, hand_brake=True))
                 s = world.spawn_actor(bp_lib.find("sensor.other.collision"), carla.Transform(), attach_to=actor)
                 s.listen(lambda ev, aid=aid: record_contact(ev, aid))
@@ -628,7 +674,7 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                                  road_frame=(road_frame if road_pl.get("centerline") else None))
 
         for aid, spec in pa.items():
-            if aid in actors and spec["mode"] == "drive":
+            if aid in actors and spec["mode"] == "drive" and not is_kinematic(aid):
                 followers[aid] = make_follower(aid, actors[aid], spec)
                 followers[aid].stop_at = spec.get("stop_at_s")
                 if spec.get("speed_profile") and not spec.get("intercept"):
@@ -744,28 +790,63 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 actors[aid] = actor
                 spawned_ids.append(actor.id)
                 id_of[actor.id] = aid
-                if actor.type_id.startswith("vehicle"):
-                    s = world.spawn_actor(bp_lib.find("sensor.other.collision"), carla.Transform(), attach_to=actor)
-                    s.listen(lambda ev, aid=aid: record_contact(ev, aid))
-                    sensors.append(s)
-                    spawned_ids.append(s.id)
-                    actor.apply_control(carla.VehicleControl(brake=0.0, hand_brake=False))
                 spec_d = pa[aid]
-                if spec_d["mode"] == "drive":
-                    fol = make_follower(aid, actor, spec_d)
-                    fol.stop_at = spec_d.get("stop_at_s")
-                    if spec_d.get("speed_profile") and not spec_d.get("intercept"):
-                        fol.profile = spec_d["speed_profile"]
-                    followers[aid] = fol
-                    peak[aid] = {"long": 0.0, "lat": 0.0}
-                    if spec_d.get("already_moving", False):
-                        tl = fol.route[min(fol.i + 3, len(fol.route) - 1)].transform.location
-                        vl = actor.get_location()
-                        dd = max(math.hypot(tl.x - vl.x, tl.y - vl.y), 1e-3)
-                        prof = spec_d.get("speed_profile")
-                        sp = (profile_speed(prof, now) if prof and not spec_d.get("intercept") else float(spec_d.get("speed_kmh", 40))) / 3.6
-                        actor.set_target_velocity(carla.Vector3D((tl.x - vl.x) / dd * sp, (tl.y - vl.y) / dd * sp, 0.0))
+                if is_kinematic(aid):
+                    try:
+                        actor.set_simulate_physics(False)
+                    except Exception:
+                        pass
+                    kin_z[aid] = actor.get_location().z
+                    kin_spd[aid] = float(spec_d["kinematic_track"][0][4])
+                    json.dump(spawned_ids, open(ids_fn, "w"))
+                else:
+                    if actor.type_id.startswith("vehicle"):
+                        s = world.spawn_actor(bp_lib.find("sensor.other.collision"), carla.Transform(), attach_to=actor)
+                        s.listen(lambda ev, aid=aid: record_contact(ev, aid))
+                        sensors.append(s)
+                        spawned_ids.append(s.id)
+                        actor.apply_control(carla.VehicleControl(brake=0.0, hand_brake=False))
+                    json.dump(spawned_ids, open(ids_fn, "w"))
+                    if spec_d["mode"] == "drive":
+                        fol = make_follower(aid, actor, spec_d)
+                        fol.stop_at = spec_d.get("stop_at_s")
+                        if spec_d.get("speed_profile") and not spec_d.get("intercept"):
+                            fol.profile = spec_d["speed_profile"]
+                        followers[aid] = fol
+                        peak[aid] = {"long": 0.0, "lat": 0.0}
+                        if spec_d.get("already_moving", False):
+                            tl = fol.route[min(fol.i + 3, len(fol.route) - 1)].transform.location
+                            vl_x, vl_y = agents[aid]["location"][0], agents[aid]["location"][1]
+                            dd = max(math.hypot(tl.x - vl_x, tl.y - vl_y), 1e-3)
+                            prof = spec_d.get("speed_profile")
+                            sp = (profile_speed(prof, now) if prof and not spec_d.get("intercept") else float(spec_d.get("speed_kmh", 40))) / 3.6
+                            actor.set_target_velocity(carla.Vector3D((tl.x - vl_x) / dd * sp, (tl.y - vl_y) / dd * sp, 0.0))
                 started[aid], start_time[aid] = True, round(now, 2)
+            for aid in [k for k in list(actors) if is_kinematic(k)]:
+                actor = actors[aid]
+                if not actor.is_alive:
+                    continue
+                kt = pa[aid]["kinematic_track"]
+                pose = sample_kinematic_track(kt, now)
+                if pose is None:
+                    if now > kt[-1][0] + 0.05:
+                        try:
+                            actor.destroy()
+                        except Exception:
+                            pass
+                        actors.pop(aid, None)
+                    continue
+                kx, ky, kh_deg, kspd = pose
+                wp = world.get_map().get_waypoint(carla.Location(kx, -ky, kin_z.get(aid, 0.0)), project_to_road=True)
+                z_road = (wp.transform.location.z + 0.05) if wp is not None else kin_z.get(aid, 0.2)
+                pitch = wp.transform.rotation.pitch if wp is not None else 0.0
+                if wp is not None:
+                    w_rad = math.radians(wp.transform.rotation.yaw)
+                    c_rad = math.radians(-kh_deg)
+                    if math.cos(w_rad) * math.cos(c_rad) + math.sin(w_rad) * math.sin(c_rad) < 0.0:
+                        pitch = -pitch
+                kin_z[aid], kin_spd[aid] = z_road, kspd
+                actor.set_transform(carla.Transform(carla.Location(kx, -ky, z_road), carla.Rotation(pitch=pitch, yaw=-kh_deg, roll=0.0)))
             for aid, spec in pa.items():
                 if aid not in actors or spec["mode"] == "static" or aid in started:
                     continue
@@ -831,7 +912,8 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                         min_pair[key] = d_
             if tick % 10 == 0:                              # trace every 0.5 s: position and speed, None once destroyed
                 trace.append({"t": round(tick * DT, 2), **{k: ([round(a.get_location().x, 1), round(a.get_location().y, 1),
-                              round(a.get_velocity().length(), 1)] if a.is_alive else None) for k, a in actors.items()}})
+                              round(kin_spd[k] if is_kinematic(k) else a.get_velocity().length(), 1)] if a.is_alive else None)
+                              for k, a in actors.items()}})
             hits = [c for c in collisions if not c["other"].startswith("static")
                     or c["other"].startswith("static.prop")]
             exp = plan.get("expect") or {}
@@ -898,6 +980,11 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 except RuntimeError:
                     pass
     finally:
+        try:
+            if spawned_ids:
+                json.dump(spawned_ids, open(ids_fn, "w"))
+        except Exception:
+            pass
         if cam_writer is not None:
             try:
                 cam_writer.release()
