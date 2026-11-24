@@ -344,6 +344,15 @@ class TestForkFromTraffic(unittest.TestCase):
         self.assertAlmostEqual(fork["s_split"], 105.0)
         self.assertEqual(sorted(fork["ids"]), [1, 2])
         self.assertIsNone(local_pipeline.fork_from_tracks(tracks[:1] + tracks[2:], 3.5))   # one car is not a fork
+        # Interior lane change (d=4.2..7.5) is NOT a fork; highway cruiser diverging in its tail (d=10..16) IS
+        lane_chg = drift_track(5, 4.2, 0.17, s0=100.0, n=20)
+        s_long = [20.0 + 3.0 * k for k in range(30)]
+        d_long = [10.2 if x < 70.0 else 10.2 + 0.18 * (x - 70.0) for x in s_long]
+        tail_div = {"id": 6, "kind": "same", "type": "car", "s": s_long, "d": d_long, "elev_ratio": 1.35, "t": [0.1 * k for k in range(30)]}
+        fork2 = local_pipeline.fork_from_tracks([lane_chg, tail_div, tracks[1]], 3.5)
+        self.assertIsNotNone(fork2)
+        self.assertEqual(sorted(fork2["ids"]), [2, 6])
+        self.assertNotIn(5, fork2["ids"])
 
     def test_branch_climbs_when_its_cars_read_higher_than_the_ego_road(self):
         base = [drift_track(10 + k, 3.5, 0.0, ratio=1.0) for k in range(4)]
@@ -606,10 +615,159 @@ class TestMultiLaneCutInAndParts(unittest.TestCase):
         self.assertAlmostEqual(ic["lane_dst_d"], lane_offset(3, 0))
         self.assertEqual(ic["max_lateral_speed_ms"], 3.2)
         self.assertGreaterEqual(ic["lead_s"], 2.4)
-        self.assertEqual(plan["expect"]["contact_parts"], {"v1": "front_left", "v2": "right_side"})
+        self.assertTrue(ic.get("side_strike"))
+        self.assertLess(ic.get("long_offset_m", 1.0), 0.0)
+        self.assertEqual(plan["expect"]["contact_parts"], {"v1": "left_side", "v2": "front_right"})
         self.assertNotIn("mid_blk", plan["idmap"])
         self.assertIn("mid_early", plan["idmap"])
         self.assertIn("r76", plan["idmap"])
+
+    def test_converging_cutin_crossing_in_front_keeps_front_left_vs_right_side(self):
+        # A lane-changer whose last visible position reaches d=0.6 m (well in front of ego's hood) is NOT a side-strike
+        t_cut = [7.5 + 0.1 * i for i in range(10)]
+        cutter = {"id": 44, "type": "car", "color": "white", "kind": "same", "t": t_cut,
+                  "s": [110 + 11.0 * 0.1 * i for i in range(10)], "z": [14.0 - 0.8 * i for i in range(10)],
+                  "d": [3.5, 3.2, 2.8, 2.4, 2.0, 1.6, 1.3, 1.0, 0.8, 0.6],
+                  "v": [11.0] * 10, "first_t": 7.5, "last_t": 8.4}
+        res = vehicle_tracks.converging_cutin_track([cutter], 8.5, side="left", color="white")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["side_strike"])
+        spec = spec_with([{"id": "c1", "relation": "beside", "lane": "left", "behavior": "cutting_in", "color": "white"}],
+                         {"type": "collision", "actor_id": "c1", "time_s": 8.5,
+                          "contact_parts": {"ego": "front_left", "c1": "right_side"}})
+        scene = {"tracks": [cutter], "speeds": [[0.0, 15.0], [15.0, 15.0]],
+                 "speed_source": "overlay", "t_v0": 0.5, "t_hi": 13.5, "lane_samples": []}
+        local_pipeline.apply_replay(spec, scene, 8.5)
+        self.assertFalse((spec["actors"][0].get("measured") or {}).get("side_strike", False))
+        self.assertEqual(spec["event"]["contact_parts"], {"ego": "front_left", "c1": "right_side"})
+
+    def test_bev_blocked_side_unpainted_barrier_and_offroad_gore_filtering(self):
+        # Right concrete barrier painted as a false TwinLiteNet line at d=-5.25 with 0 raw paint + blocked_sides=('right',)
+        g = synthetic_grid(2, 0, s_max=80.0)
+        d = np.array([g.d_of(j) for j in range(g.nd)])
+        g.seen_p[:] = 10.0
+        g.paint[:] = g.line.copy()
+        barrier_mask = np.abs(d - (-5.25)) < 0.25
+        g.line[:, barrier_mask] = 10.0                                     # false TwinLiteNet barrier peak (no paint!)
+        g.road[:, (d < -1.75) & (d >= -5.5)] = 10.0                        # false barrier drivable smear
+        nl, nr, _ = bev_lanes.count_slice(g, 40.0, 3.5, blocked_sides=("right",))
+        self.assertEqual((nl, nr), (2, 0))
+        # A genuine vehicle on the right still overrides blocked_sides
+        _, nr_v, _ = bev_lanes.count_slice(g, 40.0, 3.5, vehicles_d=[-3.5], blocked_sides=("right",))
+        self.assertEqual(nr_v, 1)
+        # Vehicle separated from ego by a seen off-road gore strip at d=9..12 m is rejected by seen_off_road_between
+        self.assertTrue(bev_lanes.seen_off_road_between(g, 40.0, 14.0))
+        self.assertFalse(bev_lanes.seen_off_road_between(g, 40.0, 7.0))
+        br_tr = {"id": 9, "kind": "same", "t": [2.0, 3.0, 4.0], "s": [20.0, 40.0, 60.0],
+                 "d": [14.0, 15.0, 16.0], "z": [20.0, 20.0, 20.0]}
+        rows = bev_lanes.lane_samples(g, 10.0, 60.0, [br_tr], blocked_sides=("right",), exclude_after=([9], 35.0))
+        for r in rows:
+            if r.get("probs") is not None:
+                self.assertEqual(r["lanes_right"], 0.0)
+                self.assertLessEqual(r["lanes_left"], 2.0)
+
+    def test_seen_off_road_ignores_overpass_shadow_when_ego_lane_lost(self):
+        # Inside a dark overpass shadow (s=40..50), TwinLiteNet outputs road=0 even under ego's own wheels (d=0):
+        # adjacent lanes and vehicles must NOT be declared off-road during that blind stretch.
+        g = synthetic_grid(2, 0, s_max=90.0)
+        a, b = int((35.0 - g.s0) / bev_lanes.S_RES), int((55.0 - g.s0) / bev_lanes.S_RES)
+        g.road[a:b, :] = 0.0
+        self.assertFalse(bev_lanes.seen_off_road(g, 45.0, 3.5))
+        self.assertFalse(bev_lanes.seen_off_road(g, 45.0, 7.0))
+        self.assertFalse(bev_lanes.seen_off_road_between(g, 45.0, 7.0))
+        # Outside the shadow (s=20), ego lane is seen as road so real off-road beyond the edge still returns True
+        self.assertTrue(bev_lanes.seen_off_road(g, 20.0, 14.0))
+
+    def test_lane_profile_anchors_ego_to_right_edge_and_collapses_prefork_staircase(self):
+        from agents import lane_lines
+        samples = []
+        for s in range(0, 200, 2):
+            nl = 3.0 if s < 20 else (4.0 if s < 70 else (3.0 if s < 95 else 2.0))
+            samples.append({"t": float(s), "lanes_left": nl, "lanes_right": 0.0, "road_lanes": 1 + nl,
+                            "probs": lane_lines.count_probs(1 + nl)})
+        div_tr = [
+            {"id": 1, "kind": "same", "s": [95.0 + 5.0 * i for i in range(8)], "d": [11.0 + 1.0 * i for i in range(8)], "elev_ratio": 1.35},
+            {"id": 2, "kind": "same", "s": [96.0 + 5.0 * i for i in range(8)], "d": [14.5 + 1.0 * i for i in range(8)], "elev_ratio": 1.30},
+        ]
+        scene = {"tracks": div_tr, "speeds": [[0.0, 15.0], [20.0, 15.0]], "speed_source": "overlay",
+                 "t_v0": 1.0, "t_hi": 14.0, "lane_samples": samples}
+        spec = spec_with()
+        spec["road"]["edge_right"] = "barrier"
+        spec["ego"]["lane"] = "right"
+        self.assertTrue(local_pipeline.lane_profile_from_map(spec, scene, "v.mp4", 20.0, log_fn=lambda m: None))
+        prof = spec["road"]["lane_profile"]
+        self.assertEqual([(p["n"], p["m"]) for p in prof], [(5, 0), (3, 2)])
+        self.assertEqual(prof[1]["branch"], {"side": "left", "rise_m": 6.0})
+        self.assertEqual(spec["ego"]["lane_index"], 4)                     # rightmost of 5 (no phantom right lane)
+
+        # Brief 15 m occlusion dip (3 -> 2 -> 3) after the split must not break the continuing 3-lane section
+        samples_dip = []
+        for s in range(0, 200, 2):
+            nl = 3.0 if s < 60 else (1.0 if 126 <= s < 142 else 2.0)
+            samples_dip.append({"t": float(s), "lanes_left": nl, "lanes_right": 0.0, "road_lanes": 1 + nl,
+                                "probs": lane_lines.count_probs(1 + nl)})
+        scene_dip = dict(scene, lane_samples=samples_dip)
+        spec_dip = spec_with([{"id": "c1", "relation": "beside", "lane": "left", "behavior": "cutting_in"}],
+                             {"type": "collision", "actor_id": "c1", "time_s": 9.0})
+        spec_dip["road"]["edge_right"] = "barrier"
+        spec_dip["ego"]["lane"] = "right"
+        self.assertTrue(local_pipeline.lane_profile_from_map(spec_dip, scene_dip, "v.mp4", 20.0, log_fn=lambda m: None))
+        self.assertEqual([(p["n"], p["m"]) for p in spec_dip["road"]["lane_profile"]], [(4, 0), (3, 1)])
+        self.assertEqual(spec_dip["road"]["lanes_per_direction"], 3)
+
+    def test_apply_replay_preserves_stopped_lead_car_for_stopped_ego(self):
+        actors = [
+            {"id": "c1", "relation": "cross_left", "lane": "same", "distance_m": 7.0, "behavior": "crossing"},
+            {"id": "c2", "relation": "behind", "lane": "right", "distance_m": 9.0, "behavior": "driving"},
+            {"id": "b1", "relation": "ahead", "lane": "same", "distance_m": 12.2, "speed_kmh": 0.0, "behavior": "stopped"},
+        ]
+        spec = spec_with(actors, {"type": "collision", "actor_id": "c1", "actor2_id": "c2", "time_s": 14.2},
+                         behavior="stopped", speed=0.0)
+        ts = [round(10.0 + 0.1 * k, 2) for k in range(20)]
+        near_dup = {"id": 2, "type": "car", "color": "white", "kind": "parked", "t": ts,
+                    "s": [7.5] * 20, "z": [7.5] * 20, "d": [0.1] * 20, "v": [0.0] * 20, "first_t": 10.0, "last_t": 11.9}
+        corridor_span = {"id": 28, "type": "car", "color": "gray", "kind": "parked", "t": ts,
+                         "s": [5.7 + 2.0 * i for i in range(20)], "z": [20.0] * 20, "d": [0.2] * 20, "v": [0.0] * 20,
+                         "first_t": 10.0, "last_t": 11.9}
+        scene = {"tracks": [near_dup, corridor_span], "speeds": [[0.0, 0.0], [20.0, 0.0]], "speed_source": "scene",
+                 "t_v0": 6.2, "t_hi": 19.2, "lane_samples": []}
+        local_pipeline.apply_replay(spec, scene, 14.2)
+        self.assertIn("b1", [a["id"] for a in spec["actors"]])
+
+    def test_model_masks_does_not_return_stale_cache_on_reused_array_id(self):
+        from unittest import mock
+        import torch
+        from agents import lane_lines
+        calls = [0]
+
+        def fake_net(x):
+            calls[0] += 1
+            val = calls[0]
+            out = torch.zeros((1, 2, 360, 640), dtype=torch.float32)
+            out[0, val % 2] = 1.0
+            return out, out
+
+        saved = dict(lane_lines._MODEL)
+        try:
+            lane_lines._MODEL.clear()
+            lane_lines._MODEL["net"] = fake_net
+            a = np.zeros((120, 160, 3), dtype=np.uint8)
+            m1 = lane_lines.model_masks(a)
+            m1_again = lane_lines.model_masks(a)
+            self.assertEqual(calls[0], 1)
+            self.assertIs(m1[0], m1_again[0])
+            # Mutate buffer in place (same id) and also allocate fresh sequential frames -> must re-infer!
+            a[:] = 255
+            m2 = lane_lines.model_masks(a)
+            self.assertEqual(calls[0], 2)
+            self.assertNotEqual(int(m1[0].sum()), int(m2[0].sum()))
+            for k in range(3):
+                b = np.full((120, 160, 3), 20 * (k + 1), dtype=np.uint8)
+                lane_lines.model_masks(b)
+            self.assertEqual(calls[0], 5)
+        finally:
+            lane_lines._MODEL.clear()
+            lane_lines._MODEL.update(saved)
 
     def test_converging_cutin_syncs_vehicle_type_when_impact_time_shifts(self):
         # VLM picked an SUV at coarse t_crash=8.6s, but the converging cutter hits at 10.1s and is a white sedan ("car")

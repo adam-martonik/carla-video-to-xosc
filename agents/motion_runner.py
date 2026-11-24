@@ -603,7 +603,12 @@ class InterceptFollower(RouteFollower):
         s_m, d_m = self.frame.to_sd(loc.x, -loc.y)
         d_t, v_t = self.ctl.update(t_sim, (s_e, d_e, self.ego.get_velocity().length()), (s_m, d_m, spd), self.crash_time is not None)
         self.speed = v_t
-        look_eff = max(3.5, 0.55 * spd) if (abs(d_t - d_m) > 0.25 and spd < 10.0) else look
+        if getattr(self.ctl.cfg, "side_strike", False) and abs(d_t - d_m) > 0.25:
+            look_eff = max(4.5, 0.45 * spd)
+        elif abs(d_t - d_m) > 0.25 and spd < 10.0:
+            look_eff = max(3.5, 0.55 * spd)
+        else:
+            look_eff = look
         x, y = self.frame.to_xy(s_m + look_eff, d_t)
         return carla.Location(x, -y, 0.0)
 
@@ -842,7 +847,9 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 cfg = CutInConfig(lane_src_d=float(ic["lane_src_d"]), lane_dst_d=float(ic["lane_dst_d"]), t_event_s=float(ic["t_event_s"]),
                                   lead_s=float(ic.get("lead_s", 1.4)), aim_offset_m=float(ic.get("aim_offset_m", 0.0)),
                                   max_lateral_speed_ms=float(ic.get("max_lateral_speed_ms", 1.5)),
-                                  cruise_speed_ms=float(ic["cruise_speed_ms"]) if ic.get("cruise_speed_ms") is not None else None)
+                                  cruise_speed_ms=float(ic["cruise_speed_ms"]) if ic.get("cruise_speed_ms") is not None else None,
+                                  long_offset_m=float(ic.get("long_offset_m", 1.0)),
+                                  side_strike=bool(ic.get("side_strike", False)))
                 return InterceptFollower(v, route, speed, target, road_frame, CutInController(cfg))
             if spec.get("polyline"):
                 sx, sy = polyline_shift(spec)

@@ -168,6 +168,50 @@ class TestInterceptFollower(unittest.TestCase):
         self.assertIsNotNone(t_touch, "overtake cutter missed decelerating ego")
         self.assertTrue(6.5 <= t_touch <= 9.5, t_touch)
 
+    def test_side_strike_follower_strikes_ego_left_side_with_front_right(self):
+        from agents import contact_analysis, motion_runner
+        from agents.intercept import CutInConfig, CutInController
+        from agents.road_frame import RoadFrame, lane_offset
+
+        frame = RoadFrame.straight(500.0)
+        d_src, d_dst = lane_offset(5, 2), lane_offset(5, 0)
+        v_c = 6.5
+        t_ev = 9.5
+        s0_c = 15.0 + 161.0 - 1.2 - v_c * t_ev
+        ego = FakeCar(15.0, -d_dst, 0.0, 19.6)
+        cutter = FakeCar(s0_c, -d_src, 0.0, v_c)
+        route = [motion_runner._RoutePoint(Loc(x, -y))
+                 for s in range(int(s0_c), 490, 2)
+                 for x, y in [frame.to_xy(float(s), d_src)]]
+        cfg = CutInConfig(lane_src_d=d_src, lane_dst_d=d_dst, t_event_s=t_ev, lead_s=2.5,
+                          max_lateral_speed_ms=3.2, cruise_speed_ms=v_c, long_offset_m=-1.2, side_strike=True)
+        fol = motion_runner.InterceptFollower(cutter, route, v_c * 3.6, ego, frame, CutInController(cfg))
+        t, t_touch, snap = 0.0, None, None
+        while t < 13.0:
+            ego.v = max(14.3, 19.6 - 0.56 * t)
+            cutter.apply_control(fol.control([], DT, t, t))
+            ego.x += ego.v * DT
+            cutter.step()
+            t += DT
+            if t_touch is None and abs(cutter.y - ego.y) < 2.2 and abs(cutter.x - ego.x) < 4.5:
+                t_touch = t
+                fol.crash_time = t
+                snap = (cutter.x - ego.x, cutter.y - ego.y, cutter.yaw)
+        self.assertIsNotNone(t_touch, "side-strike cutter never contacted decelerating ego")
+        self.assertTrue(8.0 <= t_touch <= 11.0, t_touch)
+        dx, dy, cyaw = snap
+        # Cutter is beside/behind ego's center (not ahead of ego getting clipped in the rear) and angled right into ego
+        self.assertLessEqual(dx, 0.4, snap)
+        self.assertGreaterEqual(dx, -2.8, snap)
+        self.assertGreater(cyaw, 3.0, snap)
+        rel_v1 = motion_runner.rel_in_frame(dx, dy, 0.0)
+        rel_v2 = motion_runner.rel_in_frame(-dx, -dy, cyaw)
+        z_v1 = contact_analysis.contact_zone([0.0, 1000.0, 0.0], 0.0, rel_v1)
+        z_v2 = contact_analysis.contact_zone([0.0, -1000.0, 0.0], cyaw, rel_v2)
+        self.assertTrue(contact_analysis.zones_compatible(z_v1, "left_side"), (z_v1, snap))
+        self.assertTrue(contact_analysis.zones_compatible(z_v2, "front_right"), (z_v2, snap))
+        self.assertNotEqual(z_v2, "rear_right", (z_v2, snap))
+
 
 if __name__ == "__main__":
     unittest.main()

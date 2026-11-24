@@ -439,8 +439,9 @@ def crossroad_traffic_actors(traffic, ego_kmh, lane_idx, road, existing, ego_y0)
                     "relation": relation, "lane": lane, "distance_m": round(y - ego_y0, 2),
                     "speed_kmh": speed_kmh, "behavior": behavior, "color": None})
 
-    y_stop = road.C[1] - road.half_j - 5.0
+    y_stop = road.C[1] - road.half_j - 3.0
     y_far_base = road.C[1] + road.half_j + 20.0
+    queue_types = ("suv", "car", "van", "car", "suv", "car")
     for i in range(n["ego_lane_ahead"]):
         add_y("ahead", "same", y_far_base + 12.0 * i, max(ego_kmh, 40.0), "driving", road.C[1] + 90.0)
     for key, adj_lane, ok, edge_name in (
@@ -453,10 +454,10 @@ def crossroad_traffic_actors(traffic, ego_kmh, lane_idx, road, existing, ego_y0)
             notes.append("traffic: the ego car is in the %s lane, no %s lane for %d vehicle(s)" % (edge_name, adj_lane, n[key]))
             continue
         for i in range(n[key]):
-            y_slot = y_stop - 9.0 * i
-            if y_slot >= ego_y0 + 3.0 and not any(abs(y_slot - x) < 8.0 for x in taken.get(("ahead", adj_lane), [])):
+            y_slot = y_stop - 7.5 * i
+            if y_slot >= ego_y0 + 3.0 and not any(abs(y_slot - x) < 7.0 for x in taken.get(("ahead", adj_lane), [])):
                 taken.setdefault(("ahead", adj_lane), []).append(y_slot)
-                out.append({"id": "t%d" % (len(out) + 1), "type": TRAFFIC_TYPES[len(out) % len(TRAFFIC_TYPES)],
+                out.append({"id": "t%d" % (len(out) + 1), "type": queue_types[i % len(queue_types)],
                             "relation": "ahead", "lane": adj_lane, "distance_m": round(y_slot - ego_y0, 2),
                             "speed_kmh": 0.0, "behavior": "stopped", "color": None})
             else:
@@ -1323,6 +1324,9 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 if is_ev and road.kind == "straight":
                     # closed loop: the motion runner steers this car from the live ego position (agents/intercept.py)
                     lanes_crossed = abs(k_src - lane_idx)
+                    side_strike = bool(isinstance(meas, dict) and meas.get("side_strike") and event["type"] == "collision")
+                    long_off = -0.3 if side_strike else 1.0
+                    s0 = long_off
                     cruise_ms = None
                     head_i = head
                     if isinstance(meas, dict) and meas.get("overtake"):
@@ -1331,7 +1335,7 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                             v_c = min(v_c, 0.85 * v_e)
                         lead = {"collision": 2.0, "near_miss": 1.0}.get(event["type"], lead)
                         s_ev = _ego_travel(plan_ego, v_e)(T)
-                        s0_cand = max(1.0, min(s_ev + 1.0 - v_c * T, road.end_s - S_START - 20.0))
+                        s0_cand = max(1.0, min(s_ev + long_off - v_c * T, road.end_s - S_START - 20.0))
                         if road.has_lane(S_START + s0_cand, k_src):
                             s0, v = s0_cand, v_c
                             cruise_ms = round(v_c, 2)
@@ -1348,6 +1352,9 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                         icp_d["cruise_speed_ms"] = cruise_ms
                     if lanes_crossed >= 2:
                         icp_d["max_lateral_speed_ms"] = 3.2
+                    if side_strike:
+                        icp_d["long_offset_m"] = long_off
+                        icp_d["side_strike"] = True
                     spec_p = {"mode": "drive", "speed_kmh": round(v * 3.6, 1), "already_moving": True, "avoid": False,
                               "intercept": icp_d}
                 else:
@@ -1466,9 +1473,9 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 y = ego_start[1] + gapd
                 y = min(y, road.C[1] + 90.0)
                 if not is_ev and beh == "stopped" and a["lane"] != "same":
-                    y = min(y, road.C[1] - road.half_j - 5.0)
-                    while any(abs(y - y0) < 8.5 for y0 in placed_adj_y.get(lane_k, [])):
-                        y -= 9.0
+                    y = min(y, road.C[1] - road.half_j - 3.0)
+                    while any(abs(y - y0) < 7.0 for y0 in placed_adj_y.get(lane_k, [])):
+                        y -= 7.5
                     placed_adj_y.setdefault(lane_k, []).append(y)
                 elif not is_ev and not third_party and not stop_behaviours and conflict is not None and beh == "driving":
                     y = max(y, road.C[1] + road.half_j + 8.0)

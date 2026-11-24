@@ -70,6 +70,8 @@ def _yolo():
 def detect_tracks(path, t0, t1, width, fps_track=TRACK_FPS, conf=0.25):
     """Raw tracks {id: [{"t", "box": [x1, y1, x2, y2], "cls", "conf"}]} between video times t0 and t1, with boxes in a picture
     `width` px wide (the analysis width). Frames are read in order (no seeking) so that the tracker sees a steady frame rate."""
+    from agents import lane_lines
+    crop = lane_lines._video_crop(path)
     model = _yolo()
     cap = cv2.VideoCapture(path)
     tracks = {}
@@ -85,6 +87,8 @@ def detect_tracks(path, t0, t1, width, fps_track=TRACK_FPS, conf=0.25):
             if not ok:
                 break
             if (i - i0) % stride == 0:
+                if crop is not None:
+                    fr = fr[crop[0]:crop[1], crop[2]:crop[3]]
                 h, w = fr.shape[:2]
                 fr = cv2.resize(fr, (width, int(round(h * width / w))))
                 res = model.track(fr, persist=not reset, tracker="bytetrack.yaml", classes=list(COCO), conf=conf,
@@ -305,8 +309,12 @@ def converging_cutin_track(tracks, t_crash, side="left", window=(-2.5, 2.5), col
         v_vals = v_tr + v_prev
         v_meas = float(np.median(v_vals)) if v_vals else 0.0
     t_impact = round(float(tr["t"][-1]) + 0.15, 2)
+    # A cutter that disappears off the side of the forward dashcam FOV (|d_last| >= 1.8 m, right beside ego z <= 12 m)
+    # strikes ego from the side (v2 front-corner into ego's side), rather than crossing in front of ego's bumper.
+    side_strike = bool(abs(float(tr["d"][-1])) >= 1.8 and float(tr["z"][-1]) <= 12.0)
     return {"track": tr, "prev_track": prev, "skip_ids": skip_ids, "d_start": round(float(d_start), 2),
-            "lane_offset": lane_offset, "v_meas": round(v_meas, 2), "t_impact": t_impact}
+            "lane_offset": lane_offset, "v_meas": round(v_meas, 2), "t_impact": t_impact,
+            "side_strike": side_strike}
 
 
 def ego_relative(track, ts):

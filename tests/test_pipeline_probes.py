@@ -442,6 +442,59 @@ class TestPipelineHelpers(unittest.TestCase):
         local_pipeline.reconcile_one_way(two_way, yellow_left=0.0, tracks=real_onc)
         self.assertFalse(two_way["road"]["one_way"])
 
+    def test_reconcile_one_way_flips_false_one_way_to_two_way_on_yellow_px_or_oncoming(self):
+        # Video 2 case: road_edges misclassified two-way arterial with yellow centerline + oncoming tracks as one_way
+        art, _ = scene_spec.normalize({"road": {"type": "straight", "one_way": True, "lanes_per_direction": 2}})
+        art["replay"] = [{"id": "r5", "type": "car", "color": "gray", "kind": "parked",
+                          "path": [[0.0, 60.0, 7.0], [2.0, 40.0, 7.0]], "speed": [[0.0, 36.0], [2.0, 36.0]]}]
+        tracks = [{"id": 5, "kind": "oncoming", "d": [7.0, 7.0], "v": [-10.0, -10.0], "first_t": 2.0}]
+        local_pipeline.reconcile_one_way(art, yellow_left=0.0, tracks=tracks, yellow_px=0.21)
+        self.assertFalse(art["road"]["one_way"])
+        self.assertEqual(art["replay"][0]["kind"], "oncoming")
+
+    def test_yellow_line_left_score_detects_yellow_over_white_and_occluded_frames(self):
+        import cv2, numpy as np
+        def enc(bgr):
+            return cv2.imencode(".jpg", bgr)[1].tobytes()
+        # Frame with bright yellow centerline on the left half of the lower road
+        im_yel = np.full((360, 640, 3), (80, 80, 80), dtype=np.uint8)
+        cv2.line(im_yel, (120, 330), (270, 175), (20, 210, 235), 8)
+        ll_yel = np.zeros((360, 640), dtype=np.uint8)
+        cv2.line(ll_yel, (120, 330), (270, 175), 255, 8)
+        # Occluded frame (no visible lane lines in left half)
+        im_occ = np.full((360, 640, 3), (60, 60, 60), dtype=np.uint8)
+        ll_occ = np.zeros((360, 640), dtype=np.uint8)
+        # Frame with white lane line on the left half
+        im_wht = np.full((360, 640, 3), (80, 80, 80), dtype=np.uint8)
+        cv2.line(im_wht, (120, 330), (270, 175), (240, 240, 240), 8)
+
+        seq_masks = [(ll_yel, ll_yel)] + [(ll_occ, ll_occ)] * 5
+        with mock.patch.object(road_probes.video_events, "grab_frames", return_value=[enc(im_yel)] + [enc(im_occ)] * 5), \
+                mock.patch("agents.lane_lines.model_masks", side_effect=seq_masks):
+            self.assertGreaterEqual(road_probes.yellow_line_left_score("v.mp4", 15.0, t_crash=14.0, n=6), 0.25)
+        with mock.patch.object(road_probes.video_events, "grab_frames", return_value=[enc(im_wht)] * 4), \
+                mock.patch("agents.lane_lines.model_masks", return_value=(ll_yel, ll_yel)):
+            self.assertEqual(road_probes.yellow_line_left_score("v.mp4", 15.0, t_crash=10.0, n=4), 0.0)
+
+    def test_apply_crash_preserves_uncovered_traffic_bins_with_partial_bg_tracked(self):
+        # Crossroad where bg_tracked sees ego_lane_ahead + cross_right, but 0 left_lane cars: left_lane traffic must survive
+        spec, _ = scene_spec.normalize({
+            "road": {"type": "crossroad", "lanes_per_direction": 2},
+            "ego": {"lane": "right", "speed_kmh": 50.0, "behavior": "cruise"},
+            "traffic": {"ego_lane_ahead": 2, "left_lane": 5, "right_lane": 2, "oncoming": 1},
+        })
+        crash = {"collision": True, "ego_involved": True, "second_vehicle": None,
+                 "first_vehicle": {"type": "suv", "color": "silver", "approach": "crossing_from_left", "speed": "slow"}}
+        tracked = {"background_actors": [
+            {"type": "car", "relation": "cross_right", "lane": "same", "distance_m": 12.0, "speed_kmh": 0.0, "behavior": "stopped"},
+            {"type": "car", "relation": "ahead", "lane": "same", "distance_m": 18.0, "speed_kmh": 50.0, "behavior": "driving"},
+        ]}
+        out = local_pipeline.apply_crash(spec, crash, 4.55, tracked=tracked)
+        self.assertEqual(out["traffic"]["ego_lane_ahead"], 0)
+        self.assertEqual(out["traffic"]["right_lane"], 0)
+        self.assertEqual(out["traffic"]["left_lane"], 5)
+        self.assertEqual(out["traffic"]["oncoming"], 1)
+
     def test_estimate_environment_classifies_clear_cloudy_and_night(self):
         import cv2, numpy as np
         def encode(bgr):

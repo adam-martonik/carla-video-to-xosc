@@ -22,7 +22,8 @@ S_RES = 0.5                 # m per grid cell along the road
 D_RES = 0.2                 # m per grid cell across the road
 D_RANGE = (-20.0, 25.0)     # across the road (m, + left)
 Z_RANGE = (4.0, 55.0)       # ahead of the camera that is used (m): nearer is under the hood, further is too coarse
-ROAD_Z_MAX = 55.0           # road / not-road evidence only from this near (tried 30 m: video 1 got worse, so the full range)
+ROAD_Z_MAX = 55.0           # road / not-road evidence for off-road / gore filtering (seen_off_road)
+ROAD_Z_MAX_REACH = 48.0     # road surface reach caps far-horizon mask smear while still seeing asphalt behind near traffic
 SLICE_M = 2.5               # distance between lane counts
 SLICE_HALF_M = 5.0          # half length of the stretch one count pools
 MIN_SEEN = 25               # grid hits a cross-road cell needs in a slice to count as seen
@@ -41,6 +42,8 @@ class LaneGrid:
         self.line = np.zeros((self.ns, self.nd), np.float32)
         self.road = np.zeros((self.ns, self.nd), np.float32)
         self.seen_r = np.zeros((self.ns, self.nd), np.float32)       # seen near enough to say road / not road
+        self.road_near = np.zeros((self.ns, self.nd), np.float32)    # near-field road mask for lateral reach
+        self.seen_near = np.zeros((self.ns, self.nd), np.float32)
         self.paint = np.zeros((self.ns, self.nd), np.float32)        # raw painted marking hits (keeps dashes distinct from solid)
         self.seen_p = np.zeros((self.ns, self.nd), np.float32)
 
@@ -60,23 +63,31 @@ class LaneGrid:
         si, dj = si[ok], dj[ok]
         np.add.at(self.seen, (si, dj), 1.0)
         np.add.at(self.line, (si, dj), line[ok].astype(np.float32))
-        near = Z[ok] <= ROAD_Z_MAX
+        z_ok = Z[ok]
+        road_ok = road[ok].astype(np.float32)
+        near = z_ok <= ROAD_Z_MAX
         np.add.at(self.seen_r, (si[near], dj[near]), 1.0)
-        np.add.at(self.road, (si[near], dj[near]), road[ok][near].astype(np.float32))
+        np.add.at(self.road, (si[near], dj[near]), road_ok[near])
+        near_r = z_ok <= ROAD_Z_MAX_REACH
+        np.add.at(self.seen_near, (si[near_r], dj[near_r]), 1.0)
+        np.add.at(self.road_near, (si[near_r], dj[near_r]), road_ok[near_r])
         if paint is not None:
             np.add.at(self.seen_p, (si, dj), 1.0)
             np.add.at(self.paint, (si, dj), paint[ok].astype(np.float32))
 
-    def slice(self, s, half=SLICE_HALF_M, road_seen=False):
+    def slice(self, s, half=SLICE_HALF_M, road_seen=False, near_reach=False):
         """(seen, P(line), P(road)) across the road for the stretch s +- half; P(road) is over the cells seen near enough
-        (ROAD_Z_MAX), whose counts are returned as a fourth value with road_seen=True."""
+        (ROAD_Z_MAX, or ROAD_Z_MAX_REACH when near_reach=True and populated), whose counts are returned as a fourth value
+        with road_seen=True."""
         a = max(int((s - half - self.s0) / S_RES), 0)
         b = min(int((s + half - self.s0) / S_RES) + 1, self.ns)
         seen = self.seen[a:b].sum(0)
-        seen_r = self.seen_r[a:b].sum(0)
+        use_near = near_reach and hasattr(self, "seen_near") and self.seen_near[a:b].sum() >= MIN_SEEN
+        seen_r = self.seen_near[a:b].sum(0) if use_near else self.seen_r[a:b].sum(0)
+        road_acc = self.road_near[a:b].sum(0) if use_near else self.road[a:b].sum(0)
         with np.errstate(invalid="ignore", divide="ignore"):
             pl = np.where(seen > 0, self.line[a:b].sum(0) / seen, 0.0)
-            pr = np.where(seen_r > 0, self.road[a:b].sum(0) / seen_r, 0.0)
+            pr = np.where(seen_r > 0, road_acc / seen_r, 0.0)
         return (seen, pl, pr, seen_r) if road_seen else (seen, pl, pr)
 
 
@@ -113,6 +124,7 @@ def accumulate(path, cam, s_ego, t0, t1, y_bottom, boxes_at=None, step=FRAME_STE
     from agents import lane_lines
     if lane_lines._model() is None:
         return None
+    crop = lane_lines._video_crop(path)
     X, Z, Hm, size = top_view_coords(cam)
     grid = LaneGrid(s_max=s_ego(t1) + Z_RANGE[1] + 5.0, s_min=min(s_ego(t0), 0.0) - 5.0)
     cap = cv2.VideoCapture(path)
@@ -124,6 +136,8 @@ def accumulate(path, cam, s_ego, t0, t1, y_bottom, boxes_at=None, step=FRAME_STE
             ok, fr = cap.read()
             if not ok:
                 break
+            if crop is not None:
+                fr = fr[crop[0]:crop[1], crop[2]:crop[3]]
             h, w = fr.shape[:2]
             fr = cv2.resize(fr, (cam.w, int(round(h * cam.w / w))))
             mm = lane_lines.model_masks(fr)
@@ -226,10 +240,23 @@ SOLID = 0.7
 LATTICE_TOL_BEV = 0.2          # a line counts as the edge of a further lane within this share of a lane width of the grid
 
 
-def count_slice(grid, s, w, vehicles_d=()):
+def _has_paint_at(grid, s, d, half=SLICE_HALF_M, tol_m=0.4):
+    """True when either no raw paint channel is populated (synthetic grids) or painted markings are actually seen at d
+    (filtering out unpainted concrete barriers/curbs that TwinLiteNet labels as lane lines)."""
+    if not hasattr(grid, "seen_p"):
+        return True
+    a = max(int((s - half - grid.s0) / S_RES), 0)
+    b = min(int((s + half - grid.s0) / S_RES) + 1, grid.ns)
+    if grid.seen_p[a:b].sum() < 8:
+        return True
+    return solid(grid, s, d, half=half, tol_m=tol_m) >= 0.15
+
+
+def count_slice(grid, s, w, vehicles_d=(), blocked_sides=()):
     """Lanes beside the ego lane in the slice at s: (left, right, details) from lines on the lane grid, the road surface and
-    the vehicles driving the same way (vehicles_d: their d in this slice)."""
-    seen, pl, pr, seen_r = grid.slice(s, road_seen=True)
+    the vehicles driving the same way (vehicles_d: their d in this slice). `blocked_sides` lists outer barrier sides where the
+    ego car runs directly beside a continuous barrier (no lane can exist on that side without vehicles on it)."""
+    seen, pl, pr, seen_r = grid.slice(s, road_seen=True, near_reach=True)
     if seen.max() < MIN_SEEN:
         return None
     pk = line_peaks(pl, seen)
@@ -242,11 +269,14 @@ def count_slice(grid, s, w, vehicles_d=()):
         first = min(lines, key=abs)                   # the ego lane's line on this side
         beyond = [d for d in vehicles_d if d * sign > abs(first)]
         more_lines = [d for d in lines if abs(d) > abs(first) + 0.5 * w
-                      and abs(((abs(d) - abs(first)) / w) - round((abs(d) - abs(first)) / w)) <= LATTICE_TOL_BEV]
+                      and abs(((abs(d) - abs(first)) / w) - round((abs(d) - abs(first)) / w)) <= LATTICE_TOL_BEV
+                      and _has_paint_at(grid, s, d)]
         if solid(grid, s, first) >= SOLID and not beyond and not more_lines:
-            return 0, first                           # a solid edge line with neither traffic nor further lane lines beyond
+            return 0, first                           # a solid edge line with neither traffic nor further painted lane lines beyond
         n = 0
         for d in lines:
+            if d != first and not beyond and not _has_paint_at(grid, s, d):
+                continue
             k = (abs(d) - abs(first)) / w
             if abs(k - round(k)) <= LATTICE_TOL_BEV:
                 n = max(n, int(round(k)))
@@ -277,28 +307,54 @@ def count_slice(grid, s, w, vehicles_d=()):
     nr_road = max(int(math.floor((reach_r - first_r) / w + 0.25)), 0)
     nl_veh = max([int(round(d / w)) for d in vehicles_d if d > 0.5 * w] or [0])
     nr_veh = max([int(round(-d / w)) for d in vehicles_d if d < -0.5 * w] or [0])
+    if "right" in blocked_sides and nr_veh == 0:
+        nr_lines = nr_road = 0
+    if "left" in blocked_sides and nl_veh == 0:
+        nl_lines = nl_road = 0
     nl, nr = max(nl_lines, nl_road, nl_veh), max(nr_lines, nr_road, nr_veh)
     return nl, nr, {"lines": [round(d, 1) for d in pk], "reach": [round(reach_l, 1), round(reach_r, 1)],
                     "from": {"lines": [nl_lines, nr_lines], "road": [nl_road, nr_road], "vehicles": [nl_veh, nr_veh]}}
 
 
-def lane_samples(grid, s_from, s_to, tracks=(), road_ok=None):
+def seen_off_road_between(grid, s, d, step_m=1.5, half_m=0.8):
+    """Whether a seen strip of non-road (concrete barrier, gore, dirt embankment, grass) lies between the ego lane (d = 0)
+    and lateral offset d. Vehicles on a separate parallel frontage road or an already-diverged highway branch have non-road
+    between them and the ego lane, while vehicles queued in adjacent lanes hide their lane (unseen, not seen non-road)."""
+    if abs(d) < 3.0:
+        return False
+    sign = 1.0 if d > 0 else -1.0
+    cur = 2.0
+    while cur < abs(d) - 1.0:
+        if seen_off_road(grid, s, sign * cur, half_m=half_m):
+            return True
+        cur += step_m
+    return False
+
+
+def lane_samples(grid, s_from, s_to, tracks=(), road_ok=None, blocked_sides=(), exclude_after=None):
     """Lane counts every SLICE_M m between s_from and s_to in the sample format of agents/lane_lines ("t" = distance s):
     [{"t", "probs", "lanes_left", "lanes_right", "road_lanes", "detail"}]. tracks: road tracks of agents/vehicle_tracks; only
-    those driving the same way count as lanes."""
+    those driving the same way on the connected ego carriageway count as lanes.
+    blocked_sides: outer sides directly beside ego bounded by a continuous barrier (e.g. ('right',)).
+    exclude_after: optional (set_of_track_ids, s_split) for diverging-branch tracks that leave the ego road from s_split."""
     from agents import lane_lines
     slices = [s_from + SLICE_M * i for i in range(int((s_to - s_from) / SLICE_M) + 1)]
     w = lane_width(grid, slices)
+    ex_ids, ex_s = exclude_after if exclude_after else ((), float("inf"))
+    ex_ids = set(ex_ids or ())
     out = []
     for s in slices:
         vd = []
         for tr in tracks:
             if tr.get("kind") != "same":
                 continue
+            is_branch_tr = tr.get("id") in ex_ids
             for ss, dd, zz in zip(tr["s"], tr["d"], tr.get("z") or [0.0] * len(tr["s"])):
-                if abs(ss - s) <= SLICE_HALF_M and zz <= Z_RANGE[1] and not seen_off_road(grid, ss, dd):
+                if is_branch_tr and (ss >= ex_s - SLICE_HALF_M or abs(dd) >= 4.2 * w):
+                    continue
+                if abs(ss - s) <= SLICE_HALF_M and zz <= Z_RANGE[1] and not seen_off_road(grid, ss, dd) and not seen_off_road_between(grid, ss, dd):
                     vd.append(dd)
-        r = count_slice(grid, s, w, vd)
+        r = count_slice(grid, s, w, vd, blocked_sides=blocked_sides)
         if r is None:
             out.append({"t": round(s, 2), "probs": None})
             continue
@@ -349,12 +405,17 @@ def carry_lanes(grid, rows, w):
 
 def seen_off_road(grid, s, d, half_m=1.0):
     """Whether the map clearly saw the ground at (s, d) and it was not road (e.g. a frontage road beyond a barrier); a car
-    standing in a queue hides its own lane, which then counts as not seen, not as off the road."""
+    standing in a queue hides its own lane, which then counts as not seen, not as off the road. Returns False when ego's own
+    lane (d = 0) is not reliably segmented as road at slice s (e.g. inside a dark overpass shadow or tunnel)."""
     a = max(int((s - SLICE_HALF_M - grid.s0) / S_RES), 0)
     b = min(int((s + SLICE_HALF_M - grid.s0) / S_RES) + 1, grid.ns)
     j0, j1 = max(grid.j_of(d - half_m), 0), min(grid.j_of(d + half_m) + 1, grid.nd)
     if j0 >= j1:
         return True
+    je0, je1 = max(grid.j_of(-0.8), 0), min(grid.j_of(0.8) + 1, grid.nd)
+    ego_seen = grid.seen_r[a:b, je0:je1].sum()
+    if ego_seen >= 3 * MIN_SEEN and grid.road[a:b, je0:je1].sum() / ego_seen < 0.55:
+        return False
     seen = grid.seen_r[a:b, j0:j1].sum()
     if seen < 3 * MIN_SEEN:
         return False

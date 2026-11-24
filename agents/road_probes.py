@@ -160,6 +160,50 @@ def yellow_centerline_left(video, duration, t_crash=None, n=3):
         return 0.0
 
 
+def yellow_line_left_score(video, duration, t_crash=None, n=8):
+    """Vision-only yellow-centerline score (0..1): pixel-weighted fraction of lane-marking pixels in the lower-left road half
+    that have yellow HSV paint across pre-crash frames. Weighting by marking-pixel area naturally lets unobstructed frames
+    dominate stopped/occluded frames where a queue hides the centerline."""
+    try:
+        import cv2
+        import numpy as np
+        from agents import lane_lines
+        dur = max(float(duration), 0.5)
+        t1 = min(dur - 0.2, float(t_crash) - 0.5) if (t_crash is not None and float(t_crash) > 1.5) else max(dur - 0.2, 0.5)
+        t0 = min(0.2, max(t1 - 0.4, 0.0))
+        times = _times(dur, n, t0=t0, t1=max(t1, t0 + 0.2))
+        raws = video_events.grab_frames(video, times, width=640)
+        if not raws:
+            return 0.0
+        kernel = np.ones((5, 5), np.uint8)
+        tot_yel, tot_ll = 0, 0
+        for raw in raws:
+            arr = np.frombuffer(raw, np.uint8)
+            im = cv2.imdecode(arr, cv2.IMREAD_COLOR) if arr.size else None
+            if im is None or im.size == 0:
+                continue
+            h, w = im.shape[:2]
+            y0, y1 = int(0.45 * h), int(0.92 * h)
+            x0, x1 = int(0.05 * w), int(0.50 * w)
+            if y1 - y0 < 16 or x1 - x0 < 16:
+                continue
+            mm = lane_lines.model_masks(im)
+            ll = mm[0] if mm is not None else lane_lines.marking_mask(im, y0, y1)
+            ll_roi = cv2.dilate((ll[y0:y1, x0:x1] > 0).astype(np.uint8), kernel) > 0
+            denom = int(ll_roi.sum())
+            if denom < 30:
+                continue
+            hsv = cv2.cvtColor(im[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+            yellow = (hsv[..., 0] >= 12) & (hsv[..., 0] <= 38) & (hsv[..., 1] >= 70) & (hsv[..., 2] >= 90)
+            tot_yel += int((yellow & ll_roi).sum())
+            tot_ll += denom
+        if tot_ll < 30 or tot_yel < 100:
+            return 0.0
+        return round(float(tot_yel) / float(tot_ll), 3)
+    except Exception:
+        return 0.0
+
+
 def pick_crash_candidates(scores, k=3, min_gap_s=1.0):
     """The k strongest smoothed windows that are at least min_gap_s apart (ties: strongest raw score, then earliest)."""
     if not scores:

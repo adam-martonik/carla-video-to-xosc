@@ -196,6 +196,8 @@ def focal_from_dashes(path, cam, times, speed_fn, y_bottom, vx_at=None):
     line (bright, varying strongly along the road; a solid line does not vary) are matched between frames DASH_DT apart wherever
     the overlay gives the speed V. Returns (f or None, number of clear matches)."""
     import copy
+    from agents import lane_lines
+    crop = lane_lines._video_crop(path)
     ests = []
     cap = cv2.VideoCapture(path)
     try:
@@ -217,6 +219,8 @@ def focal_from_dashes(path, cam, times, speed_fn, y_bottom, vx_at=None):
                 c.vx = vx_at(t)
             views = []
             for img in (a, b):
+                if crop is not None:
+                    img = img[crop[0]:crop[1], crop[2]:crop[3]]
                 img = cv2.resize(img, (cam.w, int(round(img.shape[0] * cam.w / img.shape[1]))))
                 g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 th = cv2.morphologyEx(g, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (31, 1))).astype(np.float32)

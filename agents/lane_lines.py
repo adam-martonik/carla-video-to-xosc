@@ -45,11 +45,21 @@ def _read(cap, fps, t, crop=None):
     return cv2.resize(fr, (WIDTH, int(round(h * WIDTH / w))))
 
 
+def _video_crop(path):
+    """Cached letterbox/pillarbox content crop (y0, y1, x0, x1) or None."""
+    try:
+        from agents import video_events
+        return video_events._get_video_meta(path)[2]
+    except Exception:
+        return None
+
+
 def road_bottom(path, n=12):
     """Row (at WIDTH) where the road area ends (the hood begins), and the frame height.
     The painted lines that point at the vanishing point stop at the hood edge, so the bottom is the typical lowest point of
     those lines (hood reflections and overlays do not point at the vanishing point). When TwinLiteNet is available, also check
     where its drivable-area mask ends in the centre of the frame (lane lines can leave the sides above the hood)."""
+    crop = _video_crop(path)
     cap = cv2.VideoCapture(path)
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -57,7 +67,7 @@ def road_bottom(path, n=12):
         lows, da_lows, h = [], [], None
         has_model = _model() is not None
         for i in range(n):
-            f = _read(cap, fps, dur * (i + 0.5) / n)
+            f = _read(cap, fps, dur * (i + 0.5) / n, crop=crop)
             if f is None:
                 continue
             h, w = f.shape[:2]
@@ -117,8 +127,8 @@ def model_masks(bgr):
     if net is None:
         return None
     import torch
-    key = (id(bgr), bgr.shape)
-    if _MODEL.get("key") == key:
+    sig = (bgr.shape, hash(bgr[::32, ::32].tobytes()))
+    if _MODEL.get("arr") is bgr and _MODEL.get("sig") == sig:
         return _MODEL["masks"]
     h, w = bgr.shape[:2]
     img = cv2.resize(bgr, (640, 360))
@@ -127,7 +137,7 @@ def model_masks(bgr):
         da, ll = net(x)
     da = cv2.resize(da.argmax(1)[0].numpy().astype(np.uint8) * 255, (w, h), interpolation=cv2.INTER_NEAREST)
     ll = cv2.resize(ll.argmax(1)[0].numpy().astype(np.uint8) * 255, (w, h), interpolation=cv2.INTER_NEAREST)
-    _MODEL["key"], _MODEL["masks"] = key, (ll, da)
+    _MODEL["arr"], _MODEL["sig"], _MODEL["masks"] = bgr, sig, (ll, da)
     return ll, da
 
 
@@ -449,6 +459,7 @@ def apply_vehicle_evidence(rows, evidence, span=0.75):
 def lane_timeline(path, t0, t1, step=0.5, window=1.0, fps_window=8.0):
     """[{"t", "probs", "road_lanes", "lanes_left", "lanes_right", ...}] every `step` seconds in [t0, t1]; each window pools the
     frames of `window` seconds centred on t. [] when the video cannot be read."""
+    crop = _video_crop(path)
     y_b, h = road_bottom(path)
     if y_b is None:
         return []
@@ -461,7 +472,7 @@ def lane_timeline(path, t0, t1, step=0.5, window=1.0, fps_window=8.0):
         n = max(int(window * fps_window), 1)
         while t <= float(t1) + 1e-6:
             ts = [min(max(t - 0.5 * window + window * (i + 0.5) / n, 0.0), dur - 0.05) for i in range(n)]
-            frames = [f for f in (_read(cap, fps, x) for x in ts) if f is not None]
+            frames = [f for f in (_read(cap, fps, x, crop=crop) for x in ts) if f is not None]
             r = analyse_window(frames, y_b) or {"lanes": None}
             r.pop("peaks", None)
             r["t"] = round(t, 2)

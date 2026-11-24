@@ -217,7 +217,7 @@ class TestCrossroadTrafficAndTiming(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         road_c_y = 100.0
         half_j = 2 * 3.5 + 4.0
-        y_stop = road_c_y - half_j - 5.0
+        y_stop = road_c_y - half_j - 3.0
         extra = {k: v for k, v in agents.items() if k not in ("v1", "v2")}
         self.assertEqual(len(extra), 5)
         stopped_left = [k for k, a in extra.items() if plan["agents"][k]["mode"] == "static" and -a["location"][1] < road_c_y]
@@ -232,6 +232,24 @@ class TestCrossroadTrafficAndTiming(unittest.TestCase):
         for k, a in extra.items():
             y_net = -a["location"][1]
             self.assertFalse(road_c_y - half_j <= y_net <= road_c_y + half_j, (k, y_net))
+
+    def test_crossroad_full_left_queue_packs_to_stop_line_blocking_sightline(self):
+        spec = self._crossroad_spec(speed_kmh=50.0, time_s=4.55)
+        spec["traffic"] = {"ego_lane_ahead": 0, "left_lane": 5, "right_lane": 0, "oncoming": 0, "rel_speed_kmh": 0.0}
+        tmp, plan, agents, net = build(spec)
+        self.addCleanup(tmp.cleanup)
+        road_c_y = 100.0
+        half_j = 2 * 3.5 + 4.0
+        v1_y = -agents["v1"]["location"][1]
+        stopped_left_ys = sorted(
+            -a["location"][1] for k, a in agents.items()
+            if k not in ("v1", "v2") and plan["agents"][k]["mode"] == "static" and -a["location"][1] < road_c_y
+        )
+        self.assertEqual(len(stopped_left_ys), 5)
+        self.assertAlmostEqual(stopped_left_ys[-1], road_c_y - half_j - 3.0, delta=0.1)
+        self.assertGreater(stopped_left_ys[0], v1_y + 2.5)
+        for a, b in zip(stopped_left_ys, stopped_left_ys[1:]):
+            self.assertAlmostEqual(b - a, 7.5, delta=0.1)
 
     def test_moving_ego_on_crossroad_with_clamped_y0_syncs_conflict_time(self):
         spec = self._crossroad_spec(speed_kmh=90.0, time_s=8.0)

@@ -446,7 +446,19 @@ def apply_crash(spec, crash, t_crash, ego_speed=None, tracked=None):
                  "behavior": ba.get("behavior", "stopped"), "color": color_rgb(ba.get("color"))}
                 for idx_b, ba in enumerate(bg_tracked, start=1)]
         if isinstance(spec.get("traffic"), dict):
-            for k_tr in ("ego_lane_ahead", "left_lane", "right_lane", "oncoming"):
+            covered = set()
+            for ba in keep:
+                rel_b, lane_b = ba["relation"], ba["lane"]
+                if rel_b == "oncoming":
+                    covered.add("oncoming")
+                elif rel_b == "ahead":
+                    if lane_b == "same":
+                        covered.add("ego_lane_ahead")
+                    elif lane_b == "left":
+                        covered.add("left_lane")
+                    elif lane_b == "right":
+                        covered.add("right_lane")
+            for k_tr in covered:
                 spec["traffic"][k_tr] = 0
     else:
         keep = [a for a in spec["actors"] if a["relation"] in ("ahead", "behind", "oncoming") and not a["id"].startswith("c")][:4]
@@ -766,7 +778,17 @@ def measure_scene(spec, video, duration, caps, lane_rows=None, log_fn=log):
     try:
         boxes_fn = (lambda t: [b for tt, b in obs if abs(tt - t) < 0.06]) if obs else None
         grid = bev_lanes.accumulate(video, cam, s_ego, t_lo, t_hi, y_b, boxes_fn, curve=curve, vx_at=vx_at)
-        samples = bev_lanes.lane_samples(grid, 0.0, s_ego(t_hi), tracks) if grid is not None else []    # beyond: only seen from afar
+        road_sp = spec.get("road") or {}
+        ego_lane = (spec.get("ego") or {}).get("lane")
+        blocked_ego = tuple(
+            sd for sd, key in (("right", "edge_right"), ("left", "edge_left"))
+            if road_sp.get(key) == "barrier" and ego_lane == sd
+        )
+        fork_tr = fork_from_tracks(tracks, 3.5) if tracks else None
+        excl = (fork_tr["ids"], fork_tr["s_split"]) if fork_tr else None
+        samples = bev_lanes.lane_samples(
+            grid, 0.0, s_ego(t_hi), tracks, blocked_sides=blocked_ego, exclude_after=excl
+        ) if grid is not None else []    # beyond: only seen from afar
     except Exception as e:
         bev_err = str(e)
         log_fn("BEV lane map unavailable: %s" % bev_err)
@@ -805,30 +827,50 @@ CLIMB_REL = 1.15             # ... and at least this much above the cars on the 
 
 
 def diverging_tracks(tracks, lane_w):
-    """Same-direction tracks that pull away sideways from the ego road (outward slope of d over s), with their side."""
+    """Same-direction tracks that pull away sideways beyond the continuing lanes onto a diverging branch, with their side
+    and the distance s_div where divergence starts. Checks both the whole track and contiguous sub-windows (handling cars
+    seen before a split that diverge and then run parallel on the branch); ignores ordinary interior lane changes
+    (final |d| < 2.5 * lane_w)."""
     import numpy as np
     out = []
+    min_end_d = 2.5 * max(float(lane_w or 3.5), 2.5)
     for t in tracks:
         if t.get("kind") != "same" or len(t["s"]) < 6:
             continue
-        s, d = np.array(t["s"]), np.array(t["d"])
-        if s[-1] - s[0] < FORK_MIN_SPAN_M or abs(d.mean()) < 0.5 * lane_w:
+        s, d = np.array(t["s"], float), np.array(t["d"], float)
+        if s[-1] - s[0] < FORK_MIN_SPAN_M or abs(d.mean()) < 0.5 * lane_w or abs(d[-1]) < min_end_d:
             continue
-        side = 1.0 if d.mean() > 0 else -1.0
+        side = 1.0 if d[-1] > 0 else -1.0
         if np.polyfit(s, d, 1)[0] * side >= FORK_SLOPE:
-            out.append((t, "left" if side > 0 else "right"))
+            out.append((t, "left" if side > 0 else "right", float(s[0])))
+            continue
+        # Track may drive straight before or after the fork transition: look for any sustained outward-diverging segment
+        # (>= FORK_MIN_SPAN_M, >= 6 pts, slope >= FORK_SLOPE, net outward shift >= 3.0 m) where the car stays outward.
+        best_s = None
+        for i in range(0, len(s) - 5):
+            for j in range(i + 5, len(s)):
+                if s[j] - s[i] < FORK_MIN_SPAN_M:
+                    continue
+                if (d[j] - d[i]) * side >= 3.0 and np.polyfit(s[i:j + 1], d[i:j + 1], 1)[0] * side >= FORK_SLOPE:
+                    # Report where the car reaches the outer edge of the diverging transition (midpoint of ramp)
+                    best_s = float(0.5 * (s[i] + s[j]))
+                    break
+            if best_s is not None:
+                break
+        if best_s is not None:
+            out.append((t, "left" if side > 0 else "right", best_s))
     return out
 
 
 def fork_from_tracks(tracks, lane_w):
     """A fork seen in the traffic itself: FORK_MIN_TRACKS or more cars on one side pulling away from the ego road. The split is
-    where those cars were first seen (median). Returns {"side", "s_split", "ids"} or None."""
+    where those cars began diverging (median). Returns {"side", "s_split", "ids"} or None."""
     import numpy as np
     div = diverging_tracks(tracks, lane_w)
     for side in ("left", "right"):
-        ts = [t for t, sd in div if sd == side]
+        ts = [(t, s_div) for t, sd, s_div in div if sd == side]
         if len(ts) >= FORK_MIN_TRACKS:
-            return {"side": side, "s_split": float(np.median([t["s"][0] for t in ts])), "ids": [t["id"] for t in ts]}
+            return {"side": side, "s_split": float(np.median([s_div for _, s_div in ts])), "ids": [t["id"] for t, _ in ts]}
     return None
 
 
@@ -862,6 +904,18 @@ def apply_fork(prof, fork, tracks, lane_w, ego_j=None, base_lanes=None, branch_p
         a, b = prof[k - 1], prof[k]
         if (side == "left") != (b["m"] > a["m"]):
             _move_leaving_lanes(prof, k, side)
+        # Collapse a short (<= 35 m) same-side staircase step immediately before the split (common when the
+        # outer lane leaves the camera FOV shortly before the gore) so all departing lanes branch together.
+        while k >= 2:
+            prev, cur, nxt = prof[k - 2], prof[k - 1], prof[k]
+            prev_drop_side = (cur["m"] > prev["m"]) if side == "left" else (cur["m"] + cur["n"] < prev["m"] + prev["n"])
+            if cur["n"] < prev["n"] and prev_drop_side and cur.get("d0") is not None and nxt.get("d0") is not None and (nxt["d0"] - cur["d0"]) <= 35.0:
+                prev["d1"] = nxt["d0"]
+                prof.pop(k - 1)
+                k -= 1
+                a, b = prof[k - 1], prof[k]
+            else:
+                break
         lo = (a["d0"] if a["d0"] is not None else 0.0) + 15.0
         hi = (b["d1"] - 15.0) if b["d1"] is not None else fork["s_split"]
         new_s = min(max(fork["s_split"], lo), max(hi, lo))
@@ -905,6 +959,27 @@ def apply_fork(prof, fork, tracks, lane_w, ego_j=None, base_lanes=None, branch_p
         len(fork["ids"]), side, new_s, "the branch climbs" if climbs else "level branch", "-" if med is None else "%.2f" % med, n)
 
 
+def _ego_lane_in_section(sec0, left0, right0, spec):
+    """Pick ego's lane offset j within sec0 (0 = leftmost in sec0 .. sec0['n']-1 = rightmost), anchoring to an outer edge
+    when zero lanes are measured on that side so ego never drifts inward leaving a phantom lane beside a barrier."""
+    if not left0 and not right0:
+        return None
+    l_med = left0[len(left0) // 2] if left0 else None
+    r_med = right0[len(right0) // 2] if right0 else None
+    ego_lane = (spec.get("ego") or {}).get("lane")
+    road_sp = spec.get("road") or {}
+    if (r_med is not None and r_med < 0.5) or (ego_lane == "right" and road_sp.get("edge_right") == "barrier" and (r_med is None or r_med < 1.0)):
+        if l_med is None or l_med >= 0.5 or sec0["n"] == 1:
+            return sec0["n"] - 1
+    if (l_med is not None and l_med < 0.5) and (r_med is not None and r_med >= 0.5):
+        return 0
+    if ego_lane == "left" and road_sp.get("edge_left") == "barrier" and (l_med is None or l_med < 1.0):
+        return 0
+    if l_med is not None:
+        return min(int(round(l_med)), sec0["n"] - 1)
+    return max(0, sec0["n"] - 1 - int(round(r_med)))
+
+
 def lane_profile_from_map(spec, scene, video, duration, branch_probe=None, log_fn=log):
     """Lane profile from the bird's-eye lane map (a count every few metres along the road): smoothed into sections directly in
     metres, the side of every change from where lanes left, branches tagged like in add_lane_profile. Returns True when the map
@@ -917,7 +992,7 @@ def lane_profile_from_map(spec, scene, video, duration, branch_probe=None, log_f
             s_ego(scene["t_hi"])))
         return False
     measured = [x for x in scene["lane_samples"] if x.get("probs")]
-    segs = lane_profile.segment_counts(measured, switch_cost=4.0, min_dur_s=10.0)          # "t" is metres here
+    segs = lane_profile.segment_counts(measured, switch_cost=4.0, min_dur_s=20.0)          # "t" is metres here
     if not segs:
         return False
     t_v0, T = sim_window(spec)
@@ -930,6 +1005,7 @@ def lane_profile_from_map(spec, scene, video, duration, branch_probe=None, log_f
     prof = lane_profile.build_profile(segs, bounds, sides, 0.0, 1.0)
     d_ev = s_ego(t_v0 + T)
     left0 = sorted(x["lanes_left"] for x in measured if x["t"] <= 30.0)       # the very start is barely seen yet
+    right0 = sorted(x["lanes_right"] for x in measured if x["t"] <= 30.0 and x.get("lanes_right") is not None)
     s_last = max(x["t"] for x in measured)
     if len(prof) > 1 and prof[0]["d1"] is not None and prof[0]["d1"] < 25.0:
         prof[1]["d0"] = None                                         # a start stretch barely seen in near-field FOV: not used
@@ -968,15 +1044,24 @@ def lane_profile_from_map(spec, scene, video, duration, branch_probe=None, log_f
         n = only or next((sg["n"] for sg in segs if sg["t1"] >= d_ev), segs[-1]["n"])
         road["lanes_per_direction"] = max(n, need)
         road["lane_profile"] = None
-        if left0:
-            spec["ego"]["lane_index"] = int(round(left0[len(left0) // 2]))
+        j_flat = _ego_lane_in_section({"n": road["lanes_per_direction"], "m": 0}, left0, right0, spec)
+        if j_flat is not None:
+            spec["ego"]["lane_index"] = j_flat
         spec.setdefault("notes", []).append("lane map: %d lanes along the simulated stretch" % road["lanes_per_direction"])
         return True
+    def _ensure_min_lanes(sec, req):
+        if sec["n"] < req:
+            grow = req - sec["n"]
+            if sec["m"] > 0:
+                shift = min(grow, sec["m"])
+                sec["m"] -= shift
+            sec["n"] = req
+
     sec_ev = lane_profile.section_at(prof, d_ev)
-    if sec_ev["n"] < need:
-        sec_ev["n"] = need
+    _ensure_min_lanes(sec_ev, need)
     sec0_ = lane_profile.section_at(prof, 0.0) if prof else None
-    ego_j = (sec0_["m"] + min(int(round(left0[len(left0) // 2])), sec0_["n"] - 1)) if (left0 and sec0_) else None
+    j0 = _ego_lane_in_section(sec0_, left0, right0, spec) if sec0_ else None
+    ego_j = (sec0_["m"] + j0) if (j0 is not None and sec0_) else None
     bnote = apply_fork(prof, fork, scene["tracks"], lane_w, ego_j,
                        base_lanes=max(sec_ev["n"], need), branch_probe=branch_probe,
                        video=video, duration=duration, time_of=time_of) if fork and len(prof) > 1 else None
@@ -984,15 +1069,14 @@ def lane_profile_from_map(spec, scene, video, duration, branch_probe=None, log_f
         bnote = tag_branches(prof, t_v0, 0.0, video, duration, branch_probe, time_of=time_of, blocked_sides=blocked)
     _clamp_post_branch(prof)
     sec_ev = lane_profile.section_at(prof, d_ev)
-    if sec_ev["n"] < need:
-        sec_ev["n"] = need
+    _ensure_min_lanes(sec_ev, need)
     if bnote:
         spec.setdefault("notes", []).append(bnote)
         log_fn(bnote)
     road["lane_profile"] = prof
     road["lanes_per_direction"] = sec_ev["n"]
     sec0 = lane_profile.section_at(prof, 0.0)
-    j = min(int(round(left0[len(left0) // 2])), sec0["n"] - 1) if left0 else None
+    j = _ego_lane_in_section(sec0, left0, right0, spec)
     spec["ego"]["lane_index"] = None if j is None else sec0["m"] + j
     txt = ", ".join("%d lanes%s" % (sc["n"], "" if sc["d0"] is None else " from %.0f m" % sc["d0"]) for sc in prof)
     spec.setdefault("notes", []).append("lane map: %s (changes on the %s); ego lane %s from the left at the start" % (
@@ -1062,7 +1146,8 @@ def apply_replay(spec, scene, t_crash, log_fn=log):
         v_ego_ev = (float(np.interp(t_eval, [p[0] for p in sp_prof], [p[1] for p in sp_prof])) / 3.6) if sp_prof else (float(spec["ego"]["speed_kmh"]) / 3.6)
         ratio = 0.90 if conv is not None else 0.75
         overtake = bool(tr_crash and tr_crash.get("kind") == "same" and v_meas is not None and v_ego_ev > 5.0 and v_meas < ratio * v_ego_ev)
-        if overtake or lane_off >= 2 or (t_sim_ev is not None and 2.5 <= t_sim_ev <= 12.0):
+        side_strike = bool(conv and conv.get("side_strike"))
+        if overtake or lane_off >= 2 or side_strike or (t_sim_ev is not None and 2.5 <= t_sim_ev <= 12.0):
             v_kmh = round(max((v_meas or 0.0) * 3.6, 12.0), 1) if overtake else round(float(c1["speed_kmh"]), 1)
             if overtake:
                 c1["speed_kmh"] = v_kmh
@@ -1078,6 +1163,14 @@ def apply_replay(spec, scene, t_crash, log_fn=log):
                         c1["type"] = tr_crash["type"]
                     if not c1.get("color") and tr_crash.get("color") in COLORS:
                         c1["color"] = "%d,%d,%d" % COLORS[tr_crash["color"]]
+            if side_strike:
+                meas["side_strike"] = True
+                if ev.get("type") == "collision":
+                    ev["contact_parts"] = (
+                        {"ego": "left_side", "c1": "front_right"}
+                        if c1.get("lane") != "right"
+                        else {"ego": "right_side", "c1": "front_left"}
+                    )
             c1["measured"] = meas
     prof = spec["road"].get("lane_profile")
     if prof:
@@ -1118,7 +1211,18 @@ def apply_replay(spec, scene, t_crash, log_fn=log):
                     "path": [[round(t - t_v0, 2), round(s_, 2), round(d_ * k_d, 2)] for t, s_, d_ in pts],
                     "speed": [[round(p[0] - t_v0, 2), round(v * 3.6, 1)] for p, v in zip(pts, spd)]})
     spec["replay"] = rep
-    spec["actors"] = [a for a in spec["actors"] if not a["id"].startswith("b")]
+    keep_b = []
+    if spec["ego"].get("behavior") == "stopped":
+        has_rep_ahead = any(
+            r["path"] and abs(float(np.median([p[2] for p in r["path"]]))) < 1.8
+            and min(float(p[1]) for p in r["path"]) > 14.0
+            for r in rep
+        )
+        if not has_rep_ahead:
+            keep_b = [a for a in spec["actors"]
+                      if a["id"].startswith("b") and a.get("relation") == "ahead"
+                      and a.get("lane") == "same" and a.get("behavior") == "stopped"][:1]
+    spec["actors"] = [a for a in spec["actors"] if not a["id"].startswith("b")] + keep_b
     if isinstance(spec.get("traffic"), dict):
         for k in ("ego_lane_ahead", "left_lane", "right_lane", "oncoming"):
             spec["traffic"][k] = 0
@@ -1294,23 +1398,38 @@ def _is_genuine_oncoming(tr, spec, lane_w=3.5):
     return True
 
 
-def reconcile_one_way(spec, yellow_left=0.0, tracks=None, lane_w=3.5):
-    """Promote a straight divided highway to one-way when there is no yellow centerline, zero genuine oncoming traffic/tracks,
-    and strong highway cues (barrier edge, diverging highway branch, or >=3 same-direction tracks with zero oncoming)."""
+def reconcile_one_way(spec, yellow_left=0.0, tracks=None, lane_w=3.5, yellow_px=0.0):
+    """Reconcile straight-road one-way status bidirectionally:
+    - If marked one-way despite yellow centerline evidence (VLM or HSV paint) or genuine oncoming traffic/tracks, flip to two-way.
+    - If marked two-way with no yellow centerline, zero genuine oncoming traffic/tracks, and strong highway cues (barrier edge,
+      diverging highway branch, or >=3 same-direction tracks), promote to one-way."""
     road = spec.get("road") or {}
-    if road.get("type") != "straight" or road.get("one_way"):
-        return spec
-    if float(yellow_left or 0.0) >= 0.15:
-        return spec
-    traffic = spec.get("traffic") or {}
-    if int(traffic.get("oncoming", 0) or 0) > 0:
-        return spec
-    if any(a.get("relation") == "oncoming" for a in spec.get("actors") or []):
+    if road.get("type") != "straight":
         return spec
     tr_list = tracks or []
     n_same = sum(1 for t in tr_list if t.get("kind") == "same")
     n_onc = sum(1 for t in tr_list if _is_genuine_oncoming(t, spec, lane_w=lane_w))
-    if n_onc > 0:
+    has_yellow = float(yellow_left or 0.0) >= 0.15 or float(yellow_px or 0.0) >= 0.10
+    traffic = spec.get("traffic") or {}
+    has_traffic_onc = int(traffic.get("oncoming", 0) or 0) > 0
+    has_actor_onc = any(a.get("relation") == "oncoming" for a in spec.get("actors") or [])
+    if road.get("one_way"):
+        if has_yellow or n_onc > 0 or has_actor_onc:
+            road["one_way"] = False
+            onc_ids = {"r%d" % t["id"] for t in tr_list if "id" in t and _is_genuine_oncoming(t, spec, lane_w=lane_w)}
+            for r in spec.get("replay") or []:
+                if r.get("id") in onc_ids and r.get("kind") == "parked":
+                    r["kind"] = "oncoming"
+            reasons = []
+            if has_yellow:
+                reasons.append("yellow centerline %.2f/%.2f" % (float(yellow_left or 0.0), float(yellow_px or 0.0)))
+            if n_onc > 0:
+                reasons.append("%d oncoming track(s)" % n_onc)
+            if has_actor_onc:
+                reasons.append("oncoming actor")
+            spec.setdefault("notes", []).append("road set to two-way (%s)" % ", ".join(reasons))
+        return spec
+    if has_yellow or has_traffic_onc or has_actor_onc or n_onc > 0:
         return spec
     has_branch = any(isinstance(sc, dict) and sc.get("branch") for sc in (road.get("lane_profile") or []))
     has_barrier = road.get("edge_right") == "barrier" or road.get("edge_left") == "barrier"
@@ -1327,6 +1446,87 @@ def reconcile_one_way(spec, yellow_left=0.0, tracks=None, lane_w=3.5):
         if n_same >= 3:
             reasons.append("%d same-direction tracks, 0 oncoming" % n_same)
         spec.setdefault("notes", []).append("road set to one-way (%s; yellow_left=%.2f)" % (", ".join(reasons), float(yellow_left or 0.0)))
+    return spec
+
+
+def measure_crossroad_approach_traffic(spec, video, duration, t_crash, log_fn=log):
+    """Count distinct queued/same-direction vehicles in adjacent lanes during the pre-crash approach to a crossroad
+    using calibrated YOLO tracks (letterbox-cropped), raising uncovered spec['traffic'] bins so stopped queues blocking
+    sightlines are faithfully populated."""
+    if (spec.get("road") or {}).get("type") != "crossroad" or t_crash is None:
+        return spec
+    try:
+        import numpy as np
+        from agents import camera_geom, lane_lines, vehicle_tracks
+        tc = float(t_crash)
+        t_hi = max(0.5, min(float(duration) - 0.1, tc - 0.4))
+        t_lo = max(0.0, tc - 4.5)
+        if t_hi <= t_lo + 0.3:
+            return spec
+        y_b, h = lane_lines.road_bottom(video)
+        if y_b is None or h is None:
+            return spec
+        lane_rows = lane_lines.lane_timeline(video, t_lo, t_hi)
+        cam, _ = camera_geom.calibrate(lane_rows, (h, lane_lines.WIDTH))
+        v0 = 0.0 if spec["ego"].get("behavior") == "stopped" else float(spec["ego"].get("speed_kmh", 50.0)) / 3.6
+        s_ego = camera_geom.travel([(t_lo, v0), (t_hi, v0)], t_lo)
+        vx_at = camera_geom.vx_series(lane_rows, cam.vx)
+        raw = vehicle_tracks.detect_tracks(video, t_lo, t_hi, lane_lines.WIDTH)
+        tracks = vehicle_tracks.to_road_tracks(raw, cam, s_ego, y_b, vx_at=vx_at)
+        if not tracks:
+            return spec
+        L = int((spec.get("road") or {}).get("lanes_per_direction", 2) or 2)
+        ego_lane = (spec.get("ego") or {}).get("lane", "right")
+        left_lanes = (L - 1) if (ego_lane == "right" and L > 1) else 0
+        right_lanes = (L - 1) if (ego_lane == "left" and L > 1) else 0
+        lane_w = 3.5
+        s_bins = {"left_lane": [], "right_lane": [], "ego_lane_ahead": []}
+        for tr in tracks:
+            if tr.get("kind") not in ("same", "parked") or len(tr.get("t") or []) < 3:
+                continue
+            ds, ss, zs = tr.get("d") or [], tr.get("s") or [], tr.get("z") or []
+            if not ds or not ss or not zs:
+                continue
+            if min(zs) > 45.0 or max(zs) < 3.5:
+                continue
+            d_med = float(np.median(ds))
+            s_med = float(np.median(ss))
+            if left_lanes >= 1 and 1.6 <= d_med <= (left_lanes + 0.5) * lane_w + 1.5:
+                s_bins["left_lane"].append(s_med)
+            elif right_lanes >= 1 and -((right_lanes + 0.5) * lane_w + 1.5) <= d_med <= -1.6:
+                s_bins["right_lane"].append(s_med)
+            elif abs(d_med) < 1.6:
+                s_bins["ego_lane_ahead"].append(s_med)
+
+        def _distinct(vals, min_gap=4.5):
+            if not vals:
+                return 0
+            vals = sorted(vals)
+            kept = [vals[0]]
+            for v in vals[1:]:
+                if v - kept[-1] >= min_gap:
+                    kept.append(v)
+            return len(kept)
+
+        covered_b = set()
+        for a in spec.get("actors") or []:
+            if not str(a.get("id", "")).startswith("b"):
+                continue
+            if a.get("relation") == "ahead":
+                covered_b.add({"same": "ego_lane_ahead", "left": "left_lane", "right": "right_lane"}.get(a.get("lane")))
+        traffic = spec.setdefault("traffic", {"ego_lane_ahead": 0, "left_lane": 0, "right_lane": 0, "oncoming": 0, "rel_speed_kmh": 0.0})
+        counts = {k: min(_distinct(vs), 6) for k, vs in s_bins.items()}
+        raised = {}
+        for k, cnt in counts.items():
+            if cnt > 0 and k not in covered_b and cnt > int(traffic.get(k, 0) or 0):
+                traffic[k] = cnt
+                raised[k] = cnt
+        if raised:
+            msg = "crossroad approach traffic from YOLO (%d tracks): raised %s" % (len(tracks), raised)
+            spec.setdefault("notes", []).append(msg)
+            log_fn(msg)
+    except Exception as e:
+        log_fn("crossroad approach traffic unavailable: %s" % e)
     return spec
 
 
@@ -1391,7 +1591,8 @@ def phase1(video, out, spec_path=None, fps=6.0, assume_crash=True, reuse=False):
             _save(roads, os.path.join(out, "road_scores.json"))
             ego_motion = video_events.ego_motion_metrics(video, t_crash, dur) if t_crash is not None else None
             spec = refine(spec, caps, ev["events"], dur, roads, t_crash=t_crash, ego_motion=ego_motion)
-            tb = road_probes.traffic_bins(video, dur, t_crash, t1=t_active)
+            t_pre = min(dur, max(float(t_crash) - 0.3, 2.0)) if (t_crash is not None and float(t_crash) >= 2.5) else t_active
+            tb = road_probes.traffic_bins(video, dur, t_crash, t1=t_pre)
             if tb:
                 spec["traffic"] = tb
                 spec.setdefault("notes", []).append("traffic measured from the frames: %s" % {k: v for k, v in tb.items() if k != "rel_speed_kmh"})
@@ -1401,6 +1602,7 @@ def phase1(video, out, spec_path=None, fps=6.0, assume_crash=True, reuse=False):
                 spec.setdefault("notes", []).append("road edges from the frames: right %s, left %s, %s" % (
                     edges["edge_right"], edges["edge_left"], "one-way" if edges["one_way"] else "two-way"))
             yellow_left = road_probes.yellow_centerline_left(video, dur, t_crash=t_crash)
+            yellow_px = road_probes.yellow_line_left_score(video, dur, t_crash=t_crash)
             t_stages["road_probes"] = time.time() - ts
             tracked = None
             if assume_crash and t_crash is not None:
@@ -1461,6 +1663,8 @@ def phase1(video, out, spec_path=None, fps=6.0, assume_crash=True, reuse=False):
                     spec.setdefault("notes", []).append(scene["note"])
                     apply_ego_speed(spec, scene)
                     from_map = lane_profile_from_map(spec, scene, video, dur)
+                    lane_w_sc = next((x["lane_w"] for x in (scene.get("lane_samples") or []) if x.get("lane_w")), 3.5)
+                    reconcile_one_way(spec, yellow_left=yellow_left, tracks=scene.get("tracks"), lane_w=lane_w_sc, yellow_px=yellow_px)
                     if scene.get("tracks"):
                         apply_replay(spec, scene, t_crash)
                 t_stages["measured_scene"] = time.time() - ts
@@ -1472,7 +1676,10 @@ def phase1(video, out, spec_path=None, fps=6.0, assume_crash=True, reuse=False):
                         _save(lane_samples, os.path.join(out, "lane_timeline.json"))
                     t_stages["lane_profile"] = time.time() - ts
                 lane_w_sc = next((x["lane_w"] for x in ((scene or {}).get("lane_samples") or []) if x.get("lane_w")), 3.5)
-                reconcile_one_way(spec, yellow_left=yellow_left, tracks=(scene or {}).get("tracks"), lane_w=lane_w_sc)
+                reconcile_one_way(spec, yellow_left=yellow_left, tracks=(scene or {}).get("tracks"), lane_w=lane_w_sc, yellow_px=yellow_px)
+                reconcile_traffic(spec)
+            elif spec["road"]["type"] == "crossroad":
+                measure_crossroad_approach_traffic(spec, video, dur, t_crash, log_fn=log)
                 reconcile_traffic(spec)
     spec["degraded"] = degraded
     if not spec_path and os.environ.get("LLM_KEEP") != "1":

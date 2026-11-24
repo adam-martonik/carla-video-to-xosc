@@ -267,6 +267,8 @@ def normalize(obj):
                 meas["lane_offset"] = int(round(_num(m.get("lane_offset"), 1, MAX_LANES - 1, 1)))
             if m.get("t_event_s") is not None:
                 meas["t_event_s"] = round(_num(m.get("t_event_s"), 1.0, 30.0, 5.0), 2)
+            if m.get("side_strike"):
+                meas["side_strike"] = True
             act["measured"] = meas
         actors.append(act)
     spec["actors"] = actors
