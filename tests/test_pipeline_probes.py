@@ -392,6 +392,74 @@ class TestPipelineHelpers(unittest.TestCase):
         self.assertIn("expected contact parts: ego=front_left, c1=right_side", txt)
         self.assertIn("simulated contact parts: v1=front_left, v2=right_side", txt)
 
+    def test_speed_at_start_and_backfill_unitless_speeds(self):
+        c1 = local_pipeline.parse_caption(1.0, "SPEED=54MPH Two lanes ahead.")
+        self.assertAlmostEqual(c1["speed_kmh"], 54 * 1.609, places=2)
+        c2 = local_pipeline.parse_caption(2.0, "Two lanes ahead. The speed is 39")
+        self.assertIsNone(c2["speed_kmh"])
+        local_pipeline.backfill_caption_speeds([c1, c2])
+        self.assertAlmostEqual(c2["speed_kmh"], 39 * 1.609, places=2)
+
+    def test_reconcile_one_way_promotes_divided_highway_and_preserves_two_way(self):
+        hw, _ = scene_spec.normalize({"road": {"type": "straight", "one_way": False, "edge_right": "barrier"}})
+        local_pipeline.reconcile_one_way(hw, yellow_left=0.02, tracks=[{"kind": "same"}] * 4)
+        self.assertTrue(hw["road"]["one_way"])
+
+        two_way, _ = scene_spec.normalize({"road": {"type": "straight", "one_way": False, "edge_right": "shoulder"}})
+        local_pipeline.reconcile_one_way(two_way, yellow_left=0.65, tracks=[{"kind": "same"}] * 4)
+        self.assertFalse(two_way["road"]["one_way"])
+
+    def test_reconcile_one_way_ignores_false_in_carriageway_or_post_crash_oncoming_tracks(self):
+        # 4-lane highway (ego in rightmost lane): d=6.7m is inside the ego carriageway (left edge at 12.25m)
+        # and post-crash tracks after t_ev=10.1s must not block one-way promotion.
+        hw, _ = scene_spec.normalize({
+            "road": {"type": "straight", "one_way": False, "lanes_per_direction": 4, "edge_right": "barrier"},
+            "ego": {"lane": "right", "behavior": "cruise", "speed_kmh": 75.0},
+            "event": {"type": "collision", "actor_id": "c1", "time_s": 10.1},
+        })
+        hw["replay"] = [{"id": "r93", "type": "car", "color": "gray", "kind": "oncoming", "path": [[10.0, 180.0, 6.7]], "speed": [[10.0, 40.0]]}]
+        false_tracks = [
+            {"kind": "same", "d": [3.5, 3.5], "v": [15.0, 15.0], "first_t": 2.0},
+            {"kind": "same", "d": [7.0, 7.0], "v": [16.0, 16.0], "first_t": 3.0},
+            {"kind": "same", "d": [10.5, 10.5], "v": [18.0, 18.0], "first_t": 4.0},
+            {"kind": "oncoming", "d": [6.7, 6.8], "v": [2.7, 2.7], "first_t": 5.0},    # slow & inside ego carriageway
+            {"kind": "oncoming", "d": [6.7, 6.7], "v": [11.1, 11.1], "first_t": 12.6}, # inside ego carriageway & post-crash
+            {"kind": "oncoming", "d": [-5.0, -5.0], "v": [14.0, 14.0], "first_t": 4.0}, # right frontage road
+        ]
+        local_pipeline.reconcile_one_way(hw, yellow_left=0.0, tracks=false_tracks)
+        self.assertTrue(hw["road"]["one_way"])
+        self.assertEqual(hw["replay"][0]["kind"], "parked")
+
+        # Genuine fast opposite-carriageway oncoming track (2-lane undivided road, d=+7.0m > 5.25-1.0) keeps two-way
+        two_way, _ = scene_spec.normalize({
+            "road": {"type": "straight", "one_way": False, "lanes_per_direction": 2, "edge_right": "barrier"},
+            "ego": {"lane": "right", "behavior": "cruise", "speed_kmh": 60.0},
+            "event": {"type": "collision", "actor_id": "c1", "time_s": 10.0},
+        })
+        real_onc = [{"kind": "same", "d": [3.5], "v": [14.0], "first_t": 2.0}] * 3 + [
+            {"kind": "oncoming", "d": [7.2, 7.1], "v": [13.5, 14.0], "first_t": 4.0},
+        ]
+        local_pipeline.reconcile_one_way(two_way, yellow_left=0.0, tracks=real_onc)
+        self.assertFalse(two_way["road"]["one_way"])
+
+    def test_estimate_environment_classifies_clear_cloudy_and_night(self):
+        import cv2, numpy as np
+        def encode(bgr):
+            return [cv2.imencode(".jpg", bgr)[1].tobytes()]
+        # Clear sunny: blue sky on top (B=220,G=160,R=80), road below
+        sunny = np.full((120, 160, 3), (120, 125, 130), dtype=np.uint8)
+        sunny[:45] = (220, 160, 80)
+        cloudy = np.full((120, 160, 3), (110, 110, 110), dtype=np.uint8)
+        cloudy[:45] = (185, 185, 185)
+        cloudy[60:, ::2] = (60, 60, 60)
+        night = np.full((120, 160, 3), (20, 20, 25), dtype=np.uint8)
+        with mock.patch.object(road_probes.video_events, "grab_frames", return_value=encode(sunny)):
+            self.assertEqual(road_probes.estimate_environment("v.mp4", 10.0), {"time_of_day": "day", "weather": "clear"})
+        with mock.patch.object(road_probes.video_events, "grab_frames", return_value=encode(cloudy)):
+            self.assertEqual(road_probes.estimate_environment("v.mp4", 10.0), {"time_of_day": "day", "weather": "cloudy"})
+        with mock.patch.object(road_probes.video_events, "grab_frames", return_value=encode(night)):
+            self.assertEqual(road_probes.estimate_environment("v.mp4", 10.0), {"time_of_day": "night", "weather": "clear"})
+
 
 if __name__ == "__main__":
     unittest.main()

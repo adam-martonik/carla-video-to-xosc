@@ -182,6 +182,8 @@ secrets.json
 # Data files (if large)
 *.csv
 *.json
+!tests/fixtures/*.json
+!tests/golden/*.json
 *.xml
 *.mp4
 *.avi

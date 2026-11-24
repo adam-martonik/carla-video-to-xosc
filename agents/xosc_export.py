@@ -32,14 +32,16 @@ class TrajectoryRecorder:
     def __init__(self):
         self.samples = {}
 
-    def record(self, t, actors):
+    def record(self, t, actors, speed_overrides=None):
+        overrides = speed_overrides or {}
         for aid, actor in actors.items():
             if not actor.is_alive:
                 continue
             tf, vel = actor.get_transform(), actor.get_velocity()
+            spd = float(overrides[aid]) if aid in overrides else math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
             self.samples.setdefault(aid, []).append([
                 round(float(t), 3), round(tf.location.x, 3), round(tf.location.y, 3), round(tf.location.z, 3),
-                round(tf.rotation.yaw, 2), round(math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2), 3)])
+                round(tf.rotation.yaw, 2), round(spd, 3)])
 
     def to_dict(self, meta=None, dt=None):
         """meta: {actor_id: {"type": ..., "blueprint": ..., "color": ...}}"""
@@ -85,13 +87,16 @@ def build_scenario(recording, plan, xodr_name=None, result=None, dt=0.1, hold_s=
             report[aid] = "skipped (fewer than 2 samples)"
             continue
         wx, wy, wh = zip(*(carla_to_world(r[1], r[2], r[4]) for r in s))
+        wz = s[:, 3]
         vtype = rec.get("type", "car")
         sm = traj_smoothing.smooth_trajectory(s[:, 0], wx, wy, vtype, dt=dt, initial_heading=wh[0])
+        z_out = np.interp(sm["times"], s[:, 0], wz)
         lim = traj_smoothing.limits_for(vtype)
         entities.append({
             "name": aid, "ego": aid == ego, "kind": "pedestrian" if vtype == "pedestrian" else "vehicle", "vtype": vtype,
             "blueprint": rec.get("blueprint"), "color": rec.get("color"),
-            "times": sm["times"].tolist(), "x": sm["x"].tolist(), "y": sm["y"].tolist(), "h": sm["h"].tolist(), "v": sm["v"].tolist(),
+            "times": sm["times"].tolist(), "x": sm["x"].tolist(), "y": sm["y"].tolist(), "z": z_out.tolist(),
+            "h": sm["h"].tolist(), "v": sm["v"].tolist(),
             "limits": {"max_speed": lim["max_speed"], "max_accel": lim["max_accel"], "max_decel": lim["max_decel"]}})
         report[aid] = {"samples": int(len(s)), "max_deviation_m": round(sm["max_deviation_m"], 3)}
         t_end = max(t_end, float(sm["times"][-1]))
@@ -99,8 +104,11 @@ def build_scenario(recording, plan, xodr_name=None, result=None, dt=0.1, hold_s=
         raise ValueError("the recording has no actor with at least 2 samples")
     if ego is None or not any(e["ego"] for e in entities):
         entities[0]["ego"] = True       # ScenarioRunner needs an actor called "hero"
-    return {"scene_id": (plan or {}).get("scene_id"), "duration": t_end, "xodr": xodr_name, "entities": entities,
-            "description": description or ("Recorded CARLA run; cropped at first impact" if t_cut is not None else "Recorded CARLA run")}, report
+    sc_out = {"scene_id": (plan or {}).get("scene_id"), "duration": t_end, "xodr": xodr_name, "entities": entities,
+              "description": description or ("Recorded CARLA run; cropped at first impact" if t_cut is not None else "Recorded CARLA run")}
+    if isinstance((plan or {}).get("environment"), dict):
+        sc_out["environment"] = dict(plan["environment"])
+    return sc_out, report
 
 
 def export_scene(out_dir, scene_id, dt=0.1, hold_s=0.3, xsd_path=None):

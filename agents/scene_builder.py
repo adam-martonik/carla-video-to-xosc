@@ -171,10 +171,10 @@ class Road:
 
 
 SPLIT_GAP_M = 4.0          # half length of the junction where a branch leaves
-DIVERGE_LEN_M = 90.0       # a branch moves this far along the road while it pulls away sideways
-DIVERGE_D_M = 6.0          # ... by this much (the strip between the ego road and the branch)
+DIVERGE_LEN_M = 100.0      # a branch moves this far along the road while it pulls away sideways
+DIVERGE_D_M = 10.0         # ... by this much (the strip between the ego road and the branch)
 RISE_LEN_M = 100.0         # a branch reaches its full height this far after it starts to climb (6 m: ~6 % average)
-RISE_START_M = 54.0        # ... which it does only once it has pulled away (60 % of DIVERGE_LEN_M: about 3.9 m apart), so the
+RISE_START_M = 55.0        # ... which it does only once it has pulled away (about 5.7 m apart), so the
                            # two roads never meet at different heights
 
 
@@ -878,11 +878,23 @@ def _replay_agents(replay, road, lane_idx, s_ego0, agents, plan_agents, idmap, c
 
     if kin_candidates:
         ts_grid = [round(0.2 * i, 2) for i in range(int(round((duration_s + 3.0) / 0.2)) + 1)]
+        b_idx = split_index(road)
+        br_sec = road.sections[b_idx] if b_idx is not None else None
+        br_prev = road.sections[b_idx - 1] if b_idx is not None else None
+        br_left = bool(br_sec and br_sec["branch"]["side"] == "left")
+        br_edge_d = (-br_sec["m"] * W) if (br_sec and br_left) else (-(br_sec["m"] + br_sec["n"]) * W if br_sec else None)
         kin_tracks = []
         for kc in kin_candidates:
             ts_r, ss_r, ds_r = kc["ts_raw"], kc["ss_raw"], kc["ds_raw"]
             d_span = (max(ds_r) - min(ds_r)) if ds_r else 0.0
-            d_flat = sorted(ds_r)[len(ds_r) // 2] if (ds_r and d_span < 2.8) else None
+            on_branch = False
+            if br_sec is not None and ds_r and ss_r:
+                lats_r = [d_ego + dd for dd in ds_r]
+                if br_left and any(lt >= br_edge_d - 0.5 * W for lt in lats_r):
+                    on_branch = True
+                elif (not br_left) and any(lt <= br_edge_d + 0.5 * W for lt in lats_r):
+                    on_branch = True
+            d_flat = sorted(ds_r)[len(ds_r) // 2] if (ds_r and d_span < 2.8 and not on_branch) else None
             s_arr, d_arr = [None] * len(ts_grid), [None] * len(ts_grid)
             act_idx, act_s, act_d = [], [], []
             for idx_g, tg in enumerate(ts_grid):
@@ -981,6 +993,30 @@ def _road_with_profile(spec, road, s_ego0, d_event, ev_actor, min_length=None):
             for sc in prof]
     new = Road("straight", spec["road"]["lanes_per_direction"], spec["road"].get("centerline"), spec["road"].get("one_way", False), min_length=min_length)
     secs = [sc for sc in secs if sc["s1"] > 1.0 and sc["s0"] < new.length - 1.0]
+    # Defensive geometric invariant: after a diverging branch, the continuing road cannot regrow lanes into the branch side.
+    bi_p = next((i for i in range(1, len(secs)) if secs[i].get("branch")), None)
+    if bi_p is not None:
+        b_s = secs[bi_p]
+        b_sd = b_s["branch"].get("side")
+        for sc in secs[bi_p + 1:]:
+            if b_sd == "left" and sc["m"] < b_s["m"]:
+                cut = b_s["m"] - sc["m"]
+                sc["m"] = b_s["m"]
+                sc["n"] = max(1, sc["n"] - cut)
+            elif b_sd == "right":
+                r_lim = b_s["m"] + b_s["n"]
+                if sc["m"] >= r_lim:
+                    sc["m"] = max(0, r_lim - 1)
+                    sc["n"] = 1
+                elif sc["m"] + sc["n"] > r_lim:
+                    sc["n"] = max(1, r_lim - sc["m"])
+        mi = bi_p
+        while mi + 1 < len(secs):
+            if not secs[mi + 1].get("branch") and secs[mi]["n"] == secs[mi + 1]["n"] and secs[mi]["m"] == secs[mi + 1]["m"]:
+                secs[mi]["s1"] = secs[mi + 1]["s1"]
+                secs.pop(mi + 1)
+            else:
+                mi += 1
     if len(secs) < 2:
         return road, (0 if spec["ego"]["lane"] == "right" or road.L == 1 else road.L - 1), \
             "lane profile: the count does not change on the simulated stretch"
@@ -996,6 +1032,45 @@ def _road_with_profile(spec, road, s_ego0, d_event, ev_actor, min_length=None):
     if ev_actor is not None and (ev_actor["relation"] == "beside" or ev_actor["behavior"] == "cutting_in"):
         step = 1 if ev_actor["lane"] != "right" else -1
         ok = [q for q in ks if new.has_lane(s_ego0, q + step) and new.has_lane(s_ego0 + d_event, q + step) and new.has_lane(s_ego0 + d_event, q)]
+        if not ok:
+            has_branch = any(sc.get("branch") for sc in secs)
+            ev_sec = new.section(s_ego0 + d_event)
+            # When the profile contains a diverging branch (or has >= 2 lanes at the event and only section 0 lacked the
+            # source lane due to a narrow start), repair the section widths so the diverging road is preserved instead of
+            # discarding the entire lane_profile.
+            if has_branch or ev_sec["n"] >= 2:
+                repaired = [dict(sc) for sc in secs]
+                ev_idx = next((i for i, sc in enumerate(repaired) if (s_ego0 + d_event) < sc["s1"]), len(repaired) - 1)
+                if repaired[ev_idx]["n"] < 2:
+                    # Widen post-split ego road to 2 lanes on the non-branch side so the cut-in fits alongside the fork
+                    b_i = next((i for i, sc in enumerate(repaired) if sc.get("branch")), None)
+                    b_side = repaired[b_i]["branch"]["side"] if b_i is not None else ("right" if step > 0 else "left")
+                    for sc in repaired[ev_idx:]:
+                        if sc["n"] < 2:
+                            if b_side == "left":
+                                sc["n"] = 2
+                            else:
+                                sc["m"] = max(0, sc["m"] - (2 - sc["n"]))
+                                sc["n"] = 2
+                # Ensure section 0 covers the event section's lanes so both ego and the cutting car have lanes from s_ego0
+                e_m, e_end = repaired[ev_idx]["m"], repaired[ev_idx]["m"] + repaired[ev_idx]["n"]
+                s0_m = min(repaired[0]["m"], e_m)
+                s0_end = max(repaired[0]["m"] + repaired[0]["n"], e_end)
+                if s0_end - s0_m <= 6:
+                    repaired[0]["m"], repaired[0]["n"] = s0_m, s0_end - s0_m
+                lo_r = min(sc["m"] for sc in repaired)
+                for sc in repaired:
+                    sc["m"] -= lo_r
+                if max(sc["m"] + sc["n"] for sc in repaired) <= 6:
+                    cand = Road("straight", spec["road"]["lanes_per_direction"], spec["road"].get("centerline"),
+                                spec["road"].get("one_way", False), repaired, min_length=min_length)
+                    ks_r = cand.lanes_at(s_ego0)
+                    ok_r = [q for q in ks_r if cand.has_lane(s_ego0, q + step) and cand.has_lane(s_ego0 + d_event, q + step) and cand.has_lane(s_ego0 + d_event, q)]
+                    if ok_r:
+                        new, ks, ok = cand, ks_r, ok_r
+                        k = new.L - 1 - (idx - lo_r) if idx is not None else None
+                        if k not in ks:
+                            k = min(ks) if spec["ego"]["lane"] == "right" or len(ks) == 1 else max(ks)
         if not ok:                      # the crash matters more than the lane count: keep the road the crash needs
             return road, (0 if spec["ego"]["lane"] == "right" or road.L == 1 else road.L - 1), \
                 "lane profile dropped: no lane on the %s of the ego car for %s's merge at the event" % (
@@ -1055,7 +1130,9 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
         lane_idx = 0 if ego["lane"] == "right" else road.L - 1
     if road.kind == "straight" and spec["road"].get("lane_profile") and not (third_party and not straight_tp_cross):
         s_ego0 = 65.0 if straight_tp_cross else S_START
-        road, lane_idx, pnote = _road_with_profile(spec, road, s_ego0, v_e * T, ev_actor, min_length=min_len)
+        ego_trav_est = _ego_travel({"mode": "static" if ego["behavior"] == "stopped" else "drive",
+                                    "speed_profile": ego.get("speed_profile")}, v_e)(T)
+        road, lane_idx, pnote = _road_with_profile(spec, road, s_ego0, ego_trav_est, ev_actor, min_length=min_len)
         notes.append(pnote)
     if third_party and not straight_tp_cross:
         # the crash is between two other road users: they meet in the junction while the ego car passes by
@@ -1558,6 +1635,57 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
         notes += _replay_agents(spec["replay"], road, lane_idx, s_ego_rp0, agents, plan_agents, idmap,
                                 corridors, duration_s=round(T + 5.0, 1))
 
+    # ---- optional non-conflicting cruisers on an empty diverging branch (only for rich scenes with traffic/replay)
+    if road.kind == "straight" and split_index(road) is not None and (spec.get("replay") or any(a["id"].startswith("b") for a in spec.get("actors") or [])):
+        b_i = split_index(road)
+        a_sec, b_sec = road.sections[b_i - 1], road.sections[b_i]
+        s_b = b_sec["s0"]
+        left_b = b_sec["branch"]["side"] == "left"
+        leave_j = list(range(a_sec["m"], b_sec["m"])) if left_b else list(range(b_sec["m"] + b_sec["n"], a_sec["m"] + a_sec["n"]))
+        br_edge = -b_sec["m"] * W if left_b else -(b_sec["m"] + b_sec["n"]) * W
+        has_br_car = False
+        for vid_k, p_k in plan_agents.items():
+            kt = (p_k or {}).get("kinematic_track") or []
+            for row in kt:
+                sr, dr = road.frame.to_sd(row[1], row[2])
+                if sr > s_b + 10.0 and ((left_b and dr > br_edge + 0.5) or (not left_b and dr < br_edge - 0.5)):
+                    has_br_car = True
+                    break
+            if has_br_car:
+                break
+        if not has_br_car and leave_j:
+            dur_br = round(T + 5.0, 1)
+            v_br = max(v_e * 1.05, 16.0)
+            for idx_bc, (s_off_b, j_b, col_b, vt_b) in enumerate(((25.0, leave_j[0], "175,175,180", "car"),
+                                                                  (60.0, leave_j[-1], "235,235,235", "suv"))):
+                s_init = s_b + s_off_b
+                if s_init >= road.end_s - 40.0:
+                    continue
+                kt_rows = []
+                tg = 0.0
+                while tg <= dur_br + 2.5:
+                    s_cur = s_init + v_br * tg
+                    if s_cur > road.end_s:
+                        break
+                    f_d = DIVERGE_D_M * _smooth((s_cur - s_b) / DIVERGE_LEN_M) * (1.0 if left_b else -1.0)
+                    d_cur = -(j_b + 0.5) * W + f_d
+                    x_c, y_c = road.frame.to_xy(s_cur, d_cur)
+                    kt_rows.append([round(tg, 2), round(x_c, 2), round(y_c, 2), round(road.lane_heading(s_cur), 1), round(v_br, 2)])
+                    tg = round(tg + 0.2, 2)
+                if len(kt_rows) >= 2:
+                    for k_r in range(len(kt_rows) - 1):
+                        dx_r = kt_rows[k_r + 1][1] - kt_rows[k_r][1]
+                        dy_r = kt_rows[k_r + 1][2] - kt_rows[k_r][2]
+                        if math.hypot(dx_r, dy_r) > 0.1:
+                            kt_rows[k_r][3] = round(math.degrees(math.atan2(dy_r, dx_r)), 1)
+                    kt_rows[-1][3] = kt_rows[-2][3]
+                    vid_b = "v%d" % (len(agents) + 1)
+                    bid = "br%d" % (idx_bc + 1)
+                    agents[vid_b] = {"type": vt_b, "x": kt_rows[0][1], "y": kt_rows[0][2], "heading": kt_rows[0][3]}
+                    idmap[bid] = vid_b
+                    plan_agents[vid_b] = {"mode": "drive", "speed_kmh": round(v_br * 3.6, 1), "already_moving": True,
+                                          "avoid": False, "color": col_b, "replay": bid, "kinematic_track": kt_rows}
+
     # ---- write files ----------------------------------------------------------------------------------
     ag_dict = {}
     for vid, a in agents.items():
@@ -1575,10 +1703,24 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
         road_plan["xodr_pieces"] = xodr_pieces(road)
         b_i = split_index(road)
         if b_i is not None:
-            # the roads on the inner side of a fork face each other: no shoulder there, it would lie on the other road
-            road_plan["no_shoulder"] = ["branch"] if road.sections[b_i]["branch"]["side"] == "left" else ["eastbound_after"]
+            a_sec, b_sec = road.sections[b_i - 1], road.sections[b_i]
+            br = b_sec["branch"]
+            b_side = br["side"]
+            leave_j = list(range(a_sec["m"], b_sec["m"])) if b_side == "left" else list(range(b_sec["m"] + b_sec["n"], a_sec["m"] + a_sec["n"]))
+            # the roads on the inner side of a fork face each other: skip ONLY their inner facing shoulders so outer shoulders
+            # remain intact and inner asphalt never overlaps across the gore
+            road_plan["no_shoulder"] = ["branch"] if b_side == "left" else ["eastbound_after"]
+            road_plan["no_shoulder_sides"] = ({"branch": ["right"], "eastbound_after": ["left"]} if b_side == "left"
+                                              else {"branch": ["left"], "eastbound_after": ["right"]})
+            road_plan["fork"] = {
+                "s_b": round(b_sec["s0"], 2), "side": b_side, "rise_m": round(float(br.get("rise_m", 0.0)), 2),
+                "leave_j": leave_j, "diverge_len_m": DIVERGE_LEN_M, "diverge_d_m": DIVERGE_D_M,
+                "rise_start_m": RISE_START_M, "rise_len_m": RISE_LEN_M,
+            }
     plan = {"ego": "v1", "duration_s": round(T + 5.0, 1), "expect": expect, "agents": plan_agents, "idmap": idmap,
             "notes": notes, "source": "scene_builder", "road": road_plan}
+    if isinstance(spec.get("environment"), dict):
+        plan["environment"] = dict(spec["environment"])
     _write_json(os.path.join(out_dir, scene_id + "_motion.json"), plan)
     _write_json(os.path.join(out_dir, scene_id + "_spec.json"), spec)
     return plan

@@ -127,6 +127,27 @@ class TestExportScene(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "motion_runner"):
                 xosc_export.export_scene(tmp, "nope")
 
+    def test_kinematic_speed_override_and_3d_elevation_preserved_in_xosc(self):
+        rec = xosc_export.TrajectoryRecorder()
+        rec.record(0.05, {"v1": FakeActor(1, 2, 0, 0.0)}, speed_overrides={"v1": 15.5})
+        self.assertEqual(rec.samples["v1"][0][5], 15.5)
+
+        r = recording(n=40, dt=0.05)
+        # v2 climbs from z=0.2 to z=6.0 along an elevated diverging branch
+        for i, row in enumerate(r["actors"]["v2"]["samples"]):
+            row[3] = round(0.2 + 5.8 * i / 39.0, 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "e_trajectories.json").write_text(json.dumps(r))
+            (tmp / "e_motion.json").write_text(json.dumps({"ego": "v1", "environment": {"time_of_day": "day", "weather": "cloudy"}}))
+            (tmp / "e.xodr").write_text("<OpenDRIVE/>")
+            out, _ = xosc_export.export_scene(str(tmp), "e", xsd_path=XSD if XSD.exists() else None)
+            root = ET.parse(out).getroot()
+            v2_verts = root.findall(".//Trajectory[@name='Traj_v2']//WorldPosition")
+            zs = [float(wp.get("z")) for wp in v2_verts]
+            self.assertGreater(max(zs), 5.0)
+            self.assertEqual(root.find(".//Weather").get("cloudState"), "overcast")
+
 
 if __name__ == "__main__":
     unittest.main()

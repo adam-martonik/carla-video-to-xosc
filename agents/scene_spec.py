@@ -30,6 +30,8 @@ EVENTS = ("collision", "near_miss", "none")
 
 EDGES = ("barrier", "shoulder", "open")
 TRAFFIC_LANES = ("ego_lane_ahead", "left_lane", "right_lane", "oncoming")
+TIME_OF_DAY = ("day", "dusk", "night")
+WEATHERS = ("clear", "cloudy", "rain", "fog")
 MAX_TRAFFIC = 12
 MAX_LANES = 6
 
@@ -291,6 +293,12 @@ def normalize(obj):
             spec["event"]["contact_parts"] = clean_cp
     if spec["event"]["type"] != "none" and spec["event"]["actor_id"] is None:
         spec["event"]["type"] = "none"      # an event needs an actor
+    env = obj.get("environment")
+    if isinstance(env, dict):
+        spec["environment"] = {
+            "time_of_day": _pick(env.get("time_of_day"), TIME_OF_DAY, "day"),
+            "weather": _pick(env.get("weather"), WEATHERS, "clear"),
+        }
     return spec, None
 
 

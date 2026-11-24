@@ -611,6 +611,31 @@ class TestMultiLaneCutInAndParts(unittest.TestCase):
         self.assertIn("mid_early", plan["idmap"])
         self.assertIn("r76", plan["idmap"])
 
+    def test_converging_cutin_syncs_vehicle_type_when_impact_time_shifts(self):
+        # VLM picked an SUV at coarse t_crash=8.6s, but the converging cutter hits at 10.1s and is a white sedan ("car")
+        t_late = [8.9 + 0.1 * i for i in range(11)]
+        cutter = {"id": 64, "type": "car", "color": "white", "kind": "same", "t": t_late,
+                  "s": [110 + 10.5 * 0.1 * i for i in range(11)], "z": [7.2 - 0.1 * i for i in range(11)],
+                  "d": [5.8, 5.6, 5.4, 5.2, 5.0, 4.7, 4.4, 4.1, 3.8, 3.5, 3.2],
+                  "v": [11.5] * 11, "first_t": 8.9, "last_t": 9.9}
+        spec = spec_with([{"id": "c1", "type": "suv", "relation": "beside", "lane": "left",
+                           "behavior": "cutting_in", "color": "240,240,240"}],
+                         {"type": "collision", "actor_id": "c1", "time_s": 8.6})
+        spec["road"]["lanes_per_direction"] = 3
+        scene = {"tracks": [cutter], "speeds": [[0.0, 15.0], [15.0, 15.0]],
+                 "speed_source": "overlay", "t_v0": 0.6, "t_hi": 13.6, "lane_samples": []}
+        local_pipeline.apply_replay(spec, scene, 8.6)
+        self.assertEqual(spec["actors"][0]["type"], "car")
+        self.assertGreater(spec["event"]["time_s"], 9.5)
+
+        # When VLM's t_crash is already close (<0.8s) to t_impact, keep VLM's finer "suv" class
+        spec_close = spec_with([{"id": "c1", "type": "suv", "relation": "beside", "lane": "left",
+                                 "behavior": "cutting_in", "color": "240,240,240"}],
+                               {"type": "collision", "actor_id": "c1", "time_s": 9.8})
+        spec_close["road"]["lanes_per_direction"] = 3
+        local_pipeline.apply_replay(spec_close, scene, 9.8)
+        self.assertEqual(spec_close["actors"][0]["type"], "suv")
+
     def test_enforce_replay_headway_no_teleport_when_lead_clears(self):
         ts = [round(0.2 * k, 2) for k in range(31)]  # 0.0 .. 6.0 s
         # Lead moves slowly at 4 m/s for first 2.6 s then leaves into adjacent lane (-3.5 -> 0.0)
@@ -681,3 +706,85 @@ class TestMultiLaneCutInAndParts(unittest.TestCase):
         kt = plan["agents"][plan["idmap"]["r34"]]["kinematic_track"]
         ys = [row[2] for row in kt]
         self.assertLess(max(ys) - min(ys), 0.3)
+
+
+class TestForkAndResilienceFixes(unittest.TestCase):
+    def test_paint_channel_prevents_twinlitenet_ribbon_from_clipping_dashed_highway_lanes(self):
+        # TwinLiteNet outputs a continuous ribbon on a dashed left divider (line=10 everywhere),
+        # while the raw paint channel only fires on dashes (~33% of rows) -> must NOT clip left lanes.
+        g = synthetic_grid(2, 0, s_max=60.0)
+        d = np.array([g.d_of(j) for j in range(g.nd)])
+        dash_rows = (np.arange(g.ns) % 6) < 2
+        left_div = np.abs(d - 1.75) < 0.25
+        right_edge = np.abs(d - (-1.75)) < 0.25
+        g.line[:, left_div] = 10.0                                          # TwinLiteNet ribbon fills dashes solid
+        g.seen_p[:] = 10.0
+        g.paint[:, left_div] = 10.0 * dash_rows[:, None]                    # raw paint preserves dashes
+        g.paint[:, right_edge] = 10.0                                       # right edge truly solid
+        nl, nr, _ = bev_lanes.count_slice(g, 30.0, 3.5)
+        self.assertEqual(nl, 2)
+        self.assertEqual(nr, 0)
+
+    def test_apply_fork_synthesizes_diverging_branch_even_from_constant_lane_profile(self):
+        from agents import lane_lines
+        # BEV lane map saw constant 2 lanes, but 2 tracked cars physically diverge to the left from s=70 m
+        samples = [{"t": float(s), "lanes_left": 1.0, "lanes_right": 0.0, "road_lanes": 2.0, "lane_w": 3.5,
+                    "probs": lane_lines.count_probs(2.0)} for s in range(0, 180, 3)]
+        tracks = [drift_track(1, 5.5, 0.22, s0=68.0, ratio=1.5), drift_track(2, 8.5, 0.24, s0=74.0, ratio=1.4)] + \
+                 [drift_track(10 + k, 3.5, 0.0, ratio=1.0) for k in range(4)]
+        scene = {"tracks": tracks, "speeds": [[0.0, 15.0], [15.0, 15.0]], "speed_source": "overlay",
+                 "t_v0": 0.0, "t_hi": 12.0, "lane_samples": samples}
+        spec = spec_with([{"id": "c1", "relation": "beside", "lane": "left", "behavior": "cutting_in"}],
+                         {"type": "collision", "actor_id": "c1", "time_s": 8.0})
+        ok = local_pipeline.lane_profile_from_map(spec, scene, "v.mp4", 15.0, log_fn=lambda m: None)
+        self.assertTrue(ok)
+        prof = spec["road"]["lane_profile"]
+        self.assertIsNotNone(prof)
+        self.assertEqual(len(prof), 2)
+        self.assertEqual(prof[1]["branch"], {"side": "left", "rise_m": 6.0})
+        self.assertGreater(prof[0]["n"], prof[1]["n"])
+
+    def test_yolo_no_download_guard_and_measure_scene_degrades_without_yolo(self):
+        from unittest import mock
+        from agents import lane_lines
+        saved_m = vehicle_tracks._MODEL.pop("m", None)
+        try:
+            with mock.patch.dict(os.environ, {"AS_NO_DOWNLOAD": "1"}), \
+                    mock.patch.object(vehicle_tracks, "WEIGHTS", os.path.join(tempfile.gettempdir(), "nonexistent_yolo26n.pt")):
+                with self.assertRaises(FileNotFoundError):
+                    vehicle_tracks._yolo()
+        finally:
+            if saved_m is not None:
+                vehicle_tracks._MODEL["m"] = saved_m
+        # measure_scene keeps overlay ego speeds and BEV samples even when YOLO detect_tracks raises
+        spec = spec_with(speed=60.0)
+        caps = [{"t": float(i), "speed_kmh": 60.0} for i in range(15)]
+        lane_rows = [{"t": 0.5 * i, "vp": [480.0, 220.0], "ratio": 2.8} for i in range(20)]
+        fake_samples = [{"t": float(s), "lanes_left": 1.0, "lanes_right": 0.0, "road_lanes": 2.0,
+                         "probs": lane_lines.count_probs(2.0)} for s in range(0, 120, 5)]
+        with mock.patch.object(lane_lines, "road_bottom", return_value=(360, 540)), \
+                mock.patch.object(camera_geom, "focal_from_dashes", return_value=(None, 0)), \
+                mock.patch.object(vehicle_tracks, "detect_tracks", side_effect=RuntimeError("offline")), \
+                mock.patch.object(bev_lanes, "accumulate", return_value=synthetic_grid(1, 0, s_max=150.0)), \
+                mock.patch.object(bev_lanes, "lane_samples", return_value=fake_samples):
+            sc = local_pipeline.measure_scene(spec, "v.mp4", 15.0, caps, lane_rows=lane_rows, log_fn=lambda m: None)
+        self.assertIsNotNone(sc)
+        self.assertEqual(sc["speed_source"], "overlay")
+        self.assertEqual(sc["tracks"], [])
+        self.assertEqual(len(sc["lane_samples"]), len(fake_samples))
+        self.assertIn("YOLO degraded", sc["note"])
+
+    def test_branch_replay_track_is_not_flattened_and_empty_branch_gets_cruisers(self):
+        from test_lane_profile import LEFT_FLYOVER
+        spec = spec_with([{"id": "c1", "relation": "beside", "lane": "left", "behavior": "cutting_in"},
+                          {"id": "b1", "relation": "ahead", "lane": "left", "behavior": "driving", "distance_m": 25.0, "speed_kmh": 35.0}],
+                         {"type": "collision", "actor_id": "c1", "time_s": 8.0}, speed=54.0)
+        spec["road"]["lane_profile"] = LEFT_FLYOVER
+        spec["road"]["one_way"] = True
+        spec["ego"]["lane_index"] = 4
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        plan = scene_builder.build(spec, tmp.name, "br_pop")
+        self.assertIn("br1", plan["idmap"])
+        self.assertIn("fork", plan["road"])
+        self.assertEqual(plan["road"]["no_shoulder_sides"], {"branch": ["right"], "eastbound_after": ["left"]})

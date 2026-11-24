@@ -1,0 +1,49 @@
+{
+ "road": {
+  "type": "crossroad",
+  "lanes_per_direction": 2,
+  "traffic_signals": true,
+  "one_way": false,
+  "edge_right": "open",
+  "edge_left": "open",
+  "centerline": null,
+  "curve_note": null,
+  "lane_profile": null
+ },
+ "traffic": {
+  "ego_lane_ahead": 0,
+  "left_lane": 0,
+  "right_lane": 0,
+  "oncoming": 0,
+  "rel_speed_kmh": 0.0
+ },
+ "ego": {
+  "type": "car",
+  "lane": "right",
+  "lane_index": null,
+  "speed_kmh": 50.0,
+  "behavior": "cruise",
+  "color": null,
+  "speed_profile": null
+ },
+ "actors": [
+  {
+   "id": "c1",
+   "type": "suv",
+   "relation": "cross_left",
+   "lane": "same",
+   "distance_m": 7.5,
+   "speed_kmh": 20.0,
+   "behavior": "crossing",
+   "color": "175,175,180"
+  }
+ ],
+ "event": {
+  "type": "collision",
+  "actor_id": "c1",
+  "actor2_id": null,
+  "time_s": 4.5,
+  "description": "a silver suv crosses from the left at an intersection"
+ },
+ "replay": []
+}

@@ -112,6 +112,31 @@ class TestShoulders(unittest.TestCase):
             succs = [int(l.find("link/successor").get("id")) for l in r64.findall("lanes/laneSection/right/lane")]
             self.assertEqual(succs, [-1, -2, -3])
 
+    def test_fork_shoulders_skip_only_inner_gore_sides_and_keep_outer_shoulders(self):
+        prof = [{"d0": None, "d1": 65.0, "n": 4, "m": 0},
+                {"d0": 65.0, "d1": None, "n": 2, "m": 2, "branch": {"side": "left", "rise_m": 6.0}}]
+        spec = {"road": {"type": "straight", "lanes_per_direction": 2, "traffic_signals": False, "one_way": True,
+                         "edge_right": "barrier", "edge_left": "barrier", "lane_profile": prof},
+                "ego": {"type": "car", "lane": "right", "lane_index": 3, "speed_kmh": 55.0, "behavior": "cruise"},
+                "actors": [], "event": {"type": "none", "actor_id": None, "actor2_id": None, "time_s": 5.0, "description": ""}}
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = scene_builder.build(spec, tmp, "fk")
+            x = map_builder.net_to_xodr(os.path.join(tmp, "fk.net.xml"), os.path.join(tmp, "fk.xodr"))
+            map_builder.add_shoulders(x, 3.0, ("right", "left"), one_way=True,
+                                      skip_roads=tuple(plan["road"].get("no_shoulder") or ()),
+                                      skip_road_sides=plan["road"].get("no_shoulder_sides"))
+            by_sumo = {}
+            for r in ET.parse(x).getroot().iter("road"):
+                ud = r.find("userData")
+                if ud is not None:
+                    by_sumo[ud.get("value")] = r
+            # eastbound_after keeps right outer shoulder, NO inner left shoulder overlapping branch
+            self.assertEqual(lanes(by_sumo["eastbound_after"], "right")[-1].get("type"), "shoulder")
+            self.assertEqual(lanes(by_sumo["eastbound_after"], "left"), [])
+            # branch keeps left outer shoulder, NO inner right shoulder overlapping eastbound_after
+            self.assertEqual(lanes(by_sumo["branch"], "left")[0].get("type"), "shoulder")
+            self.assertTrue(all(l.get("type") == "driving" for l in lanes(by_sumo["branch"], "right")))
+
 
 if __name__ == "__main__":
     unittest.main()

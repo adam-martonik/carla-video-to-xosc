@@ -31,11 +31,38 @@ SIDE_VIEW_AR = 1.9            # width / height of a box above which the vehicle 
 _MODEL = {}
 
 
+def _download_weights(url=WEIGHTS_URL, dest=WEIGHTS, timeout=60):
+    """Download YOLO weights atomically to `dest` (creating parent directories)."""
+    import urllib.request
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".tmp"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "carla-video-to-xosc/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as out:
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                out.write(chunk)
+        os.replace(tmp, dest)
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
+    return dest
+
+
 def _yolo():
     if "m" not in _MODEL:
         from ultralytics import YOLO
         if not os.path.exists(WEIGHTS):
-            raise FileNotFoundError("YOLO weights missing: download %s to %s" % (WEIGHTS_URL, WEIGHTS))
+            if os.environ.get("AS_NO_DOWNLOAD") == "1":
+                raise FileNotFoundError("YOLO weights missing (AS_NO_DOWNLOAD=1): %s" % WEIGHTS)
+            print("[tracks] downloading %s -> %s" % (WEIGHTS_URL, WEIGHTS), flush=True)
+            _download_weights(WEIGHTS_URL, WEIGHTS)
         _MODEL["m"] = YOLO(WEIGHTS)
     return _MODEL["m"]
 

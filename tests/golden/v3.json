@@ -1,0 +1,57 @@
+{
+ "motion": {
+  "agents": {
+   "v1": {
+    "already_moving": true,
+    "avoid": false,
+    "mode": "drive",
+    "path": [
+     [
+      105.25,
+      190.0
+     ]
+    ],
+    "speed_kmh": 50.0
+   },
+   "v2": {
+    "already_moving": true,
+    "avoid": false,
+    "color": "175,175,180",
+    "mode": "drive",
+    "path": [
+     [
+      190.0,
+      94.75
+     ]
+    ],
+    "speed_kmh": 20.0
+   }
+  },
+  "duration_s": 9.5,
+  "ego": "v1",
+  "expect": {
+   "actors": [
+    "v1",
+    "v2"
+   ],
+   "contact": "any",
+   "time_s": 4.5,
+   "type": "collision",
+   "window_s": 1.5
+  },
+  "idmap": {
+   "c1": "v2"
+  },
+  "notes": [],
+  "road": {
+   "centerline": null,
+   "edge_left": "open",
+   "edge_right": "open",
+   "lanes": 2,
+   "one_way": false,
+   "shoulder_m": 3.0
+  },
+  "source": "scene_builder"
+ },
+ "scene_obj": "{'v1': {'location': (105.25, -32.25, 2), 'rotation': (0, -90.0, 0), 'type': 'car'}, 'v2': {'location': (80.25, -94.75, 2), 'rotation': (0, -0.0, 0), 'type': 'suv'}}\n{}\n"
+}

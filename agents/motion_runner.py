@@ -117,9 +117,27 @@ def profile_speed(profile, t):
     return float(profile[-1][1])
 
 
+def _smooth_step(x):
+    x = max(0.0, min(1.0, float(x)))
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _fork_disp(fork, s):
+    """(lateral_shift_m >= 0, elevation_z_m) of a diverging branch at distance s along the road frame."""
+    if not fork or s is None or s <= float(fork.get("s_b", 1e9)):
+        return 0.0, 0.0
+    s_b = float(fork["s_b"])
+    div_d = float(fork.get("diverge_d_m", 10.0)) * _smooth_step((s - s_b) / max(float(fork.get("diverge_len_m", 100.0)), 1.0))
+    rise_m = float(fork.get("rise_m", 0.0))
+    z = rise_m * _smooth_step((s - s_b - float(fork.get("rise_start_m", 55.0))) / max(float(fork.get("rise_len_m", 100.0)), 1.0))
+    return div_d, z
+
+
 def barrier_offsets(road_plan, s=None):
-    """Lateral offsets d (+ = left) of the barrier lines: just outside the shoulder, on the ego carriageway's outer edges.
-    When the lane count changes along the road (road_plan["sections"]), the offsets are those of the section at distance s."""
+    """Lateral offsets d (+ = left) of the outer barrier lines: just outside the shoulder, on the ego carriageway's outer edges.
+    When the lane count changes along the road (road_plan["sections"]), the offsets follow the section at distance s, and on a
+    diverging fork (road_plan["fork"]) the branch-side outer barrier follows the outer edge of the branch instead of cutting
+    across its driving lanes."""
     if not road_plan:
         return []
     lanes, shoulder = int(road_plan.get("lanes", 2)), float(road_plan.get("shoulder_m", 3.0))
@@ -128,35 +146,108 @@ def barrier_offsets(road_plan, s=None):
     if secs and s is not None:
         sc = next((x for x in secs if s < float(x["s1"])), secs[-1])
         lanes, left_m = int(sc["m"]) + int(sc["n"]), int(sc["m"])
+    fork = road_plan.get("fork")
+    div_d, _ = _fork_disp(fork, s) if (fork and s is not None) else (0.0, 0.0)
     out = []
     if road_plan.get("edge_right") == "barrier":
-        out.append(-(lanes * LANE_WIDTH + shoulder + 0.3))
+        if fork and s is not None and s >= float(fork["s_b"]) and fork.get("side") == "right" and fork.get("leave_j"):
+            right_edge = (max(fork["leave_j"]) + 1) * LANE_WIDTH + div_d
+            out.append(-(right_edge + shoulder + 0.3))
+        else:
+            out.append(-(lanes * LANE_WIDTH + shoulder + 0.3))
     if road_plan.get("edge_left") == "barrier" and road_plan.get("one_way"):
-        out.append(-left_m * LANE_WIDTH + shoulder + 0.3)    # with two carriageways the left side is the median: no barrier
+        if fork and s is not None and s >= float(fork["s_b"]) and fork.get("side") == "left" and fork.get("leave_j"):
+            left_edge = -min(fork["leave_j"]) * LANE_WIDTH + div_d
+            out.append(left_edge + shoulder + 0.3)
+        else:
+            out.append(-left_m * LANE_WIDTH + shoulder + 0.3)    # with two carriageways the left side is the median: no barrier
+    return out
+
+
+def gore_barrier_specs(road_plan, s):
+    """Optional gore divider barrier offset (d, z_hint) between the ego road and a diverging branch once lateral separation
+    exceeds safe clearance (>= 3.2 m), or None before clearance is reached."""
+    fork = (road_plan or {}).get("fork")
+    if not fork or s is None or s < float(fork.get("s_b", 1e9)):
+        return None
+    div_d, _ = _fork_disp(fork, s)
+    if div_d < 3.2:
+        return None
+    secs = road_plan.get("sections") or []
+    sc = next((x for x in secs if s < float(x["s1"])), secs[-1]) if secs else {"m": 0, "n": int(road_plan.get("lanes", 2))}
+    if fork.get("side") == "left":
+        return (-int(sc["m"]) * LANE_WIDTH + 0.7, 0.2)
+    return (-(int(sc["m"]) + int(sc["n"])) * LANE_WIDTH - 0.7, 0.2)
+
+
+def weather_for(env):
+    """Map spec['environment'] ({'time_of_day', 'weather'}) to CARLA WeatherParameters keyword dict."""
+    env = env if isinstance(env, dict) else {}
+    tod = str(env.get("time_of_day", "day")).lower()
+    w = str(env.get("weather", "clear")).lower()
+    sun_alt = {"day": 45.0, "dusk": 8.0, "night": -15.0}.get(tod, 45.0)
+    presets = {
+        "clear":  {"cloudiness": 15.0, "precipitation": 0.0, "precipitation_deposits": 0.0, "fog_density": 0.0, "wetness": 0.0},
+        "cloudy": {"cloudiness": 85.0, "precipitation": 0.0, "precipitation_deposits": 0.0, "fog_density": 5.0, "wetness": 10.0},
+        "rain":   {"cloudiness": 90.0, "precipitation": 60.0, "precipitation_deposits": 40.0, "fog_density": 10.0, "wetness": 70.0},
+        "fog":    {"cloudiness": 70.0, "precipitation": 0.0, "precipitation_deposits": 0.0, "fog_density": 45.0, "wetness": 15.0},
+    }
+    out = dict(presets.get(w, presets["clear"]))
+    out["sun_altitude_angle"] = sun_alt
+    out["sun_azimuth_angle"] = 180.0
     return out
 
 
 def spawn_barriers(world, bp_lib, road_plan, spawned_ids, step=4.0):
-    """Barrier props along the road edges that the plan marks as 'barrier'. Returns (placed, failed)."""
+    """Barrier props along the road edges that the plan marks as 'barrier', plus a gore divider on diverging forks once the
+    two roads separate safely. Uses CARLA waypoint / branch elevation so barriers sit cleanly on climbing ramps."""
     import carla
     offsets = barrier_offsets(road_plan)
+    fork = (road_plan or {}).get("fork")
     bps = bp_lib.filter("static.prop.streetbarrier")
-    if not offsets or not bps or not road_plan.get("centerline"):
+    if (not offsets and not fork) or not bps or not (road_plan or {}).get("centerline"):
         return 0, 0
     frame = RoadFrame(road_plan["centerline"])
+    cmap = world.get_map() if hasattr(world, "get_map") else None
     placed = failed = 0
+
+    def _place(s_, d, z_hint=0.2):
+        nonlocal placed, failed
+        x, y = frame.to_xy(s_, d)
+        z_use = z_hint
+        if cmap is not None:
+            try:
+                wp = cmap.get_waypoint(carla.Location(x, -y, z_hint), project_to_road=True)
+                if wp is not None and math.hypot(wp.transform.location.x - x, wp.transform.location.y - (-y)) < 6.0:
+                    z_use = wp.transform.location.z + 0.15
+            except Exception:
+                pass
+        p = world.try_spawn_actor(bps[0], carla.Transform(carla.Location(x, -y, z_use), carla.Rotation(yaw=-frame.heading(s_))))
+        if p is None:
+            failed += 1
+        else:
+            placed += 1
+            spawned_ids.append(p.id)
+
     for i in range(len(offsets)):
+        is_left_line = (i == 1) or (i == 0 and road_plan.get("edge_right") != "barrier" and road_plan.get("edge_left") == "barrier")
         s_ = 0.0
         while s_ <= frame.length:
             here = barrier_offsets(road_plan, s_)
             d = here[i] if len(here) == len(offsets) else offsets[i]
-            x, y = frame.to_xy(s_, d)
-            p = world.try_spawn_actor(bps[0], carla.Transform(carla.Location(x, -y, 0.2), carla.Rotation(yaw=-frame.heading(s_))))
-            if p is None:
-                failed += 1
-            else:
-                placed += 1
-                spawned_ids.append(p.id)
+            z_hint = 0.2
+            if fork and s_ >= float(fork["s_b"]):
+                if (is_left_line and fork.get("side") == "left") or ((not is_left_line) and fork.get("side") == "right"):
+                    _, z_br = _fork_disp(fork, s_)
+                    z_hint = z_br + 0.2
+            _place(s_, d, z_hint)
+            s_ += step
+    if fork:
+        s_ = float(fork["s_b"])
+        while s_ <= frame.length:
+            gb = gore_barrier_specs(road_plan, s_)
+            if gb is not None:
+                _place(s_, gb[0], gb[1])
             s_ += step
     return placed, failed
 
@@ -268,23 +359,32 @@ def extend_route_along_frame(route, target_xy_carla, road_frame, route_point_cls
     return route
 
 
-def sanitize_straight_route(route, start_xy_carla, target_xy_carla, road_frame, route_point_cls=_RoutePoint, loc_cls=None, step=2.0):
+def sanitize_straight_route(route, start_xy_carla, target_xy_carla, road_frame, route_point_cls=_RoutePoint, loc_cls=None, step=2.0, road_plan=None):
     """Ensure a straight-road route stays in its starting lane (rebuilding along `road_frame` if CARLA's OpenDRIVE
-    waypoint graph jumps laterally > 2 m onto a shoulder or neighbouring lane) and reaches the target."""
+    waypoint graph jumps laterally > 2 m onto a shoulder or neighbouring lane) and reaches the target. Waypoints following
+    a diverging fork branch in `road_plan['fork']` are preserved instead of being flattened back onto `d0`."""
     if road_frame is None:
         return route
     if loc_cls is None and route:
         loc_cls = type(route[-1].transform.location)
     s0, d0 = road_frame.to_sd(float(start_xy_carla[0]), -float(start_xy_carla[1]))
     s_tgt, _ = road_frame.to_sd(float(target_xy_carla[0]), -float(target_xy_carla[1]))
+    fork = (road_plan or {}).get("fork")
     jumped = not route
     if route:
         for wp in route:
             loc = wp.transform.location
-            _, dw = road_frame.to_sd(loc.x, -loc.y)
+            sw, dw = road_frame.to_sd(loc.x, -loc.y)
             if abs(dw - d0) > 2.0:
-                jumped = True
-                break
+                on_branch = False
+                if fork and sw >= float(fork.get("s_b", 1e9)) and fork.get("leave_j"):
+                    div_d, _ = _fork_disp(fork, sw)
+                    sign = 1.0 if fork.get("side") == "left" else -1.0
+                    br_ds = [-(j + 0.5) * LANE_WIDTH + sign * div_d for j in fork["leave_j"]]
+                    on_branch = any(abs(dw - bd) <= 2.0 for bd in br_ds)
+                if not on_branch:
+                    jumped = True
+                    break
     if jumped and loc_cls is not None and s_tgt > s0 + 5.0:
         out = []
         s_ = s0
@@ -509,9 +609,10 @@ class InterceptFollower(RouteFollower):
 
 
 def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost", port=2000, seed=0, record_video=None,
-               real_time=True):
+               real_time=True, camera="chase"):
     """real_time: every simulation step takes at least DT of wall time, so the scene plays at the speed of the video in the CARLA
-    window (synchronous mode would otherwise run it as fast as the server can step)."""
+    window (synchronous mode would otherwise run it as fast as the server can step).
+    camera: 'chase' (default smooth chase/crash-focus), 'dashcam' (ego windshield mount), or 'both' (side-by-side)."""
     import carla
     from agents.map_builder import build_and_load_map
 
@@ -556,6 +657,11 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
         world = build_and_load_map(client, net_fn, out_dir, plan.get("road"))
     else:
         _cleanup(client, ids_fn, world)
+    if isinstance(plan.get("environment"), dict):
+        try:
+            world.set_weather(carla.WeatherParameters(**weather_for(plan["environment"])))
+        except Exception:
+            pass
     bp_lib = world.get_blueprint_library()
     tm = client.get_trafficmanager()
 
@@ -594,23 +700,39 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
 
     result = {"scene_id": scene_id, "outcome": "no_collision", "events": [], "plan_note": plan.get("note")}
     cam_sensor, cam_q, cam_writer, last_frame = None, None, None, [None]
+    dash_sensor, dash_q, last_dash = None, None, [None]
 
     def _capture_tick():
-        if cam_q is None or cam_writer is None:
+        if cam_writer is None:
             return
         import queue
-        frame = None
-        while not cam_q.empty():
-            frame = cam_q.get_nowait()
-        if frame is None:
-            try:
-                frame = cam_q.get(timeout=0.5)
-            except queue.Empty:
-                frame = None
-        if frame is not None:
-            last_frame[0] = bgra_bytes_to_bgr(frame.raw_data, frame.width, frame.height)
-        if last_frame[0] is not None:
-            cam_writer.write(last_frame[0])
+        import numpy as np
+
+        def _drain(q, slot):
+            if q is None:
+                return
+            frame = None
+            while not q.empty():
+                frame = q.get_nowait()
+            if frame is None:
+                try:
+                    frame = q.get(timeout=0.5)
+                except queue.Empty:
+                    frame = None
+            if frame is not None:
+                slot[0] = bgra_bytes_to_bgr(frame.raw_data, frame.width, frame.height)
+
+        _drain(cam_q, last_frame)
+        _drain(dash_q, last_dash)
+        if camera == "both":
+            if last_frame[0] is not None and last_dash[0] is not None:
+                cam_writer.write(np.hstack([last_dash[0], last_frame[0]]))
+        elif camera == "dashcam":
+            if last_dash[0] is not None:
+                cam_writer.write(last_dash[0])
+        else:
+            if last_frame[0] is not None:
+                cam_writer.write(last_frame[0])
 
     try:
         def _spawn_one(aid, a):
@@ -731,7 +853,8 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 route = build_route(world.get_map(), v_loc, tgt_carla,
                                     max_len=max(250.0, road_frame.length + 50.0))
                 if road_pl.get("centerline") and tgt_carla:
-                    route = sanitize_straight_route(route, (v_loc.x, v_loc.y), tgt_carla[-1], road_frame, _RoutePoint, carla.Location)
+                    route = sanitize_straight_route(route, (v_loc.x, v_loc.y), tgt_carla[-1], road_frame, _RoutePoint, carla.Location,
+                                                    road_plan=road_pl)
             return RouteFollower(v, route, speed, bool(spec.get("avoid", False)),
                                  road_frame=(road_frame if road_pl.get("centerline") else None))
 
@@ -783,6 +906,24 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             if cam_sensor is not None and cam_sensor.is_alive:
                 cam_sensor.set_transform(tf)
 
+        # On crossroad scenarios, align traffic signals so the ego approach has a green light rather than a random red
+        if not road_pl.get("centerline") and ego in actors and actors[ego].is_alive:
+            try:
+                el = actors[ego].get_location()
+                ey_rad = math.radians(actors[ego].get_transform().rotation.yaw)
+                efx, efy = math.cos(ey_rad), math.sin(ey_rad)
+                tls = list(world.get_actors().filter("traffic.traffic_light*"))
+                ego_tl = actors[ego].get_traffic_light() if hasattr(actors[ego], "get_traffic_light") else None
+                for tl in tls:
+                    tl.freeze(True)
+                    tl_loc = tl.get_location()
+                    ahead = (tl_loc.x - el.x) * efx + (tl_loc.y - el.y) * efy
+                    same_dir = (tl == ego_tl) or (ahead > 0.0 and abs(math.cos(math.radians(tl.get_transform().rotation.yaw)) * efx +
+                                                                      math.sin(math.radians(tl.get_transform().rotation.yaw)) * efy) < 0.5)
+                    tl.set_state(carla.TrafficLightState.Green if same_dir else carla.TrafficLightState.Red)
+            except Exception:
+                pass
+
         try:
             ego_yaw = actors[ego].get_transform().rotation.yaw
             cur_cam_pose = _chase_target_pose()
@@ -794,19 +935,35 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 world.get_spectator().set_transform(spec_tf)
                 if record_path:
                     import queue, cv2
+                    cam_w, cam_h = (640, 360) if camera == "both" else (1280, 720)
                     cam_bp = bp_lib.find("sensor.camera.rgb")
-                    cam_bp.set_attribute("image_size_x", "1280")
-                    cam_bp.set_attribute("image_size_y", "720")
+                    cam_bp.set_attribute("image_size_x", str(cam_w))
+                    cam_bp.set_attribute("image_size_y", str(cam_h))
                     cam_bp.set_attribute("fov", "90")
-                    cam_sensor = world.try_spawn_actor(cam_bp, spec_tf)
-                    if cam_sensor is not None:
-                        cam_q = queue.Queue()
-                        cam_sensor.listen(cam_q.put)
-                        sensors.append(cam_sensor)
-                        spawned_ids.append(cam_sensor.id)
+                    if camera in ("chase", "both"):
+                        cam_sensor = world.try_spawn_actor(cam_bp, spec_tf)
+                        if cam_sensor is not None:
+                            cam_q = queue.Queue()
+                            cam_sensor.listen(cam_q.put)
+                            sensors.append(cam_sensor)
+                            spawned_ids.append(cam_sensor.id)
+                    if camera in ("dashcam", "both") and ego in actors and actors[ego].is_alive:
+                        dash_bp = bp_lib.find("sensor.camera.rgb")
+                        dash_bp.set_attribute("image_size_x", str(cam_w))
+                        dash_bp.set_attribute("image_size_y", str(cam_h))
+                        dash_bp.set_attribute("fov", "100")
+                        dash_tf = carla.Transform(carla.Location(x=1.2, y=0.0, z=1.35))
+                        dash_sensor = world.try_spawn_actor(dash_bp, dash_tf, attach_to=actors[ego])
+                        if dash_sensor is not None:
+                            dash_q = queue.Queue()
+                            dash_sensor.listen(dash_q.put)
+                            sensors.append(dash_sensor)
+                            spawned_ids.append(dash_sensor.id)
+                    if cam_sensor is not None or dash_sensor is not None:
                         json.dump(spawned_ids, open(ids_fn, "w"))
-                        cam_writer = cv2.VideoWriter(record_path, cv2.VideoWriter_fourcc(*"mp4v"), round(1.0 / DT, 1), (1280, 720))
-                        print(f"[motion] recording CARLA spectator video -> {record_path}")
+                        out_w = (cam_w * 2) if (camera == "both" and cam_sensor is not None and dash_sensor is not None) else cam_w
+                        cam_writer = cv2.VideoWriter(record_path, cv2.VideoWriter_fourcc(*"mp4v"), round(1.0 / DT, 1), (out_w, cam_h))
+                        print(f"[motion] recording CARLA {camera} video -> {record_path}")
         except Exception:
             pass
 
@@ -963,7 +1120,7 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             paced_tick(world)
             _capture_tick()
             tick += 1
-            recorder.record(tick * DT, actors)
+            recorder.record(tick * DT, actors, speed_overrides=kin_spd)
             alive = {k: a.get_location() for k, a in actors.items() if a.is_alive}
             ks = sorted(alive)
             for ia in range(len(ks)):
@@ -1083,6 +1240,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="auto_result")
     ap.add_argument("--no-map", action="store_true", help="keep the currently loaded CARLA map")
     ap.add_argument("--hold", type=float, default=5.0)
-    ap.add_argument("--record", action="store_true", help="save crash-focused spectator camera video")
+    ap.add_argument("--record", action="store_true", help="save CARLA camera video")
+    ap.add_argument("--camera", choices=("chase", "dashcam", "both"), default="chase", help="camera view for --record")
     args = ap.parse_args()
-    run_motion(args.out, args.scene_id, load_map=not args.no_map, hold_sec=args.hold, record_video=args.record)
+    run_motion(args.out, args.scene_id, load_map=not args.no_map, hold_sec=args.hold, record_video=args.record, camera=args.camera)

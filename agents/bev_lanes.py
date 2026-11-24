@@ -41,6 +41,8 @@ class LaneGrid:
         self.line = np.zeros((self.ns, self.nd), np.float32)
         self.road = np.zeros((self.ns, self.nd), np.float32)
         self.seen_r = np.zeros((self.ns, self.nd), np.float32)       # seen near enough to say road / not road
+        self.paint = np.zeros((self.ns, self.nd), np.float32)        # raw painted marking hits (keeps dashes distinct from solid)
+        self.seen_p = np.zeros((self.ns, self.nd), np.float32)
 
     def d_of(self, j):
         return D_RANGE[0] + j * D_RES
@@ -48,7 +50,7 @@ class LaneGrid:
     def j_of(self, d):
         return int(round((d - D_RANGE[0]) / D_RES))
 
-    def add(self, s_off, X, Z, line, road, valid, curve=None):
+    def add(self, s_off, X, Z, line, road, valid, curve=None, paint=None):
         """Add one top view: X, Z (m) per top-view pixel, masks line / road / valid of the same shape, at ego travel s_off;
         curve: agents/camera_geom.RoadCurve, so that a bending road's lanes stay straight in the grid."""
         d = -X - (curve.offset(s_off, Z) if curve is not None else 0.0)
@@ -61,6 +63,9 @@ class LaneGrid:
         near = Z[ok] <= ROAD_Z_MAX
         np.add.at(self.seen_r, (si[near], dj[near]), 1.0)
         np.add.at(self.road, (si[near], dj[near]), road[ok][near].astype(np.float32))
+        if paint is not None:
+            np.add.at(self.seen_p, (si, dj), 1.0)
+            np.add.at(self.paint, (si, dj), paint[ok].astype(np.float32))
 
     def slice(self, s, half=SLICE_HALF_M, road_seen=False):
         """(seen, P(line), P(road)) across the road for the stretch s +- half; P(road) is over the cells seen near enough
@@ -86,6 +91,20 @@ def top_view_coords(cam, res=D_RES):
     return X, Z, Hm, size
 
 
+def _paint_mask(bgr):
+    """Classical white/yellow road-paint mask that preserves dashes (TwinLiteNet fills dashes into solid ribbons)."""
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    k = max(int(0.035 * bgr.shape[1]) | 1, 3)
+    th = np.maximum(
+        cv2.morphologyEx(g, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1))),
+        cv2.morphologyEx(g, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(k // 2 | 1, 3)))),
+    ).astype(np.float32)
+    white = (th > 10.0) & (th > 2.5 * cv2.blur(th, (61, 61)))
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    yellow = (hsv[..., 0] >= 12) & (hsv[..., 0] <= 38) & (hsv[..., 1] >= 70) & (hsv[..., 2] >= 100)
+    return ((white | yellow) * 255).astype(np.uint8)
+
+
 def accumulate(path, cam, s_ego, t0, t1, y_bottom, boxes_at=None, step=FRAME_STEP_S, curve=None, vx_at=None):
     """Fill a LaneGrid from the frames between t0 and t1 (every `step` s). boxes_at(t) -> [[x1, y1, x2, y2], ...] vehicle boxes
     at the analysis width (left out of the map); vx_at(t) -> the vanishing point's column at t (the camera's heading against
@@ -109,6 +128,7 @@ def accumulate(path, cam, s_ego, t0, t1, y_bottom, boxes_at=None, step=FRAME_STE
             fr = cv2.resize(fr, (cam.w, int(round(h * cam.w / w))))
             mm = lane_lines.model_masks(fr)
             ll, da = mm
+            pm = _paint_mask(fr)
             valid = np.zeros(fr.shape[:2], np.uint8)
             valid[int(cam.vy + 3):int(y_bottom)] = 1
             for b in (boxes_at(t) if boxes_at else []):
@@ -122,7 +142,7 @@ def accumulate(path, cam, s_ego, t0, t1, y_bottom, boxes_at=None, step=FRAME_STE
                 Ht = top_view_coords(c_t)[2]
             warp = lambda m: cv2.warpPerspective(m, Ht, size, flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP, borderValue=0)
             v_t = warp(valid) > 0
-            grid.add(s_ego(t), X, Z, warp(ll) > 0, warp(np.maximum(da, ll)) > 0, v_t, curve)
+            grid.add(s_ego(t), X, Z, warp(ll) > 0, warp(np.maximum(da, ll)) > 0, v_t, curve, paint=warp(pm) > 0)
             t += step
     finally:
         cap.release()
@@ -145,20 +165,20 @@ def line_peaks(pl, seen, min_sep_m=2.0):
 
 
 def lane_width(grid, slices, default=3.5):
-    """The video's lane width: the width of the ego lane (its two lines around d = 0, 2.6 .. 4.6 m apart), median over all
-    slices; failing that the median spacing of neighbouring lines."""
+    """The video's lane width: the width of the ego lane (its two lines around d = 0, 2.8 .. 4.1 m apart), median over all
+    slices; failing that the median spacing of neighbouring lines, clamped to realistic road lane widths (2.8 .. 4.0 m)."""
     ego, gaps = [], []
     for s in slices:
         seen, pl, _ = grid.slice(s)
         pk = line_peaks(pl, seen)
-        gaps += [b - a for a, b in zip(pk, pk[1:]) if 2.6 <= b - a <= 4.6]
+        gaps += [b - a for a, b in zip(pk, pk[1:]) if 2.6 <= b - a <= 4.3]
         left = [d for d in pk if d > 0]
         right = [d for d in pk if d < 0]
-        if left and right and 2.6 <= min(left) - max(right) <= 4.6:
+        if left and right and 2.8 <= min(left) - max(right) <= 4.1:
             ego.append(min(left) - max(right))
     if len(ego) >= 5:
-        return float(np.median(ego))
-    return float(np.median(gaps)) if len(gaps) >= 5 else default
+        return min(max(float(np.median(ego)), 2.8), 4.0)
+    return min(max(float(np.median(gaps)), 2.8), 4.0) if len(gaps) >= 5 else default
 
 
 def road_reach(pr, seen, side, max_gap_m=1.5):
@@ -180,17 +200,26 @@ def road_reach(pr, seen, side, max_gap_m=1.5):
 
 def solid(grid, s, d, half=SLICE_HALF_M, tol_m=0.4):
     """Share of the grid rows of the stretch s +- half on which a line was seen at d (+- tol_m): a solid line is seen on most of
-    them, a dashed one on about a third."""
+    them, a dashed one on about a third. Uses the raw painted-marking channel (`grid.paint`) when populated so TwinLiteNet's
+    continuous lane-ribbon output does not turn dashed lane dividers into solid edges."""
     a = max(int((s - half - grid.s0) / S_RES), 0)
     b = min(int((s + half - grid.s0) / S_RES) + 1, grid.ns)
-    j0, j1 = grid.j_of(d - tol_m), grid.j_of(d + tol_m) + 1
-    seen = grid.seen[a:b, j0:j1].sum(1)
-    hit = grid.line[a:b, j0:j1].sum(1)
+    j0, j1 = max(grid.j_of(d - tol_m), 0), min(grid.j_of(d + tol_m) + 1, grid.nd)
+    if j0 >= j1:
+        return 0.0
+    if hasattr(grid, "seen_p") and grid.seen_p[a:b, j0:j1].sum() >= 8:
+        seen = grid.seen_p[a:b, j0:j1].sum(1)
+        hit = grid.paint[a:b, j0:j1].sum(1)
+        thresh = 0.12
+    else:
+        seen = grid.seen[a:b, j0:j1].sum(1)
+        hit = grid.line[a:b, j0:j1].sum(1)
+        thresh = 0.15
     rows = seen >= 2
     if rows.sum() < 4:
         return 0.0
     with np.errstate(invalid="ignore", divide="ignore"):
-        return float(((hit[rows] / seen[rows]) > 0.15).mean())
+        return float(((hit[rows] / seen[rows]) > thresh).mean())
 
 
 SOLID = 0.7
@@ -212,8 +241,10 @@ def count_slice(grid, s, w, vehicles_d=()):
             return 0, None
         first = min(lines, key=abs)                   # the ego lane's line on this side
         beyond = [d for d in vehicles_d if d * sign > abs(first)]
-        if solid(grid, s, first) >= SOLID and not beyond:
-            return 0, first                           # a solid edge line nobody drives beyond: the road ends here
+        more_lines = [d for d in lines if abs(d) > abs(first) + 0.5 * w
+                      and abs(((abs(d) - abs(first)) / w) - round((abs(d) - abs(first)) / w)) <= LATTICE_TOL_BEV]
+        if solid(grid, s, first) >= SOLID and not beyond and not more_lines:
+            return 0, first                           # a solid edge line with neither traffic nor further lane lines beyond
         n = 0
         for d in lines:
             k = (abs(d) - abs(first)) / w
@@ -224,15 +255,17 @@ def count_slice(grid, s, w, vehicles_d=()):
     nl_lines, out_l = lattice(left_l, 1)
     nr_lines, out_r = lattice(right_l, -1)
     reach_l, reach_r = road_reach(pr, seen_r, "left"), road_reach(pr, seen_r, "right")
-    # beyond the outermost line: a strip narrower than SHOULDER_LANES is a shoulder; so is anything beyond a solid edge line that
-    # no car drives beyond (a solid line that cars drive past separates lanes, e.g. before a fork)
+    # beyond the outermost line: a strip narrower than SHOULDER_LANES is a shoulder; so is a modest strip beyond a solid edge
+    # line that no car drives beyond (but a wide multi-lane expanse >= 2.2 lanes of drivable pavement is real highway lanes, e.g.
+    # separated by a solid exit-lane divider before a fork)
     for side in ("left", "right"):
         out = out_l if side == "left" else out_r
         reach = reach_l if side == "left" else reach_r
         if out is None or reach <= abs(out):
             continue
         beyond = [d for d in vehicles_d if (d > abs(out) if side == "left" else d < -abs(out))]
-        if reach < abs(out) + SHOULDER_LANES * w or (solid(grid, s, out) >= SOLID and not beyond):
+        is_solid_edge = solid(grid, s, out) >= SOLID and not beyond and reach < abs(out) + 2.2 * w
+        if reach < abs(out) + SHOULDER_LANES * w or is_solid_edge:
             if side == "left":
                 reach_l = abs(out)
             else:

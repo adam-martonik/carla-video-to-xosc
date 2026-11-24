@@ -18,12 +18,14 @@ LANE_QUESTIONS = {
                       "(choose A if all visible vehicles drive the same way as the ego vehicle)?",
 }
 RIGHT_EDGE_Q = (CTX + "Look at the RIGHT edge of the road, beside the right-most lane of the ego vehicle's driving direction. "
-                "What is there?\nA) a concrete barrier, jersey wall or guardrail (even if a narrow shoulder line is in front of it)\n"
-                "B) a curb, sidewalk or paved shoulder (with no barrier or wall)\n"
-                "C) open ground, grass, dirt or sand (with no barrier or wall)")
+                "What forms the outer boundary there?\n"
+                "A) a concrete barrier, jersey wall, retaining wall or metal guardrail (choose A whenever a wall or barrier runs along the right edge, even if a white edge line or narrow shoulder strip lies in front of it)\n"
+                "B) a curb, sidewalk or wide paved shoulder with NO concrete wall, barrier or guardrail\n"
+                "C) open ground, grass, dirt or sand with NO wall, barrier or guardrail")
 LEFT_EDGE_Q = (CTX + "Look at the LEFT edge of the road, beside the left-most lane of the ego vehicle's driving direction. "
-               "What is there?\nA) a concrete barrier, jersey wall or guardrail (even if a narrow shoulder line is in front of it)\n"
-               "B) lanes with oncoming traffic or a painted median\n"
+               "What is there?\n"
+               "A) a concrete barrier, jersey wall or metal guardrail (even if a narrow shoulder line is in front of it)\n"
+               "B) lanes with oncoming traffic driving toward the camera or a painted yellow median\n"
                "C) a curb, sidewalk or paved shoulder (with no barrier or wall)\n"
                "D) open ground, grass, dirt or sand (with no barrier or wall)")
 ONCOMING_Q = (CTX + "Is there a separate set of lanes next to the ego vehicle's road with oncoming vehicles driving the opposite way "
@@ -102,7 +104,7 @@ def road_edges(video, duration, n=6, t0=None, t1=None):
         yes = 0.0
         used = 0
         for t in times:
-            fr = video_events.grab_frames(video, [t], width=512)
+            fr = video_events.grab_frames(video, [t], width=640)
             if not fr:
                 continue
             pr = llm_backend.choice_probabilities(RIGHT_EDGE_Q, fr, "ABC")
@@ -121,9 +123,10 @@ def road_edges(video, duration, n=6, t0=None, t1=None):
         def pick(p, names):
             k = max(p, key=p.get)
             return names.get(k, "shoulder") if p[k] >= MIN_CHOICE_PROB else "shoulder"
+        yes_avg = yes / used
         return {"edge_right": pick(r, {"A": "barrier", "B": "shoulder", "C": "open"}),
                 "edge_left": pick(l, {"A": "barrier", "B": "shoulder", "C": "shoulder", "D": "open"}),
-                "one_way": (yes / used) < 0.25}
+                "one_way": yes_avg < 0.25 or (yes_avg < 0.45 and l["B"] < 0.30)}
     except Exception:
         return None
 
@@ -198,15 +201,24 @@ BRANCH_RISE_Q = (CTX + "Is there a road or lanes on the %s that are HIGHER than 
 BRANCH_SPLIT_Q = (CTX + "Look at the %s side of the ego vehicle's road. Do some lanes on the %s separate from the ego vehicle's road "
                   "and continue as a different road (a fork, an exit ramp, a separate carriageway or a flyover), divided from it by a "
                   "barrier, a gap or a different height? Answer YES or NO.")
+FORK_SIDE_Q = (CTX + "Look ahead along the highway or road. Does the road split or fork so that some lanes separate away as a "
+               "different carriageway, main highway, exit ramp or flyover?\n"
+               "A) yes, lanes separate away on the LEFT side of the ego vehicle's road\n"
+               "B) yes, lanes separate away on the RIGHT side of the ego vehicle's road\n"
+               "C) no, the road does not split into separate roads")
 RISE_P = 0.5           # mean YES probability above which the lanes that leave climb (measured: 0.52-0.68 vs 0.08-0.40 without)
 SPLIT_P = 0.5          # ... above which they go on as a flat road of their own (a weaker cue: the plain question overlaps more)
 
 
 def branch_evidence(video, t, side, duration, n=4, span=4.0):
-    """(P(lanes on `side` go on as a separate road), P(that road rises)) from frames in the `span` seconds after video time t,
-    when lanes have left the ego road on that side. (0, 0) when the model is not available."""
+    """(P(lanes on `side` go on as a separate road), P(that road rises)) from frames around and after video time t
+    (approaching the gore through passing it), when lanes leave the ego road on that side. (0, 0) when unavailable."""
     try:
-        times = [min(t + 0.5 + span * i / max(n - 1, 1), max(duration - 0.1, 0.0)) for i in range(n)]
+        t0 = max(float(t) - 1.0, 0.0)
+        t1 = min(float(t) + span, max(float(duration) - 0.1, 0.0))
+        if t1 <= t0:
+            t1 = max(float(duration) - 0.1, 0.0)
+        times = [t0 + (t1 - t0) * i / max(n - 1, 1) for i in range(n)]
         word = side.upper()
         ps, pr, used = 0.0, 0.0, 0
         for tt in times:
@@ -219,3 +231,76 @@ def branch_evidence(video, t, side, duration, n=4, span=4.0):
         return (ps / used, pr / used) if used else (0.0, 0.0)
     except Exception:
         return 0.0, 0.0
+
+
+def fork_side(video, t, duration, n=4, span=4.5):
+    """Comparative left-vs-right fork probe around video time t: {'left', 'right', 'none'} probabilities, or None."""
+    try:
+        t0 = max(float(t) - 1.5, 0.0)
+        t1 = min(float(t) + span - 1.5, max(float(duration) - 0.1, 0.0))
+        if t1 <= t0:
+            t1 = max(float(duration) - 0.1, 0.0)
+        times = [t0 + (t1 - t0) * i / max(n - 1, 1) for i in range(n)]
+        p = _avg_choice(video, times, FORK_SIDE_Q, "ABC")
+        return {"left": round(p["A"], 3), "right": round(p["B"], 3), "none": round(p["C"], 3)}
+    except Exception:
+        return None
+
+
+def estimate_environment(video, duration, n=4):
+    """Fast OpenCV estimate of {'time_of_day': day|dusk|night, 'weather': clear|cloudy|fog} from sky/road statistics."""
+    default = {"time_of_day": "day", "weather": "clear"}
+    try:
+        import cv2
+        import numpy as np
+        times = _times(max(float(duration), 0.5), n, t0=0.2, t1=max(float(duration) - 0.2, 0.4))
+        raws = video_events.grab_frames(video, times, width=320)
+        if not raws:
+            return default
+        med_vs, sky_vs, sky_ss, sky_brs, road_stds = [], [], [], [], []
+        for raw in raws:
+            arr = np.frombuffer(raw, np.uint8)
+            im = cv2.imdecode(arr, cv2.IMREAD_COLOR) if arr.size else None
+            if im is None or im.size == 0:
+                continue
+            g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+            rs = np.where(g.mean(axis=1) > 15)[0]
+            y0, y1 = (int(rs[0]), int(rs[-1]) + 1) if rs.size > 20 else (0, g.shape[0])
+            act = im[y0:y1, :]
+            ah = act.shape[0]
+            if ah < 20:
+                continue
+            hsv = cv2.cvtColor(act, cv2.COLOR_BGR2HSV)
+            med_vs.append(float(np.median(hsv[..., 2])))
+            sky_bgr = act[:max(int(0.35 * ah), 4), :]
+            sky_hsv = hsv[:max(int(0.35 * ah), 4), :]
+            sky_vs.append(float(np.median(sky_hsv[..., 2])))
+            sky_ss.append(float(np.median(sky_hsv[..., 1])))
+            sky_brs.append(float(np.mean(sky_bgr[..., 0].astype(np.float32) - sky_bgr[..., 2].astype(np.float32))))
+            road_g = cv2.cvtColor(act[int(0.50 * ah):int(0.85 * ah), :], cv2.COLOR_BGR2GRAY)
+            if road_g.size:
+                road_stds.append(float(np.std(road_g)))
+        if not med_vs:
+            return default
+        med_v = float(np.median(med_vs))
+        sky_v = float(np.median(sky_vs))
+        sky_s = float(np.median(sky_ss))
+        sky_br = float(np.median(sky_brs))
+        road_std = float(np.median(road_stds)) if road_stds else 40.0
+        if med_v < 58.0 and sky_v < 75.0:
+            tod = "night"
+        elif med_v < 95.0 and sky_v < 125.0:
+            tod = "dusk"
+        else:
+            tod = "day"
+        if tod == "night":
+            weather = "clear"
+        elif sky_br > 12.0 and sky_s > 35.0:
+            weather = "clear"
+        elif road_std < 18.0 and sky_s < 25.0 and sky_v > 140.0:
+            weather = "fog"
+        else:
+            weather = "cloudy"
+        return {"time_of_day": tod, "weather": weather}
+    except Exception:
+        return default

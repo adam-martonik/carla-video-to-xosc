@@ -472,17 +472,33 @@ def lane_timeline(path, t0, t1, step=0.5, window=1.0, fps_window=8.0):
         cap.release()
 
 
-def change_side(rows, t_before, t_after, span=2.0):
+def change_side(rows, t_before, t_after, span=2.0, seg_before=None, seg_after=None, blocked_sides=()):
     """'left' or 'right': the side whose number of lanes beside the ego lane changes more between the windows before and after
-    a change of the count (medians over `span` seconds on each side)."""
-    def med(key, lo, hi):
+    a change of the count. Uses full adjacent segment bounds when given (avoiding missing-frame gaps), else `span` on each side
+    widened to the nearest valid samples when sparse. `blocked_sides` (e.g. a continuous concrete barrier) biases away from
+    spurious drops on a physically walled side when the other side also changed clearly."""
+    def med(key, lo, hi, direction):
         v = [r[key] for r in rows if r.get(key) is not None and lo <= r["t"] <= hi]
+        if len(v) < 2:
+            if direction < 0:
+                v = [r[key] for r in rows if r.get(key) is not None and r["t"] <= hi][-3:]
+            else:
+                v = [r[key] for r in rows if r.get(key) is not None and r["t"] >= lo][:3]
         return float(np.median(v)) if v else None
-    l0, l1 = med("lanes_left", t_before - span, t_before), med("lanes_left", t_after, t_after + span)
-    r0, r1 = med("lanes_right", t_before - span, t_before), med("lanes_right", t_after, t_after + span)
+    lo0 = seg_before[0] if seg_before is not None else t_before - span
+    hi0 = seg_before[1] if seg_before is not None else t_before
+    lo1 = seg_after[0] if seg_after is not None else t_after
+    hi1 = seg_after[1] if seg_after is not None else t_after + span
+    l0, l1 = med("lanes_left", lo0, hi0, -1), med("lanes_left", lo1, hi1, +1)
+    r0, r1 = med("lanes_right", lo0, hi0, -1), med("lanes_right", lo1, hi1, +1)
     if None in (l0, l1, r0, r1):
+        return "left" if "right" in blocked_sides and "left" not in blocked_sides else "right"
+    dl, dr = abs(l1 - l0), abs(r1 - r0)
+    if "right" in blocked_sides and "left" not in blocked_sides and dl >= 0.35:
+        return "left"
+    if "left" in blocked_sides and "right" not in blocked_sides and dr >= 0.35:
         return "right"
-    return "left" if abs(l1 - l0) > abs(r1 - r0) else "right"
+    return "left" if dl > dr else "right"
 
 
 def draw_debug(path, t, out_jpg, window=1.0, fps_window=8.0):

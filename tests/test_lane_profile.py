@@ -433,5 +433,83 @@ class TestVehicleEvidence(unittest.TestCase):
         self.assertEqual(rows[1]["road_lanes"], 1.1)                          # no car seen near 5 s
 
 
+class TestForkPreservationAndChangeSide(unittest.TestCase):
+    def test_change_side_bridges_missing_gap_and_respects_right_barrier(self):
+        from agents import lane_lines
+        # Mirrors results/1/lane_timeline.json: lanes_left drops 3.8->1.0 earlier in seg 1,
+        # while t=4.6..5.1 are None and right has brief frontage bleed at 6.1..6.6
+        rows = [
+            {"t": 2.6, "lanes_left": 2.3, "lanes_right": 0.6},
+            {"t": 3.1, "lanes_left": 2.7, "lanes_right": 0.6},
+            {"t": 3.6, "lanes_left": 3.8, "lanes_right": 0.6},
+            {"t": 4.1, "lanes_left": 3.4, "lanes_right": 0.6},
+            {"t": 4.6, "lanes_left": None, "lanes_right": None},
+            {"t": 5.6, "lanes_left": 1.0, "lanes_right": 0.7},
+            {"t": 6.1, "lanes_left": 1.0, "lanes_right": 1.8},
+            {"t": 6.6, "lanes_left": 1.0, "lanes_right": 1.5},
+            {"t": 7.1, "lanes_left": 1.0, "lanes_right": 0.2},
+            {"t": 7.6, "lanes_left": 1.0, "lanes_right": 0.2},
+            {"t": 8.1, "lanes_left": 1.0, "lanes_right": 0.2},
+        ]
+        side = lane_lines.change_side(rows, 6.6, 7.1, seg_before=(2.6, 6.6), seg_after=(7.1, 8.1), blocked_sides=("right",))
+        self.assertEqual(side, "left")
+
+    def test_builder_repairs_narrow_start_section_to_preserve_diverging_branch(self):
+        # Mirrors the exact bug in results/1: section 0 has m=1 (3 lanes), section 1 has 4 lanes,
+        # section 2 drops to 2 lanes with a branch -> must preserve the branch instead of dropping lane_profile.
+        prof = [
+            {"d0": None, "d1": 25.0, "n": 3, "m": 1},
+            {"d0": 25.0, "d1": 80.0, "n": 4, "m": 0},
+            {"d0": 80.0, "d1": None, "n": 2, "m": 2, "branch": {"side": "left", "rise_m": 6.0}},
+        ]
+        actors = [{"id": "c1", "type": "car", "relation": "beside", "lane": "left", "distance_m": 8.0,
+                   "speed_kmh": 55.0, "behavior": "cutting_in"}]
+        spec = base_spec(prof, lane_index=2, actors=actors, event={"type": "collision", "actor_id": "c1", "time_s": 8.0})
+        tmp, plan, agents, net = build(spec)
+        self.addCleanup(tmp.cleanup)
+        self.assertIn("sections", plan["road"])
+        self.assertIn("fork", plan["road"])
+        self.assertIn('id="branch"', net)
+        self.assertFalse(any("lane profile dropped" in n for n in plan["notes"]))
+
+    def test_tag_branches_uses_comparative_fork_side_and_blocked_right_barrier(self):
+        prof = [{"d0": None, "d1": 60.0, "n": 4, "m": 0}, {"d0": 60.0, "d1": None, "n": 2, "m": 0}]
+        # Both sides score > 0.5 on yes/no probe, but right has a barrier and fork_side says left
+        probe = lambda video, t, side, dur: (0.33, 0.54) if side == "left" else (0.36, 0.66)
+        fs_probe = lambda video, t, dur: {"left": 0.72, "right": 0.15, "none": 0.13}
+        note = local_pipeline.tag_branches(prof, 0.5, 15.0, "v.mp4", 20.0, probe=probe,
+                                           fork_side_probe=fs_probe, blocked_sides=("right",))
+        self.assertEqual(prof[1]["branch"], {"side": "left", "rise_m": 6.0})
+        self.assertEqual(prof[1]["m"], 2)
+        self.assertIn("on the left", note)
+
+    def test_post_branch_lane_regrowth_is_clamped_and_merged_without_branch_overlap(self):
+        # Left branch leaves lanes 0,1 at 95 m; noisy section at 126 m tries to regrow m=1 into the left branch.
+        prof = [
+            {"d0": None, "d1": 56.0, "n": 5, "m": 1},
+            {"d0": 56.0, "d1": 95.0, "n": 6, "m": 0},
+            {"d0": 95.0, "d1": 126.0, "n": 4, "m": 2, "branch": {"side": "left", "rise_m": 6.0}},
+            {"d0": 126.0, "d1": None, "n": 5, "m": 1},
+        ]
+        clamped = copy.deepcopy(prof)
+        local_pipeline._clamp_post_branch(clamped)
+        self.assertEqual([(s["n"], s["m"], s["d1"]) for s in clamped],
+                         [(5, 1, 56.0), (6, 0, 95.0), (4, 2, None)])
+        # Builder enforces the same invariant even when given an unclamped profile directly
+        tmp, plan, agents, net = build(base_spec(prof, lane_index=5))
+        self.addCleanup(tmp.cleanup)
+        self.assertEqual(len(re.findall(r'<lane id="eastbound_after_\d"', net)), 4)
+        self.assertEqual(len(re.findall(r'<lane id="branch_\d"', net)), 2)
+
+        # Right branch: regrowth on the right is clamped, while widening on the non-branch (left) side is kept
+        r_prof = [
+            {"d0": None, "d1": 70.0, "n": 4, "m": 0},
+            {"d0": 70.0, "d1": 120.0, "n": 2, "m": 0, "branch": {"side": "right", "rise_m": 0.0}},
+            {"d0": 120.0, "d1": None, "n": 3, "m": 0},
+        ]
+        local_pipeline._clamp_post_branch(r_prof)
+        self.assertEqual([(s["n"], s["m"], s["d1"]) for s in r_prof], [(4, 0, 70.0), (2, 0, None)])
+
+
 if __name__ == "__main__":
     unittest.main()

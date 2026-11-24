@@ -1,0 +1,83 @@
+{
+ "motion": {
+  "agents": {
+   "v1": {
+    "already_moving": true,
+    "avoid": false,
+    "mode": "drive",
+    "path": [
+     [
+      290.0,
+      -5.25
+     ]
+    ],
+    "speed_kmh": 50.0
+   },
+   "v2": {
+    "already_moving": true,
+    "avoid": false,
+    "color": "235,235,235",
+    "intercept": {
+     "aim_offset_m": 0.0,
+     "kind": "cut_in",
+     "lane_dst_d": -5.25,
+     "lane_src_d": -1.75,
+     "lead_s": 1.4,
+     "t_event_s": 7.0,
+     "target": "v1"
+    },
+    "mode": "drive",
+    "speed_kmh": 50.0
+   },
+   "v3": {
+    "already_moving": true,
+    "avoid": false,
+    "color": "25,25,25",
+    "mode": "drive",
+    "path": [
+     [
+      290.0,
+      -1.75
+     ]
+    ],
+    "speed_kmh": 45.0
+   }
+  },
+  "duration_s": 12.0,
+  "ego": "v1",
+  "expect": {
+   "actors": [
+    "v1",
+    "v2"
+   ],
+   "contact": "side",
+   "time_s": 7.0,
+   "type": "collision",
+   "window_s": 1.5
+  },
+  "idmap": {
+   "a1": "v3",
+   "c1": "v2"
+  },
+  "notes": [],
+  "road": {
+   "centerline": [
+    [
+     0.0,
+     0.0
+    ],
+    [
+     300.0,
+     0.0
+    ]
+   ],
+   "edge_left": "shoulder",
+   "edge_right": "shoulder",
+   "lanes": 2,
+   "one_way": false,
+   "shoulder_m": 3.0
+  },
+  "source": "scene_builder"
+ },
+ "scene_obj": "{'v1': {'location': (15.0, 5.25, 2), 'rotation': (0, -0.0, 0), 'type': 'car'}, 'v2': {'location': (16.0, 1.75, 2), 'rotation': (0, -0.0, 0), 'type': 'suv'}, 'v3': {'location': (55.0, 1.75, 2), 'rotation': (0, -0.0, 0), 'type': 'car'}}\n{}\n"
+}

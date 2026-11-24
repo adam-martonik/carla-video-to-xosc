@@ -91,7 +91,8 @@ def _add_entity(entities, ent):
 def _add_init(init_actions, name, ent):
     priv = _sub(init_actions, "Private", entityRef=name)
     tele = _sub(_sub(priv, "PrivateAction"), "TeleportAction")
-    _world_position(tele, ent["x"][0], ent["y"][0], ent["h"][0])
+    z0 = float(ent["z"][0]) if ent.get("z") else 0.0
+    _world_position(tele, ent["x"][0], ent["y"][0], ent["h"][0], z=z0)
     spd = _sub(_sub(_sub(priv, "PrivateAction"), "LongitudinalAction"), "SpeedAction")
     _sub(spd, "SpeedActionDynamics", dynamicsShape="step", value="0.0", dynamicsDimension="time")
     _sub(_sub(spd, "SpeedActionTarget"), "AbsoluteTargetSpeed", value="%.3f" % max(0.0, float(ent["v"][0])))
@@ -107,9 +108,10 @@ def _add_trajectory_group(act, name, ent):
     traj = _sub(follow, "Trajectory", name="Traj_" + name, closed="false")
     poly = _sub(_sub(traj, "Shape"), "Polyline")
     t0 = float(ent["times"][0])
-    for t, x, y, h in zip(ent["times"], ent["x"], ent["y"], ent["h"]):
+    zs = ent.get("z") or [0.0] * len(ent["times"])
+    for t, x, y, z, h in zip(ent["times"], ent["x"], ent["y"], zs, ent["h"]):
         vtx = _sub(poly, "Vertex", time="%.3f" % (float(t) - t0))
-        _world_position(vtx, x, y, h)
+        _world_position(vtx, x, y, h, z=float(z))
     _sub(_sub(follow, "TimeReference"), "Timing", domainAbsoluteRelative="absolute", scale="1.0", offset="0.0")
     _sub(follow, "TrajectoryFollowingMode", followingMode="position")
     _time_trigger(ev, "Start_" + name, 0.0)
@@ -141,13 +143,23 @@ def build_xosc(scenario):
     init_actions = _sub(_sub(sb, "Init"), "Actions")
     env_action = _sub(_sub(init_actions, "GlobalAction"), "EnvironmentAction")
     env = _sub(env_action, "Environment", name="RecordedEnv")
-    night = bool(scenario.get("is_night"))
-    _sub(env, "TimeOfDay", animation="false", dateTime="2026-06-15T23:30:00" if night else "2026-06-15T14:00:00")
-    weather = _sub(env, "Weather", cloudState="free")
-    _sub(weather, "Sun", intensity="0.02" if night else "0.90", azimuth="0", elevation="-0.35" if night else "1.20")
-    _sub(weather, "Fog", visualRange="100000.0")
-    _sub(weather, "Precipitation", precipitationType="dry", intensity="0.0")
-    _sub(env, "RoadCondition", frictionScaleFactor="%.2f" % float(scenario.get("friction", 1.0)))
+    env_cfg = scenario.get("environment") if isinstance(scenario.get("environment"), dict) else {}
+    tod = str(env_cfg.get("time_of_day") or ("night" if scenario.get("is_night") else "day")).lower()
+    wkind = str(env_cfg.get("weather") or "clear").lower()
+    dt_str = {"night": "2026-06-15T23:30:00", "dusk": "2026-06-15T19:45:00"}.get(tod, "2026-06-15T14:00:00")
+    sun_int = {"night": "0.02", "dusk": "0.35"}.get(tod, "0.90")
+    sun_el = {"night": "-0.35", "dusk": "0.15"}.get(tod, "1.20")
+    cloud_state = {"clear": "free", "cloudy": "overcast", "rain": "rainy", "fog": "overcast"}.get(wkind, "free")
+    vis_range = {"fog": "150.0", "rain": "10000.0", "cloudy": "50000.0"}.get(wkind, "100000.0")
+    precip_type = "rain" if wkind == "rain" else "dry"
+    precip_int = "0.6" if wkind == "rain" else "0.0"
+    _sub(env, "TimeOfDay", animation="false", dateTime=dt_str)
+    weather = _sub(env, "Weather", cloudState=cloud_state)
+    _sub(weather, "Sun", intensity=sun_int, azimuth="0", elevation=sun_el)
+    _sub(weather, "Fog", visualRange=vis_range)
+    _sub(weather, "Precipitation", precipitationType=precip_type, intensity=precip_int)
+    default_fric = 0.7 if wkind == "rain" else 1.0
+    _sub(env, "RoadCondition", frictionScaleFactor="%.2f" % float(scenario.get("friction", default_fric)))
     for name, e in zip(names, ents):
         _add_init(init_actions, name, e)
 

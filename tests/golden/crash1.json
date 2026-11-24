@@ -1,0 +1,116 @@
+{
+ "motion": {
+  "agents": {
+   "v1": {
+    "mode": "static"
+   },
+   "v2": {
+    "already_moving": true,
+    "avoid": false,
+    "color": "25,25,25",
+    "mode": "drive",
+    "polyline": [
+     [
+      72.0,
+      11.5
+     ],
+     [
+      72.0,
+      9.41
+     ],
+     [
+      72.0,
+      7.32
+     ],
+     [
+      72.0,
+      5.23
+     ],
+     [
+      72.0,
+      3.14
+     ],
+     [
+      72.0,
+      1.05
+     ],
+     [
+      72.0,
+      -1.05
+     ],
+     [
+      72.0,
+      -3.14
+     ],
+     [
+      72.0,
+      -5.23
+     ],
+     [
+      72.0,
+      -7.32
+     ],
+     [
+      72.0,
+      -9.41
+     ],
+     [
+      72.0,
+      -11.5
+     ]
+    ],
+    "speed_kmh": 20.0
+   },
+   "v3": {
+    "already_moving": true,
+    "avoid": false,
+    "color": "110,70,40",
+    "mode": "drive",
+    "path": [
+     [
+      290.0,
+      -5.25
+     ]
+    ],
+    "speed_kmh": 50.0
+   }
+  },
+  "duration_s": 13.0,
+  "ego": "v1",
+  "expect": {
+   "actors": [
+    "v2",
+    "v3"
+   ],
+   "contact": "any",
+   "max_dist_m": 6.0,
+   "time_s": 3.02,
+   "type": "collision",
+   "window_s": 1.5
+  },
+  "idmap": {
+   "c1": "v2",
+   "c2": "v3"
+  },
+  "notes": [],
+  "road": {
+   "centerline": [
+    [
+     0.0,
+     0.0
+    ],
+    [
+     300.0,
+     0.0
+    ]
+   ],
+   "edge_left": "shoulder",
+   "edge_right": "shoulder",
+   "lanes": 2,
+   "one_way": false,
+   "shoulder_m": 6.0
+  },
+  "source": "scene_builder"
+ },
+ "scene_obj": "{'v1': {'location': (65.0, 1.75, 2), 'rotation': (0, -0.0, 0), 'type': 'car'}, 'v2': {'location': (72.0, -11.5, 2), 'rotation': (0, 90.0, 0), 'type': 'car'}, 'v3': {'location': (30.12, 5.25, 2), 'rotation': (0, -0.0, 0), 'type': 'van'}}\n{}\n"
+}

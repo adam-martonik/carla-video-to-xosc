@@ -213,31 +213,39 @@ def _shoulder_lane(lane_id, width_m):
     return lane
 
 
-def add_shoulders(xodr_path, width_m=3.0, sides=("right", "left"), one_way=None, skip_roads=()):
+def add_shoulders(xodr_path, width_m=3.0, sides=("right", "left"), one_way=None, skip_roads=(), skip_road_sides=None):
     """Add a paved shoulder as the outermost lane on the given sides, so that a pushed car stays on pavement.
     SUMO exports every carriageway as its own road with right lanes only: 'right' is the outer edge of each carriageway; 'left'
     is the outer edge only when the road is one-way (with two carriageways the left side is the median, which stays as it is).
-    Returns the number of roads changed."""
+    `skip_road_sides` ({sumo_road_id: ["left"|"right"]}) skips only the inner facing side(s) of a fork so outer shoulders stay
+    intact without overlapping at the gore. Returns the number of roads changed."""
     if not sides:
         return 0
     tree = ET.parse(xodr_path)
     def sumo_id(r):
         ud = r.find("userData")
         return ud.get("value") if ud is not None else None
+    srs = skip_road_sides or {}
+    skip_whole = set(skip_roads) - set(srs)
     roads = [r for r in tree.getroot().iter("road") if r.find("lanes/laneSection/right") is not None and r.get("junction") == "-1"
-             and sumo_id(r) not in skip_roads]
+             and sumo_id(r) not in skip_whole]
     changed = 0
     for road in roads:
+        sid = sumo_id(road)
+        skip_s = set(srs.get(sid) or ())
+        road_sides = tuple(sd for sd in sides if sd not in skip_s)
+        if not road_sides:
+            continue
         for sec in road.findall("lanes/laneSection"):
             done = False
-            if "right" in sides:
+            if "right" in road_sides:
                 right = sec.find("right")
                 n = len(right.findall("lane"))
                 right.append(_shoulder_lane(-(n + 1), width_m))
                 done = True
             # one-way: a road whose lane count changes is several roads in a row, so the flag is passed in when known
             single_direction = (len(roads) == 1) if one_way is None else bool(one_way)
-            if "left" in sides and single_direction and sec.find("left") is None:
+            if "left" in road_sides and single_direction and sec.find("left") is None:
                 left = ET.Element("left")
                 left.append(_shoulder_lane(1, width_m))
                 sec.insert(list(sec).index(sec.find("center")), left)
@@ -266,7 +274,8 @@ def build_and_load_map(client, net_xml, out_dir=None, plan_road=None):
     sides = shoulder_sides(plan_road)
     one_way = bool(plan_road.get("one_way")) if (plan_road or {}).get("sections") else None
     w = add_shoulders(xodr_path, float((plan_road or {}).get("shoulder_m", 3.0)), sides, one_way=one_way,
-                      skip_roads=tuple((plan_road or {}).get("no_shoulder") or ())) if sides else 0
+                      skip_roads=tuple((plan_road or {}).get("no_shoulder") or ()),
+                      skip_road_sides=(plan_road or {}).get("no_shoulder_sides")) if sides else 0
     world = load_xodr(client, xodr_path)
     print(f"[map] loaded {world.get_map().name} from {os.path.basename(xodr_path)} ({n} signals moved off the lanes, {w} shoulder(s) added)")
     return world

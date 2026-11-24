@@ -235,6 +235,52 @@ class TestKinematicAndCleanup(unittest.TestCase):
             _, dw = fr.to_sd(wp.transform.location.x, -wp.transform.location.y)
             self.assertAlmostEqual(dw, d_ego, delta=0.2)
 
+    def test_fork_barriers_never_enter_branch_lanes_and_gore_starts_after_clearance(self):
+        road = {
+            "lanes": 4, "shoulder_m": 3.0, "edge_right": "barrier", "edge_left": "barrier", "one_way": True,
+            "sections": [{"s0": 0.0, "s1": 80.0, "n": 4, "m": 0},
+                         {"s0": 80.0, "s1": 550.0, "n": 2, "m": 2, "branch": {"side": "left", "rise_m": 6.0}}],
+            "fork": {"s_b": 80.0, "side": "left", "rise_m": 6.0, "leave_j": [0, 1],
+                     "diverge_len_m": 100.0, "diverge_d_m": 10.0, "rise_start_m": 55.0, "rise_len_m": 100.0},
+        }
+        # Right after split (s=85): left barrier MUST stay outside branch's outer left edge (d > 3.0), NEVER at -3.7
+        b_right, b_left = motion_runner.barrier_offsets(road, 85.0)
+        self.assertLess(b_right, -14.0)
+        self.assertGreater(b_left, 3.0)
+        self.assertIsNone(motion_runner.gore_barrier_specs(road, 90.0))      # < 3.2 m separation yet
+        # Well past split (s=180): branch moved +10 m left -> outer left barrier at +13.3 m, gore divider appears cleanly
+        b_right2, b_left2 = motion_runner.barrier_offsets(road, 180.0)
+        self.assertAlmostEqual(b_left2, 13.3, places=2)
+        gb = motion_runner.gore_barrier_specs(road, 180.0)
+        self.assertIsNotNone(gb)
+        self.assertAlmostEqual(gb[0], -7.0 + 0.7, places=2)
+
+    def test_sanitize_straight_route_preserves_diverging_branch_path(self):
+        from agents.road_frame import RoadFrame
+        class _Loc:
+            def __init__(self, x=0.0, y=0.0, z=0.0): self.x, self.y, self.z = x, y, z
+        fr = RoadFrame([[0.0, 0.0], [300.0, 0.0]])
+        road_plan = {"fork": {"s_b": 80.0, "side": "left", "rise_m": 6.0, "leave_j": [0, 1],
+                              "diverge_len_m": 100.0, "diverge_d_m": 10.0, "rise_start_m": 55.0, "rise_len_m": 100.0}}
+        # Vehicle in lane j=0 (d=-1.75) follows diverging branch up to d=+8.25
+        route = []
+        for s in range(20, 260, 4):
+            div_d, _ = motion_runner._fork_disp(road_plan["fork"], float(s))
+            x, y = fr.to_xy(float(s), -1.75 + div_d)
+            route.append(motion_runner._RoutePoint(_Loc(x, -y)))
+        out = motion_runner.sanitize_straight_route(route, (20.0, 1.75), (260.0, -8.25), fr,
+                                                    motion_runner._RoutePoint, _Loc, road_plan=road_plan)
+        _, d_end = fr.to_sd(out[-1].transform.location.x, -out[-1].transform.location.y)
+        self.assertGreater(d_end, 6.0)
+
+    def test_weather_for_maps_environment_presets(self):
+        day_clear = motion_runner.weather_for({"time_of_day": "day", "weather": "clear"})
+        day_cloudy = motion_runner.weather_for({"time_of_day": "day", "weather": "cloudy"})
+        night = motion_runner.weather_for({"time_of_day": "night", "weather": "clear"})
+        self.assertGreater(day_clear["sun_altitude_angle"], 30.0)
+        self.assertGreater(day_cloudy["cloudiness"], 70.0)
+        self.assertLess(night["sun_altitude_angle"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
