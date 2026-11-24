@@ -30,8 +30,8 @@ EVENTS = ("collision", "near_miss", "miss", "none")
 
 EDGES = ("barrier", "shoulder", "open")
 TRAFFIC_LANES = ("ego_lane_ahead", "left_lane", "right_lane", "oncoming")
-TIME_OF_DAY = ("day", "dusk", "night")
-WEATHERS = ("clear", "cloudy", "rain", "fog")
+TIME_OF_DAY = ("day", "dawn", "dusk", "night")
+WEATHERS = ("clear", "cloudy", "rain", "storm", "fog")
 MAX_TRAFFIC = 12
 MAX_LANES = 6
 

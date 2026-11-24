@@ -405,6 +405,421 @@ class TestCombinedRoadAndTimingMatrix(unittest.TestCase):
         self.assertEqual([(v["road"], v["timing"]) for v in zipped],
                          [("original", "original"), ("curve_left", "miss_late"), ("crossroad_2lane", "no_aggressor")])
 
+    def test_crashing_only_flag_produces_only_collision_scenarios(self):
+        """--crashing-only must produce only collision variants for counts, 'all', and filtered explicit lists."""
+        for fname in ("v1", "crash1", "v3"):
+            base = load_fixture(fname)
+            vs = scenario_variants.generate_variants(base, timing_presets="5", crashing_only=True)
+            self.assertEqual(len(vs), 5, fname)
+            self.assertTrue(all(v["expected_outcome"] == "collision" for v in vs), (fname, [v["timing"] for v in vs]))
+            # Every variant builds cleanly with collision expectation
+            t_exps = []
+            for v in vs:
+                with tempfile.TemporaryDirectory() as tmp:
+                    plan = scene_builder.build(v["spec"], tmp, "s")
+                    self.assertEqual(plan["expect"]["type"], "collision", (fname, v["timing"]))
+                    t_exps.append(plan["expect"]["time_s"])
+            # Must produce genuinely distinct timings (including earlier_collision on straight third-party crash1!)
+            self.assertGreaterEqual(len(set(t_exps)), 3, (fname, t_exps))
+
+        # Filtering an explicit mixed list drops misses / near-misses / no_aggressor
+        filtered = scenario_variants.generate_variants(
+            load_fixture("v3"),
+            timing_presets="original,miss_late,no_aggressor,near_miss_early,later_collision,fast_collision",
+            crashing_only=True,
+        )
+        self.assertEqual([v["timing"] for v in filtered], ["original", "later_collision", "fast_collision"])
+
+    def test_first_person_spectator_pose_and_activation(self):
+        """First-person spectator activates for --dashcam and --camera dashcam/dashcam_all, and computes world mount pose."""
+        self.assertTrue(motion_runner.should_use_first_person_spectator("dashcam", dashcam=False))
+        self.assertTrue(motion_runner.should_use_first_person_spectator("dashcam_all", dashcam=False))
+        self.assertTrue(motion_runner.should_use_first_person_spectator("chase", dashcam=True))
+        self.assertFalse(motion_runner.should_use_first_person_spectator("chase", dashcam=False))
+        self.assertFalse(motion_runner.should_use_first_person_spectator("both", dashcam=True))
+
+        # Heading east (yaw=0): local (x=1.2, y=0, z=1.35) adds +1.2 to X, +1.35 to Z, pitch=-3.0
+        wx, wy, wz, wp, wyaw, wroll = motion_runner.world_dashcam_pose((10.0, 5.0, 0.2), (0.0, 0.0, 0.0), (1.2, 0.0, 1.35, -3.0))
+        self.assertAlmostEqual(wx, 11.2, places=2)
+        self.assertAlmostEqual(wy, 5.0, places=2)
+        self.assertAlmostEqual(wz, 1.55, places=2)
+        self.assertAlmostEqual(wp, -3.0, places=2)
+        self.assertAlmostEqual(wyaw, 0.0, places=2)
+        # Heading south (CARLA yaw=90): forward offset +1.75 moves along +Y
+        wx2, wy2, wz2, _, wyaw2, _ = motion_runner.world_dashcam_pose((10.0, 5.0, 0.2), (0.0, 90.0, 0.0), (1.75, 0.0, 2.0, -4.0))
+        self.assertAlmostEqual(wx2, 10.0, places=2)
+        self.assertAlmostEqual(wy2, 6.75, places=2)
+        self.assertAlmostEqual(wz2, 2.2, places=2)
+        self.assertAlmostEqual(wyaw2, 90.0, places=2)
+
+    def test_predict_dashcam_pose_eliminates_sync_tick_lag_and_handles_braking_and_turns(self):
+        """Regression test: first-person spectator prediction cancels 1-tick v*DT lag so camera never starts behind
+        the rearview mirror at speed nor slides forward out of the car while decelerating/braking."""
+        mount = motion_runner.dashcam_mount_transform("car")  # (1.20, 0.0, 1.35, -3.0)
+        dt = motion_runner.DT
+
+        # High-speed cruise (20 m/s east): without prediction camera sits 1.0 m behind mount (inside cabin behind mirror);
+        # with lead_s=DT it lands on the post-tick vehicle position + mount (0.0 m error).
+        x0, v0 = 15.0, 20.0
+        wx, wy, wz, wp, wyaw, wroll = motion_runner.predict_dashcam_pose(
+            (x0, 0.0, 0.0), (0.0, 0.0, 0.0), mount, vel_xyz=(v0, 0.0, 0.0), lead_s=dt
+        )
+        x_after_tick = x0 + v0 * dt
+        self.assertAlmostEqual(wx - x_after_tick, mount[0], delta=0.005)
+        self.assertAlmostEqual(wy, 0.0, delta=0.005)
+        self.assertAlmostEqual(wz, mount[2], delta=0.005)
+
+        # Hard emergency braking (-6.0 m/s^2 from 10 m/s): includes 0.5*a*dt^2 to stay locked within 1 mm
+        v_brk, a_brk = 10.0, -6.0
+        wx_b, _, _, _, _, _ = motion_runner.predict_dashcam_pose(
+            (50.0, 0.0, 0.0), (0.0, 0.0, 0.0), mount, vel_xyz=(v_brk, 0.0, 0.0), acc_xyz=(a_brk, 0.0, 0.0), lead_s=dt
+        )
+        x_brk_after = 50.0 + v_brk * dt + 0.5 * a_brk * dt * dt
+        self.assertAlmostEqual(wx_b - x_brk_after, mount[0], delta=0.002)
+
+        # Braking near full stop (v=0.1 m/s, a=-6 m/s^2) must stop cleanly, never predict reversing behind x0
+        wx_stop, _, _, _, _, _ = motion_runner.predict_dashcam_pose(
+            (60.0, 0.0, 0.0), (0.0, 0.0, 0.0), mount, vel_xyz=(0.1, 0.0, 0.0), acc_xyz=(-6.0, 0.0, 0.0), lead_s=dt
+        )
+        self.assertGreaterEqual(wx_stop, 60.0 + mount[0])
+        self.assertLessEqual(wx_stop, 60.0 + mount[0] + 0.005)
+
+        # Crash impulse acceleration spike (+200 m/s^2) is clamped so spectator never shoots out of the car
+        wx_imp, _, _, _, _, _ = motion_runner.predict_dashcam_pose(
+            (60.0, 0.0, 0.0), (0.0, 0.0, 0.0), mount, vel_xyz=(5.0, 0.0, 0.0), acc_xyz=(200.0, 0.0, 0.0), lead_s=dt
+        )
+        self.assertAlmostEqual(wx_imp - (60.0 + 5.0 * dt), mount[0], delta=0.015)
+
+        # Yaw wrap across +/-180 deg computes clean shortest-arc angular rate without 360-deg spin
+        rate = motion_runner.angular_rate_pyr((0.0, 179.0, 0.0), (0.0, -179.0, 0.0), dt=dt)
+        self.assertAlmostEqual(rate[1], 40.0, places=2)
+        _, _, _, _, pyaw, _ = motion_runner.predict_dashcam_pose(
+            (0.0, 0.0, 0.0), (0.0, -179.0, 0.0), mount, rot_rate_pyr=rate, lead_s=dt
+        )
+        self.assertAlmostEqual(pyaw, -177.0, places=2)
+
+        # Zero lead returns exact resting mount pose
+        self.assertEqual(
+            motion_runner.predict_dashcam_pose((10.0, 5.0, 0.2), (0.0, 0.0, 0.0), mount, vel_xyz=(20.0, 0.0, 0.0), lead_s=0.0),
+            motion_runner.world_dashcam_pose((10.0, 5.0, 0.2), (0.0, 0.0, 0.0), mount),
+        )
+
+    def test_freeze_actors_for_exit_halts_vehicles_and_walkers_before_async(self):
+        """Regression test: leaving synchronous mode must halt every live vehicle (handbrake + zero velocity)
+        and walker so no car coasts away from the spectator camera at scenario end."""
+        import types
+
+        class _Vec3:
+            def __init__(self, x=0.0, y=0.0, z=0.0):
+                self.x, self.y, self.z = x, y, z
+
+        class _VCtl:
+            def __init__(self, throttle=0.0, steer=0.0, brake=0.0, hand_brake=False):
+                self.throttle, self.steer, self.brake, self.hand_brake = throttle, steer, brake, hand_brake
+
+        class _WCtl:
+            def __init__(self, speed=0.0):
+                self.speed = speed
+
+        class _Veh:
+            def __init__(self, alive=True):
+                self.type_id = "vehicle.dodge.charger"
+                self.is_alive = alive
+                self.autopilot = True
+                self.ctrl = None
+                self.vel = _Vec3(18.0, 0.0, 0.0)
+                self.ang = _Vec3(0.0, 0.0, 10.0)
+            def set_autopilot(self, v): self.autopilot = v
+            def apply_control(self, c): self.ctrl = c
+            def set_target_velocity(self, v): self.vel = v
+            def set_target_angular_velocity(self, v): self.ang = v
+
+        class _Walker:
+            def __init__(self):
+                self.type_id = "walker.pedestrian.0001"
+                self.is_alive = True
+                self.ctrl = None
+            def apply_control(self, c): self.ctrl = c
+
+        v_live, v_dead, w_live = _Veh(True), _Veh(False), _Walker()
+        carla_stub = types.SimpleNamespace(VehicleControl=_VCtl, WalkerControl=_WCtl, Vector3D=_Vec3)
+        motion_runner.freeze_actors_for_exit({"v1": v_live, "v2": v_dead, "w1": w_live}, carla_stub)
+
+        self.assertFalse(v_live.autopilot)
+        self.assertEqual(v_live.ctrl.throttle, 0.0)
+        self.assertEqual(v_live.ctrl.brake, 1.0)
+        self.assertTrue(v_live.ctrl.hand_brake)
+        self.assertEqual((v_live.vel.x, v_live.vel.y, v_live.vel.z), (0.0, 0.0, 0.0))
+        self.assertEqual((v_live.ang.x, v_live.ang.y, v_live.ang.z), (0.0, 0.0, 0.0))
+        self.assertIsNone(v_dead.ctrl)
+        self.assertEqual(w_live.ctrl.speed, 0.0)
+
+    def test_run_motion_first_person_spectator_zero_lag_and_frozen_at_end(self):
+        """End-to-end mocked CARLA test reproducing Unreal's synchronous tick order (OnPreTick -> physics -> render):
+        verifies the first-person dashcam spectator stays locked to the windshield mount on tick 0, during cruise,
+        during hold, and remains stationary with the halted vehicle when asynchronous mode is restored."""
+        import types
+
+        class _Vec3:
+            def __init__(self, x=0.0, y=0.0, z=0.0):
+                self.x, self.y, self.z = float(x), float(y), float(z)
+            def length(self):
+                return math.sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+
+        class _Loc(_Vec3):
+            def distance(self, other):
+                return math.sqrt((self.x - other.x) ** 2 + (self.y - other.y) ** 2 + (self.z - other.z) ** 2)
+
+        class _Rot:
+            def __init__(self, pitch=0.0, yaw=0.0, roll=0.0):
+                self.pitch, self.yaw, self.roll = float(pitch), float(yaw), float(roll)
+
+        class _Tf:
+            def __init__(self, loc=None, rot=None):
+                self.location = loc or _Loc()
+                self.rotation = rot or _Rot()
+            def get_forward_vector(self):
+                r = math.radians(self.rotation.yaw)
+                return _Vec3(math.cos(r), math.sin(r), 0.0)
+            def get_right_vector(self):
+                r = math.radians(self.rotation.yaw)
+                return _Vec3(-math.sin(r), math.cos(r), 0.0)
+
+        class _VCtl:
+            def __init__(self, throttle=0.0, steer=0.0, brake=0.0, hand_brake=False):
+                self.throttle, self.steer, self.brake, self.hand_brake = throttle, steer, brake, hand_brake
+
+        class _WCtl:
+            def __init__(self, direction=None, speed=0.0):
+                self.direction, self.speed = direction, speed
+
+        class _Settings:
+            def __init__(self, synchronous_mode=False, fixed_delta_seconds=0.0, **kw):
+                self.synchronous_mode = synchronous_mode
+                self.fixed_delta_seconds = fixed_delta_seconds
+
+        class _Actor:
+            def __init__(self, aid, tid, tf, parent=None):
+                self.id, self.type_id, self._tf, self.parent = aid, tid, tf, parent
+                self.is_alive = True
+                self._vel = _Vec3()
+                self._pending_vel = None
+                self._acc = _Vec3()
+                self._ctrl = _VCtl()
+                self._cb = None
+                self.bounding_box = NS(extent=_Vec3(2.4, 0.95, 0.72))
+            def get_transform(self): return _Tf(_Loc(self._tf.location.x, self._tf.location.y, self._tf.location.z),
+                                                _Rot(self._tf.rotation.pitch, self._tf.rotation.yaw, self._tf.rotation.roll))
+            def get_location(self): return _Loc(self._tf.location.x, self._tf.location.y, self._tf.location.z)
+            def get_velocity(self): return _Vec3(self._vel.x, self._vel.y, self._vel.z)
+            def get_acceleration(self): return _Vec3(self._acc.x, self._acc.y, self._acc.z)
+            def set_transform(self, tf): self._tf = tf
+            def apply_control(self, c): self._ctrl = c
+            def set_autopilot(self, v): pass
+            def set_target_velocity(self, v): self._pending_vel = _Vec3(v.x, v.y, v.z)
+            def set_target_angular_velocity(self, v): pass
+            def get_physics_control(self): return NS(wheels=[NS(max_steer_angle=70.0)])
+            def listen(self, cb): self._cb = cb
+            def stop(self): self._cb = None
+
+        class _Wp:
+            def __init__(self, x, y):
+                self.transform = _Tf(_Loc(x, y, 0.0), _Rot(0.0, 0.0, 0.0))
+                self.is_junction = False
+            def next(self, step):
+                return [_Wp(self.transform.location.x + step, self.transform.location.y)]
+
+        class _Map:
+            def get_waypoint(self, loc, project_to_road=True, lane_type=None):
+                return _Wp(loc.x, loc.y)
+
+        class _Bp:
+            def __init__(self, tid): self.id = tid
+            def has_attribute(self, k): return False
+            def set_attribute(self, k, v): pass
+
+        class _BpLib:
+            def find(self, tid): return _Bp(tid)
+            def filter(self, pat): return [_Bp(pat)]
+
+        spectator = _Actor(999, "spectator", _Tf())
+        rendered_offsets = []      # (sim_t, spec_x - veh_x, veh_vx) observed on each rendered frame while moving
+        state_at_async = {}
+        spawned_att = []
+
+        class _World:
+            def __init__(self):
+                self._t = 0.0
+                self._next_id = 1
+                self._actors = []
+                self._sync = False
+                self._dt = motion_runner.DT
+            def get_map(self): return _Map()
+            def get_blueprint_library(self): return _BpLib()
+            def get_spectator(self): return spectator
+            def get_actors(self): return list(self._actors)
+            def get_snapshot(self): return NS(timestamp=NS(elapsed_seconds=self._t))
+            def apply_settings(self, s):
+                if self._sync and not s.synchronous_mode:
+                    veh = next((a for a in self._actors if a.type_id.startswith("vehicle.")), None)
+                    if veh is not None:
+                        state_at_async["veh_vx"] = veh._vel.x
+                        state_at_async["hand_brake"] = veh._ctrl.hand_brake
+                        state_at_async["brake"] = veh._ctrl.brake
+                        state_at_async["offset_x"] = spectator._tf.location.x - veh._tf.location.x
+                self._sync = bool(s.synchronous_mode)
+                self._dt = float(s.fixed_delta_seconds or motion_runner.DT)
+            def try_spawn_actor(self, bp, tf, attach_to=None, attachment_type=None):
+                a = _Actor(self._next_id, bp.id, tf, parent=attach_to)
+                self._next_id += 1
+                self._actors.append(a)
+                if bp.id == "sensor.camera.rgb":
+                    spawned_att.append(attachment_type)
+                return a
+            def spawn_actor(self, bp, tf, attach_to=None, attachment_type=None):
+                return self.try_spawn_actor(bp, tf, attach_to=attach_to, attachment_type=attachment_type)
+            def tick(self):
+                # Unreal sync order: OnPreTick already applied spectator.set_transform & vehicle controls;
+                # now TG_DuringPhysics steps vehicles by dt, then RedrawViewports renders vehicle vs spectator!
+                self._t += self._dt
+                for a in self._actors:
+                    if a.type_id.startswith("vehicle.") and a.is_alive:
+                        if a._pending_vel is not None:
+                            a._vel = a._pending_vel
+                            a._pending_vel = None
+                        if a._ctrl.hand_brake:
+                            a._acc = _Vec3(0.0, 0.0, 0.0)
+                        elif a._ctrl.brake > 0.0:
+                            ax = -6.0 * a._ctrl.brake if a._vel.x > 0.0 else 0.0
+                            vx_new = max(0.0, a._vel.x + ax * self._dt)
+                            a._tf.location.x += 0.5 * (a._vel.x + vx_new) * self._dt
+                            a._acc = _Vec3((vx_new - a._vel.x) / self._dt, 0.0, 0.0)
+                            a._vel.x = vx_new
+                        else:
+                            a._tf.location.x += a._vel.x * self._dt
+                            a._acc = _Vec3(0.0, 0.0, 0.0)
+                veh = next((a for a in self._actors if a.type_id.startswith("vehicle.")), None)
+                if veh is not None and veh._vel.x > 1.0:
+                    rendered_offsets.append((round(self._t, 2), round(spectator._tf.location.x - veh._tf.location.x, 3), round(veh._vel.x, 2)))
+
+        fake_world = _World()
+        fake_tm = NS(set_synchronous_mode=lambda v: None, set_random_device_seed=lambda s: None)
+        fake_client = NS(set_timeout=lambda t: None, get_world=lambda: fake_world, get_trafficmanager=lambda: fake_tm, apply_batch=lambda cmds: None)
+        fake_carla = types.SimpleNamespace(
+            Client=lambda h, p: fake_client,
+            WorldSettings=_Settings,
+            Location=_Loc,
+            Rotation=_Rot,
+            Transform=_Tf,
+            Vector3D=_Vec3,
+            VehicleControl=_VCtl,
+            WalkerControl=_WCtl,
+            LaneType=NS(Driving=1),
+            AttachmentType=NS(Rigid="RIGID", SpringArm="SPRING"),
+            command=NS(DestroyActor=lambda i: i),
+        )
+
+        saved_carla = sys.modules.get("carla")
+        sys.modules["carla"] = fake_carla
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                # Build a minimal moving-vehicle scene with dashcam first-person spectator and non-zero hold_sec
+                with open(os.path.join(tmp, "sc_scene_obj.txt"), "w", encoding="utf-8") as f:
+                    f.write("{'v1': {'type': 'car', 'location': [10.0, 0.0, 0.0], 'rotation': [0.0, 0.0, 0.0]}}\n{}\n")
+                plan = {
+                    "ego": "v1",
+                    "duration_s": 0.5,
+                    "expect": {"type": "none", "actors": ["v1"]},
+                    "dashcam_actors": ["v1"],
+                    "agents": {
+                        "v1": {"mode": "drive", "speed_kmh": 72.0, "already_moving": True, "path": [[200.0, 0.0]]}
+                    },
+                }
+                with open(os.path.join(tmp, "sc_motion.json"), "w", encoding="utf-8") as f:
+                    json.dump(plan, f)
+                motion_runner.run_motion(
+                    tmp, "sc", load_map=False, hold_sec=0.5, real_time=False,
+                    record_video=False, camera="dashcam", dashcam=False,
+                )
+        finally:
+            if saved_carla is None:
+                sys.modules.pop("carla", None)
+            else:
+                sys.modules["carla"] = saved_carla
+
+        # Every rendered tick while moving at 20 m/s MUST stay locked at mount_x=1.20 (NOT lagged to 0.20 behind mirror!)
+        self.assertGreater(len(rendered_offsets), 20)
+        mount_x = motion_runner.dashcam_mount_transform("car")[0]
+        for sim_t, dx, vx in rendered_offsets:
+            self.assertAlmostEqual(dx, mount_x, delta=0.05, msg=f"lag/drift at t={sim_t}, vx={vx}: dx={dx}")
+
+        # Before returning to async mode, vehicle MUST be completely stopped with handbrake and spectator aligned
+        self.assertEqual(state_at_async.get("veh_vx"), 0.0)
+        self.assertTrue(state_at_async.get("hand_brake"))
+        self.assertEqual(state_at_async.get("brake"), 1.0)
+        self.assertAlmostEqual(state_at_async.get("offset_x"), mount_x, delta=0.01)
+
+    def test_vary_weather_per_road_and_explicit_weather_variants_and_headlights(self):
+        """--vary-weather assigns distinct weather/time per changed road without multiplying count, and headlights turn on."""
+        base = load_fixture("v1")
+        base["environment"] = {"time_of_day": "day", "weather": "clear"}
+        with tempfile.TemporaryDirectory() as tmp:
+            man = scenario_variants.build_variants(
+                base, tmp,
+                road_presets="3", timing_presets="3",
+                crashing_only=True, vary_weather=True, log_fn=None,
+            )
+            # 3 roads x 3 crashing timings = 9 (NOT 27!), with 3 distinct weather presets (1 per road)
+            self.assertEqual(len(man["variants"]), 9)
+            self.assertTrue(all(e["expected_outcome"] == "collision" for e in man["variants"]))
+            by_road = {}
+            for e in man["variants"]:
+                by_road.setdefault(e["road"], set()).add(e["weather"])
+            self.assertEqual(by_road["original"], {"original"})
+            self.assertEqual(len({next(iter(s)) for s in by_road.values()}), 3)
+
+        # Explicit --weather-variants supports <time>:<weather>, product mode reuses same road map signature!
+        with tempfile.TemporaryDirectory() as tmp:
+            man_w = scenario_variants.build_variants(
+                load_fixture("v3"), tmp,
+                road_presets="original", timing_presets="original",
+                weather_presets="original,night:rain,dawn:fog,day:storm", log_fn=None,
+            )
+            self.assertEqual(len(man_w["variants"]), 4)
+            sigs = [local_pipeline._road_map_signature(e["dir"]) for e in man_w["variants"]]
+            self.assertEqual(len(set(sigs)), 1)        # identical road -> zero extra CARLA map reloads!
+            envs = [(e["environment"]["time_of_day"], e["environment"]["weather"]) for e in man_w["variants"]]
+            self.assertEqual(envs[1:], [("night", "rain"), ("dawn", "fog"), ("day", "storm")])
+
+        # Weather parameters and automatic headlights
+        self.assertEqual(motion_runner.vehicle_lights_for({"time_of_day": "day", "weather": "clear"}), ())
+        self.assertIn("low_beam", motion_runner.vehicle_lights_for({"time_of_day": "night", "weather": "clear"}))
+        self.assertIn("fog", motion_runner.vehicle_lights_for({"time_of_day": "dawn", "weather": "fog"}))
+        storm_w = motion_runner.weather_for({"time_of_day": "day", "weather": "storm"})
+        self.assertGreater(storm_w["precipitation"], 80.0)
+        self.assertGreater(storm_w["wetness"], 85.0)
+
+        # XSD validation of new dawn/storm environment in OpenSCENARIO export
+        xsd = FIX / "OpenSCENARIO.xsd"
+        if xsd.exists():
+            try:
+                import xmlschema  # noqa: F401
+                has_xsd = True
+            except ImportError:
+                has_xsd = False
+            if has_xsd:
+                def samples(x0, y, v):
+                    return [[round(i * 0.05, 3), x0 + v * i * 0.05, y, 0.2, 0.0, v] for i in range(40)]
+                rec = {"frame": "carla", "dt": 0.05, "actors": {
+                    "v1": {"type": "car", "blueprint": "vehicle.dodge.charger", "samples": samples(0.0, 5.25, 14.0)},
+                }}
+                for env in ({"time_of_day": "dawn", "weather": "fog"}, {"time_of_day": "night", "weather": "storm"}):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        Path(tmp, "w_trajectories.json").write_text(json.dumps(rec))
+                        Path(tmp, "w_motion.json").write_text(json.dumps({"ego": "v1", "environment": env}))
+                        Path(tmp, "w.xodr").write_text("<OpenDRIVE/>")
+                        xosc_export.export_scene(tmp, "w", xsd_path=xsd)
+
     def test_real_result_specs_build_clean_road_and_timing_matrices(self):
         """End-to-end check on real pipeline specs (results/1 highway fork cut-in, results/2 third-party, results/3 crossroad)."""
         for idx in ("1", "2", "3"):

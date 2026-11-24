@@ -570,35 +570,51 @@ def apply_road_design(base_spec, preset_name):
 TIMING_PRESETS = {
     "original": {
         "label": "Original collision timing from footage",
-        "mode": "original",
+        "mode": "original", "crashing": True,
     },
     "earlier_collision": {
         "label": "Same collision ~1.5 s earlier",
-        "mode": "shift_collision", "time_shift_s": -1.5,
+        "mode": "shift_collision", "time_shift_s": -1.5, "crashing": True,
     },
     "later_collision": {
         "label": "Same collision ~1.5 s later",
-        "mode": "shift_collision", "time_shift_s": 1.5,
+        "mode": "shift_collision", "time_shift_s": 1.5, "crashing": True,
+    },
+    "much_earlier_collision": {
+        "label": "Same collision ~2.5 s earlier",
+        "mode": "shift_collision", "time_shift_s": -2.5, "crashing": True,
+    },
+    "much_later_collision": {
+        "label": "Same collision ~2.8 s later",
+        "mode": "shift_collision", "time_shift_s": 2.8, "crashing": True,
+    },
+    "fast_collision": {
+        "label": "Faster approach (~1.25x speed), synced collision",
+        "mode": "shift_collision", "time_shift_s": -1.0, "speed_scale": 1.25, "crashing": True,
+    },
+    "slow_collision": {
+        "label": "Slower approach (~0.78x speed), synced collision",
+        "mode": "shift_collision", "time_shift_s": 1.2, "speed_scale": 0.78, "crashing": True,
     },
     "near_miss_early": {
         "label": "Aggressor arrives ~0.9 s early (close near-miss, no collision)",
-        "mode": "offset", "outcome": "near_miss", "aggressor_dt_s": -0.9, "cutin_long_m": 6.8,
+        "mode": "offset", "outcome": "near_miss", "aggressor_dt_s": -0.9, "cutin_long_m": 6.8, "crashing": False,
     },
     "near_miss_late": {
         "label": "Aggressor arrives ~0.9 s late (close near-miss, no collision)",
-        "mode": "offset", "outcome": "near_miss", "aggressor_dt_s": 0.9, "cutin_long_m": -7.2,
+        "mode": "offset", "outcome": "near_miss", "aggressor_dt_s": 0.9, "cutin_long_m": -7.2, "crashing": False,
     },
     "miss_early": {
         "label": "Aggressor arrives ~2.2 s early (clean miss, no collision)",
-        "mode": "offset", "outcome": "miss", "aggressor_dt_s": -2.2, "cutin_long_m": 14.0,
+        "mode": "offset", "outcome": "miss", "aggressor_dt_s": -2.2, "cutin_long_m": 14.0, "crashing": False,
     },
     "miss_late": {
         "label": "Aggressor arrives ~2.2 s late (clean miss, no collision)",
-        "mode": "offset", "outcome": "miss", "aggressor_dt_s": 2.2, "cutin_long_m": -14.0,
+        "mode": "offset", "outcome": "miss", "aggressor_dt_s": 2.2, "cutin_long_m": -14.0, "crashing": False,
     },
     "no_aggressor": {
         "label": "Aggressor vehicle does not appear at all (benign baseline)",
-        "mode": "no_aggressor", "outcome": "none",
+        "mode": "no_aggressor", "outcome": "none", "crashing": False,
     },
 }
 
@@ -613,6 +629,16 @@ DEFAULT_TIMING_ORDER = (
     "near_miss_late",
 )
 
+CRASHING_TIMING_ORDER = (
+    "original",
+    "earlier_collision",
+    "later_collision",
+    "fast_collision",
+    "slow_collision",
+    "much_earlier_collision",
+    "much_later_collision",
+)
+
 CUSTOM_DT_RE = re.compile(r"^(dt|shift):([+-]?\d+(?:\.\d+)?)$", re.I)
 
 
@@ -623,7 +649,7 @@ def _resolve_timing_cfg(preset_name):
     if m:
         kind, val = m.group(1).lower(), float(m.group(2))
         if kind == "shift":
-            return {"label": "Collision shifted by %+.1f s" % val, "mode": "shift_collision", "time_shift_s": val}
+            return {"label": "Collision shifted by %+.1f s" % val, "mode": "shift_collision", "time_shift_s": val, "crashing": True}
         abs_v = abs(val)
         if abs_v < 0.45:
             outcome = "collision"
@@ -636,16 +662,26 @@ def _resolve_timing_cfg(preset_name):
             "label": "Aggressor offset %+.1f s (%s)" % (val, outcome),
             "mode": "offset", "outcome": outcome, "aggressor_dt_s": val,
             "cutin_long_m": round(sign * max(5.5, min(20.0, abs_v * 6.5)), 1),
+            "crashing": outcome == "collision",
         }
     raise ValueError("unknown timing preset %r (available: %s, or dt:<sec> / shift:<sec>)" % (
         preset_name, ", ".join(TIMING_PRESETS)))
 
 
-def default_timing_presets(spec, count):
-    """Choose `count` well-balanced timing variations (collision, non-collision timing shifts, and aggressor-absent)."""
+def is_crashing_timing_preset(preset_name):
+    """True when `preset_name` preserves a collision outcome (no misses, near-misses, or aggressor removal)."""
+    return bool(_resolve_timing_cfg(preset_name).get("crashing", False))
+
+
+def default_timing_presets(spec, count, crashing_only=False):
+    """Choose `count` timing variations. When `crashing_only=True`, every returned preset produces a collision."""
     count = max(1, int(count))
-    out = list(DEFAULT_TIMING_ORDER[:count])
-    extra = ("dt:+1.5", "dt:-1.5", "shift:+2.5", "shift:-2.5", "dt:+3.0", "dt:-3.0")
+    if crashing_only:
+        out = list(CRASHING_TIMING_ORDER[:count])
+        extra = ("shift:-2.0", "shift:+2.0", "shift:-3.0", "shift:+3.5", "shift:+4.0")
+    else:
+        out = list(DEFAULT_TIMING_ORDER[:count])
+        extra = ("dt:+1.5", "dt:-1.5", "shift:+2.5", "shift:-2.5", "dt:+3.0", "dt:-3.0")
     for ex in extra:
         if len(out) >= count:
             break
@@ -655,8 +691,8 @@ def default_timing_presets(spec, count):
 
 def apply_timing_variant(base_spec, preset_name):
     """Apply a timing variation to `base_spec` (which may already have been transformed onto another road design).
-    Supports shifted-time collisions, near-misses, clean timing misses where cars don't collide, and removing the
-    aggressor completely while keeping dashcam_actors pointed at the surviving colliding/subject vehicle(s)."""
+    Supports shifted-time collisions, speed-scaled collisions, near-misses, clean timing misses where cars don't
+    collide, and removing the aggressor completely while keeping dashcam_actors pointed at the surviving vehicle(s)."""
     cfg = _resolve_timing_cfg(preset_name)
     spec = copy.deepcopy(base_spec)
     info = corner_case_info(spec)
@@ -701,9 +737,44 @@ def apply_timing_variant(base_spec, preset_name):
 
     if mode == "shift_collision":
         shift_s = float(cfg["time_shift_s"])
+        speed_scale = float(cfg.get("speed_scale", 1.0))
+        if abs(speed_scale - 1.0) > 1e-3:
+            if info["third_party"]:
+                if ev2 is not None and float(ev2.get("speed_kmh", 0.0)) > 1.0:
+                    ev2["speed_kmh"] = round(max(20.0, min(110.0, float(ev2["speed_kmh"]) * speed_scale)), 1)
+                if ev1 is not None and float(ev1.get("speed_kmh", 0.0)) > 1.0:
+                    ev1["speed_kmh"] = round(max(12.0, min(55.0, float(ev1["speed_kmh"]) * speed_scale)), 1)
+            else:
+                if ego.get("behavior") != "stopped" and float(ego.get("speed_kmh", 0.0)) > 1.0:
+                    max_v = 72.0 if road.get("type") == "crossroad" else 120.0
+                    ego["speed_kmh"] = round(max(22.0, min(max_v, float(ego["speed_kmh"]) * speed_scale)), 1)
+                    if isinstance(ego.get("speed_profile"), list):
+                        ego["speed_profile"] = [
+                            [p[0], round(max(12.0, min(max_v, float(p[1]) * speed_scale)), 1)]
+                            for p in ego["speed_profile"]
+                        ]
+                if ev1 is not None and float(ev1.get("speed_kmh", 0.0)) > 1.0:
+                    ev1["speed_kmh"] = round(max(12.0, min(110.0, float(ev1["speed_kmh"]) * speed_scale)), 1)
+                    if isinstance(ev1.get("measured"), dict) and ev1["measured"].get("speed_kmh") is not None:
+                        ev1["measured"] = dict(ev1["measured"])
+                        ev1["measured"]["speed_kmh"] = round(
+                            max(12.0, min(100.0, float(ev1["measured"]["speed_kmh"]) * speed_scale)), 1
+                        )
+        # For straight-road crossing shifted earlier, raise crossing speed so impact genuinely occurs earlier
+        if (
+            shift_s < -0.5
+            and abs(speed_scale - 1.0) <= 1e-3
+            and road.get("type") == "straight"
+            and info["kind"] in ("crossing", "third_party_crossing")
+            and ev1 is not None
+        ):
+            boost = 1.55 if shift_s <= -2.0 else 1.35
+            ev1["speed_kmh"] = round(min(44.0, max(float(ev1.get("speed_kmh", 20.0)) * boost, 26.0)), 1)
+
+        info_after = corner_case_info(spec)
         t_cur = info["event_time_s"]
         if road.get("type") == "crossroad":
-            v_ref = info["subject_speed_ms"]
+            v_ref = info_after["subject_speed_ms"]
             max_arm_t = min(7.5, 86.0 / max(v_ref, 1.0))
             t_new = round(min(max(t_cur + shift_s, 2.8), max(max_arm_t, 3.0)), 2)
         else:
@@ -713,7 +784,8 @@ def apply_timing_variant(base_spec, preset_name):
         if ev1 is not None and isinstance(ev1.get("measured"), dict) and ev1["measured"].get("t_event_s") is not None:
             ev1["measured"]["t_event_s"] = t_new
         notes = list(spec.get("notes") or [])
-        notes.append("timing variant: %s (event time %.2f s -> %.2f s)" % (preset_name, t_cur, t_new))
+        spd_note = (", speed %.2fx" % speed_scale) if abs(speed_scale - 1.0) > 1e-3 else ""
+        notes.append("timing variant: %s (event time %.2f s -> %.2f s%s)" % (preset_name, t_cur, t_new, spd_note))
         spec["notes"] = notes
         return spec
 
@@ -751,79 +823,219 @@ def apply_timing_variant(base_spec, preset_name):
     return spec
 
 
+# ----------------------------------------------------------------------------------------- weather / time-of-day presets
+WEATHER_PRESETS = {
+    "original":    {"label": "Original weather & time from video"},
+    "day_clear":   {"label": "Clear midday sun",            "time_of_day": "day",   "weather": "clear"},
+    "day_cloudy":  {"label": "Overcast daytime",            "time_of_day": "day",   "weather": "cloudy"},
+    "day_rain":    {"label": "Daytime rain & wet road",     "time_of_day": "day",   "weather": "rain"},
+    "day_fog":     {"label": "Dense daytime fog",           "time_of_day": "day",   "weather": "fog"},
+    "day_storm":   {"label": "Heavy rainstorm & slick road", "time_of_day": "day",  "weather": "storm"},
+    "dawn_fog":    {"label": "Early dawn low sun & mist",   "time_of_day": "dawn",  "weather": "fog"},
+    "dusk_clear":  {"label": "Sunset golden hour",          "time_of_day": "dusk",  "weather": "clear"},
+    "dusk_cloudy": {"label": "Overcast dusk twilight",      "time_of_day": "dusk",  "weather": "cloudy"},
+    "dusk_rain":   {"label": "Rainy dusk twilight",         "time_of_day": "dusk",  "weather": "rain"},
+    "night_clear": {"label": "Clear night with headlights", "time_of_day": "night", "weather": "clear"},
+    "night_rain":  {"label": "Rainy night & wet asphalt",   "time_of_day": "night", "weather": "rain"},
+    "night_fog":   {"label": "Foggy night low visibility",  "time_of_day": "night", "weather": "fog"},
+}
+
+DEFAULT_WEATHER_ORDER = (
+    "original",
+    "day_rain",
+    "dusk_cloudy",
+    "night_clear",
+    "day_fog",
+    "night_rain",
+    "dawn_fog",
+    "day_storm",
+    "dusk_rain",
+    "night_fog",
+    "dusk_clear",
+    "day_cloudy",
+    "day_clear",
+)
+
+
+def _resolve_weather_cfg(preset_name):
+    key = str(preset_name).strip().lower()
+    if key in WEATHER_PRESETS:
+        return dict(WEATHER_PRESETS[key])
+    # Accept explicit "<time_of_day>:<weather>" or "<time_of_day>_<weather>" pairs
+    parts = re.split(r"[:/_]", key)
+    if len(parts) == 2 and parts[0] in scene_spec.TIME_OF_DAY and parts[1] in scene_spec.WEATHERS:
+        return {"label": "%s / %s" % (parts[0], parts[1]), "time_of_day": parts[0], "weather": parts[1]}
+    raise ValueError("unknown weather preset %r (available: %s, or <time>:<weather>)" % (
+        preset_name, ", ".join(WEATHER_PRESETS)))
+
+
+def default_weather_presets(spec, count):
+    """Choose `count` visually distinct weather/time presets starting with 'original' and skipping duplicates of the
+    spec's original environment."""
+    count = max(1, int(count))
+    env = spec.get("environment") if isinstance(spec.get("environment"), dict) else {}
+    orig_key = "%s_%s" % (str(env.get("time_of_day", "day")).lower(), str(env.get("weather", "clear")).lower())
+    out = ["original"]
+    for p in DEFAULT_WEATHER_ORDER[1:]:
+        if p == orig_key:
+            continue
+        out.append(p)
+        if len(out) >= count:
+            break
+    if len(out) < count:
+        for p in DEFAULT_WEATHER_ORDER[1:]:
+            if p not in out:
+                out.append(p)
+            if len(out) >= count:
+                break
+    return out[:count]
+
+
+def apply_weather_variant(base_spec, preset_name):
+    """Apply a weather / time-of-day preset onto `base_spec` without altering road geometry or trajectories."""
+    cfg = _resolve_weather_cfg(preset_name)
+    spec = copy.deepcopy(base_spec)
+    if str(preset_name).strip().lower() == "original":
+        return spec
+    spec["environment"] = {"time_of_day": cfg["time_of_day"], "weather": cfg["weather"]}
+    notes = list(spec.get("notes") or [])
+    notes.append("environment variant: %s (%s, %s)" % (preset_name, cfg["time_of_day"], cfg["weather"]))
+    spec["notes"] = notes
+    return spec
+
+
 # ----------------------------------------------------------------------------------------- parsing & matrix generation
 def _safe_slug(text):
     return re.sub(r"[^a-zA-Z0-9_-]+", "_", str(text).strip()).strip("_") or "var"
 
 
-def parse_variant_arg(arg, kind, spec):
+def parse_variant_arg(arg, kind, spec, crashing_only=False):
     """Parse CLI/API variant specification: None -> ['original'], integer/digits -> default N presets,
     'all' -> all compatible presets, or comma-separated preset names."""
     if arg is None or str(arg).strip() == "":
         return ["original"]
     if isinstance(arg, (list, tuple)):
         items = [str(x).strip() for x in arg if str(x).strip()]
-        return items or ["original"]
-    raw = str(arg).strip()
-    if raw.lower() == "all":
-        if kind == "road":
-            return default_road_presets(spec, len(ROAD_PRESETS))
-        return list(DEFAULT_TIMING_ORDER)
-    if raw.isdigit():
-        n = int(raw)
-        if n <= 0:
-            return ["original"]
-        return default_road_presets(spec, n) if kind == "road" else default_timing_presets(spec, n)
-    items = [x.strip() for x in raw.split(",") if x.strip()]
+    else:
+        raw = str(arg).strip()
+        if raw.lower() == "all":
+            if kind == "road":
+                return default_road_presets(spec, len(ROAD_PRESETS))
+            if kind == "weather":
+                return default_weather_presets(spec, len(WEATHER_PRESETS))
+            return list(CRASHING_TIMING_ORDER) if crashing_only else list(DEFAULT_TIMING_ORDER)
+        if raw.isdigit():
+            n = int(raw)
+            if n <= 0:
+                return ["original"]
+            if kind == "road":
+                return default_road_presets(spec, n)
+            if kind == "weather":
+                return default_weather_presets(spec, n)
+            return default_timing_presets(spec, n, crashing_only=crashing_only)
+        items = [x.strip() for x in raw.split(",") if x.strip()]
+    if kind == "timing" and crashing_only:
+        items = [x for x in items if is_crashing_timing_preset(x)]
     return items or ["original"]
 
 
-def generate_variants(base_spec, road_presets=None, timing_presets=None, combine="product"):
-    """Generate a list of variant specs from `base_spec`, supporting road-only, timing-only, or combined
-    road + timing generation.
+def generate_variants(base_spec, road_presets=None, timing_presets=None, combine="product",
+                      crashing_only=False, weather_presets=None, vary_weather=False):
+    """Generate a list of variant specs from `base_spec`, supporting road-only, timing-only, weather-only, or
+    combined road + timing + weather/time generation.
 
-    combine:
-      - 'product' (default): full Cartesian product road_presets x timing_presets, grouped by road_preset
-        so CARLA can reuse the same loaded OpenDRIVE map across timing variants on each road.
-      - 'zip': 1-to-1 pairing (cycling the shorter list if lengths differ).
+    crashing_only:
+      - When True, timing variations include ONLY crashing scenarios (shifted/speed-scaled collisions; no misses,
+        near-misses, or no_aggressor variants).
+    vary_weather:
+      - Convenience flag: automatically assigns a distinct weather/time-of-day preset per changed road map (keeping
+        the total scenario count unchanged when roads are varied; or cycling across variants / generating 4 weather
+        presets when no road/timing variation is specified).
+    weather_presets:
+      - Explicit weather/time presets (count, 'all', or comma-separated names/time:weather pairs), combined according
+        to `combine` ('product' or 'zip').
 
-    Returns [{"id", "road", "timing", "expected_outcome", "spec"}, ...].
+    Returns [{"id", "road", "timing", "weather", "environment", "expected_outcome", "spec"}, ...].
     """
     clean_base, err = scene_spec.normalize(base_spec)
     if clean_base is None:
         raise ValueError("invalid base spec: %s" % err)
     roads = parse_variant_arg(road_presets, "road", clean_base)
-    timings = parse_variant_arg(timing_presets, "timing", clean_base)
+    timings = parse_variant_arg(timing_presets, "timing", clean_base, crashing_only=crashing_only)
 
-    pairs = []
-    if combine == "zip":
-        n = max(len(roads), len(timings))
-        for i in range(n):
-            pairs.append((roads[i % len(roads)], timings[i % len(timings)]))
-        # Stable sort by road preset to maximize CARLA map reuse while keeping deterministic order
-        road_rank = {r: idx for idx, r in enumerate(roads)}
-        pairs.sort(key=lambda rt: road_rank.get(rt[0], 999))
+    triples = []     # (road_name, timing_name, weather_name)
+    if weather_presets is not None and str(weather_presets).strip() != "":
+        weathers = parse_variant_arg(weather_presets, "weather", clean_base)
+        if combine == "zip":
+            n = max(len(roads), len(timings), len(weathers))
+            for i in range(n):
+                triples.append((roads[i % len(roads)], timings[i % len(timings)], weathers[i % len(weathers)]))
+            road_rank = {r: idx for idx, r in enumerate(roads)}
+            triples.sort(key=lambda rtw: road_rank.get(rtw[0], 999))
+        else:
+            for r in roads:
+                for w in weathers:
+                    for t in timings:
+                        triples.append((r, t, w))
+    elif vary_weather:
+        if len(roads) > 1:
+            # Assign one distinct weather/time per road map (original road stays original env, each changed map gets new env)
+            road_weathers = default_weather_presets(clean_base, len(roads))
+            rw_map = {r: road_weathers[i] for i, r in enumerate(roads)}
+            if combine == "zip":
+                n = max(len(roads), len(timings))
+                for i in range(n):
+                    r = roads[i % len(roads)]
+                    triples.append((r, timings[i % len(timings)], rw_map[r]))
+                road_rank = {r: idx for idx, r in enumerate(roads)}
+                triples.sort(key=lambda rtw: road_rank.get(rtw[0], 999))
+            else:
+                for r in roads:
+                    for t in timings:
+                        triples.append((r, t, rw_map[r]))
+        elif len(timings) > 1:
+            tw_list = default_weather_presets(clean_base, len(timings))
+            for i, t in enumerate(timings):
+                triples.append((roads[0], t, tw_list[i]))
+        else:
+            for w in default_weather_presets(clean_base, 4):
+                triples.append((roads[0], timings[0], w))
     else:
-        for r in roads:
-            for t in timings:
-                pairs.append((r, t))
+        if combine == "zip":
+            n = max(len(roads), len(timings))
+            for i in range(n):
+                triples.append((roads[i % len(roads)], timings[i % len(timings)], "original"))
+            road_rank = {r: idx for idx, r in enumerate(roads)}
+            triples.sort(key=lambda rtw: road_rank.get(rtw[0], 999))
+        else:
+            for r in roads:
+                for t in timings:
+                    triples.append((r, t, "original"))
 
     out = []
     seen_ids = set()
-    for r_name, t_name in pairs:
+    any_weather = any(w != "original" for _, _, w in triples)
+    for r_name, t_name, w_name in triples:
         road_spec = apply_road_design(clean_base, r_name)
         var_spec = apply_timing_variant(road_spec, t_name)
-        vid = "road_%s__timing_%s" % (_safe_slug(r_name), _safe_slug(t_name))
+        var_spec = apply_weather_variant(var_spec, w_name)
+        if any_weather and w_name != "original":
+            vid = "road_%s__env_%s__timing_%s" % (_safe_slug(r_name), _safe_slug(w_name), _safe_slug(t_name))
+        else:
+            vid = "road_%s__timing_%s" % (_safe_slug(r_name), _safe_slug(t_name))
         if vid in seen_ids:
             k = 2
             while "%s_%d" % (vid, k) in seen_ids:
                 k += 1
             vid = "%s_%d" % (vid, k)
         seen_ids.add(vid)
+        env_cur = dict(var_spec.get("environment") or {"time_of_day": "day", "weather": "clear"})
         var_spec["variant"] = {
             "id": vid,
             "road": r_name,
             "timing": t_name,
+            "weather": w_name,
+            "environment": env_cur,
             "expected_outcome": var_spec["event"]["type"],
             "dashcam_actors": list(var_spec.get("dashcam_actors") or []),
         }
@@ -834,6 +1046,8 @@ def generate_variants(base_spec, road_presets=None, timing_presets=None, combine
             "id": vid,
             "road": r_name,
             "timing": t_name,
+            "weather": w_name,
+            "environment": env_cur,
             "expected_outcome": norm_var["event"]["type"],
             "spec": norm_var,
         })
@@ -842,20 +1056,29 @@ def generate_variants(base_spec, road_presets=None, timing_presets=None, combine
 
 def format_variants_report(manifest):
     """Readable summary table of all built (and optionally simulated) scenario variants."""
+    w_list = manifest.get("weathers") or ["original"]
+    extra_hdr = (", weathers=%s" % ",".join(w_list)) if any(w != "original" for w in w_list) else ""
+    crash_hdr = ", crashing_only=True" if manifest.get("crashing_only") else ""
     lines = [
-        "Scenario variants: %d total (roads=%s, timings=%s, combine=%s)" % (
+        "Scenario variants: %d total (roads=%s, timings=%s%s, combine=%s%s)" % (
             len(manifest.get("variants") or []),
             ",".join(manifest.get("roads") or []),
             ",".join(manifest.get("timings") or []),
+            extra_hdr,
             manifest.get("combine", "product"),
+            crash_hdr,
         )
     ]
     for item in manifest.get("variants") or []:
+        env = item.get("environment") or {}
+        env_txt = (", env=%s/%s" % (env.get("time_of_day", "day"), env.get("weather", "clear"))) if (
+            item.get("weather") and item.get("weather") != "original"
+        ) else ""
         parts = [
-            "  - %s: road=%s (%dL%s), timing=%s, expect=%s" % (
+            "  - %s: road=%s (%dL%s), timing=%s%s, expect=%s" % (
                 item["id"], item["road_type"], item["lanes_per_direction"],
                 ", curved" if item.get("curved") else (", fork/drop" if item.get("varying") else ""),
-                item["timing"], item["expected_outcome"],
+                item["timing"], env_txt, item["expected_outcome"],
             )
         ]
         if item.get("dashcam_actors"):
@@ -871,11 +1094,15 @@ def format_variants_report(manifest):
 
 
 def build_variants(base_spec, out_dir, road_presets=None, timing_presets=None, combine="product",
+                   crashing_only=False, weather_presets=None, vary_weather=False,
                    scene_id=SCENE_ID, log_fn=print):
-    """Build every requested road/timing variant into `<out_dir>/variants/<variant_id>/` and write
+    """Build every requested road/timing/weather variant into `<out_dir>/variants/<variant_id>/` and write
     `variants_manifest.json` and `variants_report.txt`. Returns the manifest dict."""
     os.makedirs(out_dir, exist_ok=True)
-    variants = generate_variants(base_spec, road_presets=road_presets, timing_presets=timing_presets, combine=combine)
+    variants = generate_variants(
+        base_spec, road_presets=road_presets, timing_presets=timing_presets, combine=combine,
+        crashing_only=crashing_only, weather_presets=weather_presets, vary_weather=vary_weather,
+    )
     var_root = os.path.join(out_dir, "variants")
     os.makedirs(var_root, exist_ok=True)
     entries = []
@@ -890,6 +1117,8 @@ def build_variants(base_spec, out_dir, road_presets=None, timing_presets=None, c
             "rel_dir": os.path.join("variants", item["id"]),
             "road": item["road"],
             "timing": item["timing"],
+            "weather": item["weather"],
+            "environment": item["environment"],
             "road_type": road_sp["type"],
             "lanes_per_direction": road_sp["lanes_per_direction"],
             "one_way": bool(road_sp.get("one_way")),
@@ -902,14 +1131,18 @@ def build_variants(base_spec, out_dir, road_presets=None, timing_presets=None, c
         }
         entries.append(entry)
         if log_fn:
-            log_fn("[variants] built %s (road=%s, timing=%s, expect=%s, dashcam=%s)" % (
-                item["id"], item["road"], item["timing"], item["expected_outcome"], entry["dashcam_actors"]))
+            log_fn("[variants] built %s (road=%s, timing=%s, env=%s/%s, expect=%s, dashcam=%s)" % (
+                item["id"], item["road"], item["timing"],
+                item["environment"]["time_of_day"], item["environment"]["weather"],
+                item["expected_outcome"], entry["dashcam_actors"]))
 
     manifest = {
         "scene_id": scene_id,
         "combine": combine,
+        "crashing_only": bool(crashing_only),
         "roads": list(dict.fromkeys(e["road"] for e in entries)),
         "timings": list(dict.fromkeys(e["timing"] for e in entries)),
+        "weathers": list(dict.fromkeys(e["weather"] for e in entries)),
         "variants": entries,
     }
     with open(os.path.join(out_dir, "variants_manifest.json"), "w", encoding="utf-8") as f:
@@ -921,20 +1154,26 @@ def build_variants(base_spec, out_dir, road_presets=None, timing_presets=None, c
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Generate timing and road-design scenario variants from a scene spec")
+    ap = argparse.ArgumentParser(description="Generate timing, road-design, and weather/time scenario variants from a scene spec")
     ap.add_argument("--spec", required=True, help="path to base *_spec.json")
     ap.add_argument("--out", required=True, help="output directory for generated variants")
     ap.add_argument("--timing-variants", default=None,
                     help="timing variants: count (e.g. 4), 'all', or comma-separated presets (%s)" % ",".join(TIMING_PRESETS))
+    ap.add_argument("--crashing-only", "--crash-only", dest="crashing_only", action="store_true",
+                    help="when changing timings, generate ONLY crashing scenarios (no misses, near-misses, or aggressor removal)")
     ap.add_argument("--road-variants", default=None,
                     help="road variants: count (e.g. 4), 'all', or comma-separated presets (%s)" % ",".join(ROAD_PRESETS))
+    ap.add_argument("--vary-weather", action="store_true",
+                    help="automatically vary weather and time-of-day across changed maps/roads (and turn on headlights at night/rain/fog)")
+    ap.add_argument("--weather-variants", default=None,
+                    help="explicit weather/time presets: count, 'all', or comma-separated presets (%s, or <time>:<weather>)" % ",".join(WEATHER_PRESETS))
     ap.add_argument("--combine", choices=("product", "zip"), default="product",
-                    help="how to combine road and timing variants: full Cartesian 'product' (default) or 1-to-1 'zip'")
+                    help="how to combine road, timing, and explicit weather variants: full Cartesian 'product' (default) or 1-to-1 'zip'")
     ap.add_argument("--sim", action="store_true", help="also simulate every variant in CARLA and export .xosc")
     ap.add_argument("--max-iter", type=int, default=8)
     ap.add_argument("--record", action="store_true", help="record CARLA video for each simulated variant")
     ap.add_argument("--camera", choices=("chase", "dashcam", "both", "dashcam_all"), default="chase")
-    ap.add_argument("--dashcam", action="store_true", help="record dashcam footage mounted on the colliding vehicle(s)")
+    ap.add_argument("--dashcam", action="store_true", help="record dashcam footage mounted on the colliding vehicle(s) and show first-person view")
     ap.add_argument("--dashcam-mode", default="colliders", help="colliders (default), primary, or actor id")
     args = ap.parse_args(argv)
 
@@ -945,6 +1184,9 @@ def main(argv=None):
         road_presets=args.road_variants,
         timing_presets=args.timing_variants,
         combine=args.combine,
+        crashing_only=args.crashing_only,
+        weather_presets=args.weather_variants,
+        vary_weather=args.vary_weather,
     )
     if args.sim:
         from agents import local_pipeline

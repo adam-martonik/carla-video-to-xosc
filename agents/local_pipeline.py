@@ -1861,8 +1861,10 @@ def report(out, spec, ready):
     if spec:
         if isinstance(spec.get("variant"), dict):
             v = spec["variant"]
-            lines.append("Variant: %s (road=%s, timing=%s, expected=%s)" % (
-                v.get("id", "-"), v.get("road", "-"), v.get("timing", "-"), v.get("expected_outcome", "-")))
+            env_v = v.get("environment") or spec.get("environment") or {}
+            lines.append("Variant: %s (road=%s, timing=%s, env=%s/%s, expected=%s)" % (
+                v.get("id", "-"), v.get("road", "-"), v.get("timing", "-"),
+                env_v.get("time_of_day", "day"), env_v.get("weather", "clear"), v.get("expected_outcome", "-")))
         lines.append("Scene: %s road, %d lanes per direction; ego %s at %.0f km/h (%s, %s lane)" % (
             spec["road"]["type"], spec["road"]["lanes_per_direction"], spec["ego"]["type"], spec["ego"]["speed_kmh"],
             spec["ego"]["behavior"], spec["ego"]["lane"]))
@@ -1918,14 +1920,20 @@ def main():
     ap.add_argument("--dashcam-mode", default="colliders", help="dashcam target: colliders (default, all colliding vehicles), primary, or actor id")
     ap.add_argument("--ego-on-collider", action="store_true", help="export the primary colliding vehicle as OpenSCENARIO 'hero'")
     ap.add_argument("--timing-variants", default=None,
-                    help="generate timing variants: count (e.g. 4), 'all', or comma-separated presets (original,earlier_collision,later_collision,near_miss_early,near_miss_late,miss_early,miss_late,no_aggressor)")
+                    help="generate timing variants: count (e.g. 4), 'all', or comma-separated presets (original,earlier_collision,later_collision,fast_collision,slow_collision,near_miss_early,near_miss_late,miss_early,miss_late,no_aggressor)")
+    ap.add_argument("--crashing-only", "--crash-only", dest="crashing_only", action="store_true",
+                    help="when changing timings, produce ONLY crashing scenarios (no misses, near-misses, or aggressor removal)")
     ap.add_argument("--road-variants", default=None,
                     help="generate road-design variants: count (e.g. 4), 'all', or comma-separated presets (original,straight_2lane_twoway,straight_3lane_highway,wide_4lane_highway,curve_left,curve_right,s_curve,lane_drop,highway_fork,crossroad_1lane,crossroad_2lane,crossroad_3lane)")
+    ap.add_argument("--vary-weather", action="store_true",
+                    help="when changing maps/roads, automatically vary weather and time-of-day (with vehicle headlights at night/rain/fog)")
+    ap.add_argument("--weather-variants", default=None,
+                    help="explicit weather/time presets: count (e.g. 4), 'all', or comma-separated presets (original,day_rain,dusk_cloudy,night_clear,day_fog,night_rain,dawn_fog,day_storm,... or <time>:<weather>)")
     ap.add_argument("--variant-combine", choices=("product", "zip"), default="product",
-                    help="combine road and timing variants as Cartesian 'product' (default) or 1-to-1 'zip'")
+                    help="combine road, timing, and explicit weather variants as Cartesian 'product' (default) or 1-to-1 'zip'")
     a = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    want_variants = bool(a.timing_variants or a.road_variants)
+    want_variants = bool(a.timing_variants or a.road_variants or a.vary_weather or a.weather_variants)
     man_fn = os.path.join(a.out, "variants_manifest.json")
     spec = ready = manifest = None
     if not a.sim_only:
@@ -1936,7 +1944,9 @@ def main():
             from agents import scenario_variants
             manifest = scenario_variants.build_variants(
                 spec, a.out, road_presets=a.road_variants, timing_presets=a.timing_variants,
-                combine=a.variant_combine, scene_id=SCENE_ID, log_fn=log,
+                combine=a.variant_combine, crashing_only=a.crashing_only,
+                weather_presets=a.weather_variants, vary_weather=a.vary_weather,
+                scene_id=SCENE_ID, log_fn=log,
             )
     else:
         spec_fn = os.path.join(a.out, SCENE_ID + "_spec.json")
@@ -1946,7 +1956,9 @@ def main():
             from agents import scenario_variants
             manifest = scenario_variants.build_variants(
                 spec, a.out, road_presets=a.road_variants, timing_presets=a.timing_variants,
-                combine=a.variant_combine, scene_id=SCENE_ID, log_fn=log,
+                combine=a.variant_combine, crashing_only=a.crashing_only,
+                weather_presets=a.weather_variants, vary_weather=a.vary_weather,
+                scene_id=SCENE_ID, log_fn=log,
             )
         elif os.path.exists(man_fn):
             manifest = _load(man_fn)

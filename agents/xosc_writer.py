@@ -146,19 +146,19 @@ def build_xosc(scenario):
     env_cfg = scenario.get("environment") if isinstance(scenario.get("environment"), dict) else {}
     tod = str(env_cfg.get("time_of_day") or ("night" if scenario.get("is_night") else "day")).lower()
     wkind = str(env_cfg.get("weather") or "clear").lower()
-    dt_str = {"night": "2026-06-15T23:30:00", "dusk": "2026-06-15T19:45:00"}.get(tod, "2026-06-15T14:00:00")
-    sun_int = {"night": "0.02", "dusk": "0.35"}.get(tod, "0.90")
-    sun_el = {"night": "-0.35", "dusk": "0.15"}.get(tod, "1.20")
-    cloud_state = {"clear": "free", "cloudy": "overcast", "rain": "rainy", "fog": "overcast"}.get(wkind, "free")
-    vis_range = {"fog": "150.0", "rain": "10000.0", "cloudy": "50000.0"}.get(wkind, "100000.0")
-    precip_type = "rain" if wkind == "rain" else "dry"
-    precip_int = "0.6" if wkind == "rain" else "0.0"
+    dt_str = {"night": "2026-06-15T23:30:00", "dusk": "2026-06-15T19:45:00", "dawn": "2026-06-15T06:15:00"}.get(tod, "2026-06-15T14:00:00")
+    sun_int = {"night": "0.02", "dusk": "0.35", "dawn": "0.30"}.get(tod, "0.90")
+    sun_el = {"night": "-0.35", "dusk": "0.15", "dawn": "0.12"}.get(tod, "1.20")
+    cloud_state = {"clear": "free", "cloudy": "overcast", "rain": "rainy", "storm": "rainy", "fog": "overcast"}.get(wkind, "free")
+    vis_range = {"fog": "150.0", "storm": "4000.0", "rain": "10000.0", "cloudy": "50000.0"}.get(wkind, "100000.0")
+    precip_type = "rain" if wkind in ("rain", "storm") else "dry"
+    precip_int = "0.9" if wkind == "storm" else ("0.6" if wkind == "rain" else "0.0")
     _sub(env, "TimeOfDay", animation="false", dateTime=dt_str)
     weather = _sub(env, "Weather", cloudState=cloud_state)
     _sub(weather, "Sun", intensity=sun_int, azimuth="0", elevation=sun_el)
     _sub(weather, "Fog", visualRange=vis_range)
     _sub(weather, "Precipitation", precipitationType=precip_type, intensity=precip_int)
-    default_fric = 0.7 if wkind == "rain" else 1.0
+    default_fric = 0.6 if wkind == "storm" else (0.7 if wkind == "rain" else 1.0)
     _sub(env, "RoadCondition", frictionScaleFactor="%.2f" % float(scenario.get("friction", default_fric)))
     for name, e in zip(names, ents):
         _add_init(init_actions, name, e)
