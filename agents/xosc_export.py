@@ -73,9 +73,10 @@ def crop_time(result, plan, hold_s=0.3):
     return (min(times) + hold_s) if times else None
 
 
-def build_scenario(recording, plan, xodr_name=None, result=None, dt=0.1, hold_s=0.3, description=None):
-    """Turn a recording into the dict that xosc_writer.write_openscenario_xosc expects. Also returns a per-actor report."""
-    ego = (plan or {}).get("ego")
+def build_scenario(recording, plan, xodr_name=None, result=None, dt=0.1, hold_s=0.3, description=None, ego_actor=None):
+    """Turn a recording into the dict that xosc_writer.write_openscenario_xosc expects. Also returns a per-actor report.
+    ego_actor: optional actor id (e.g. primary colliding vehicle) to designate as OpenSCENARIO 'hero' instead of plan['ego']."""
+    ego = ego_actor if (ego_actor and ego_actor in recording.get("actors", {})) else (plan or {}).get("ego")
     t_cut = crop_time(result, plan, hold_s)
     entities, report = [], {}
     t_end = 0.0
@@ -111,7 +112,7 @@ def build_scenario(recording, plan, xodr_name=None, result=None, dt=0.1, hold_s=
     return sc_out, report
 
 
-def export_scene(out_dir, scene_id, dt=0.1, hold_s=0.3, xsd_path=None):
+def export_scene(out_dir, scene_id, dt=0.1, hold_s=0.3, xsd_path=None, ego_actor=None):
     """Read the files of a finished run in out_dir and write <scene_id>.xosc there. Returns (xosc_path, report)."""
     def path(suffix):
         return os.path.join(out_dir, scene_id + suffix)
@@ -129,7 +130,7 @@ def export_scene(out_dir, scene_id, dt=0.1, hold_s=0.3, xsd_path=None):
     plan = load(path("_motion.json"), {})
     result = load(path("_motion_result.json"), None)
     xodr = scene_id + ".xodr" if os.path.exists(path(".xodr")) else None
-    scenario, report = build_scenario(recording, plan, xodr, result, dt=dt, hold_s=hold_s)
+    scenario, report = build_scenario(recording, plan, xodr, result, dt=dt, hold_s=hold_s, ego_actor=ego_actor)
     scenario["scene_id"] = scene_id
     out = xosc_writer.write_openscenario_xosc(scenario, path(".xosc"), xsd_path=xsd_path)
     return out, report
@@ -142,8 +143,9 @@ def main(argv=None):
     ap.add_argument("--dt", type=float, default=0.1, help="trajectory sample step in seconds")
     ap.add_argument("--hold", type=float, default=0.3, help="seconds kept after the first impact")
     ap.add_argument("--xsd", default=None, help="validate against this OpenSCENARIO 1.0 schema")
+    ap.add_argument("--ego-actor", default=None, help="actor id to export as OpenSCENARIO 'hero' (default: plan['ego'])")
     args = ap.parse_args(argv)
-    out, report = export_scene(args.out_dir, args.scene_id, args.dt, args.hold, args.xsd)
+    out, report = export_scene(args.out_dir, args.scene_id, args.dt, args.hold, args.xsd, ego_actor=args.ego_actor)
     for aid, r in report.items():
         print("[xosc] %s: %s" % (aid, r))
     print("[xosc] wrote", out)

@@ -44,10 +44,19 @@ def evaluate(expect, result):
     detail = {"outcome": result.get("outcome"), "reasons": []}
     reasons = detail["reasons"]
     if typ == "none":
-        ego_hits = [e for e in events if e.get("actor") == "v1" and _is_actor_hit(e)]
-        detail["ego_collisions"] = len(ego_hits)
-        if ego_hits:
-            reasons.append("the ego car touched another road user although none was expected")
+        watch = set(actors) | {"v1"}
+        hits = [e for e in events if e.get("actor") in watch and _is_actor_hit(e)]
+        detail["ego_collisions"] = len(hits)
+        if hits:
+            reasons.append("a watched vehicle (%s) touched another road user although none was expected" % hits[0].get("actor"))
+        for e in events:
+            if e.get("actor") in watch and not _is_actor_hit(e):
+                if e.get("other") == "static.road":
+                    iv = e.get("impulse_vec") or [0.0, 0.0, 0.0]
+                    if len(iv) >= 3 and abs(iv[2]) >= math.hypot(iv[0], iv[1]):
+                        continue
+                reasons.append("scenery: %s hit scenery (%s) at %.1f s" % (e.get("actor"), e.get("other"), e.get("t_sim", 0.0)))
+                break
         return not reasons, detail
     a, b = actors[0], actors[1]
     pair = [e for e in events if {e.get("actor"), e.get("other_actor")} == {a, b}]
@@ -85,6 +94,10 @@ def evaluate(expect, result):
                     got_part = zones.get(aid)
                     if got_part is not None and not zones_compatible(got_part, want_part):
                         reasons.append("contact part: %s hit on %s, expected %s" % (aid, got_part, want_part))
+    elif typ == "miss":
+        if pair:
+            reasons.append("the pair touched in a scene that expects a miss (no collision)")
+        t_first = float(expect.get("time_s", 0.0))
     else:   # near_miss
         thr = float(expect.get("max_dist_m", 6.0))
         if pair:
@@ -157,7 +170,7 @@ def search(out_dir, scene_id, run_fn, max_iter=MAX_ITER, log=print):
     base = _load(plan_fn)
     _dump(base, os.path.join(out_dir, scene_id + "_motion_base.json"))
     expect = base.get("expect", {"type": "none", "actors": ["v1"]})
-    variants = NONE_VARIANTS if expect.get("type") == "none" else VARIANTS
+    variants = NONE_VARIANTS if expect.get("type") in ("none", "miss") else VARIANTS
     history, best, it = [], None, 0
     dropped = []                                   # replayed vehicles taken out because they were in the way of the crash
     for variant in variants[:max_iter]:
@@ -190,5 +203,9 @@ def search(out_dir, scene_id, run_fn, max_iter=MAX_ITER, log=print):
     _dump(final_plan, plan_fn)
     out = {"status": status, "expect": expect, "iterations": it, "history": history,
            "best": {"detail": best[3] if best else None}}
+    if best and isinstance(best[2], dict):
+        for k in ("dashcam_actors", "dashcam_videos", "video_path"):
+            if best[2].get(k):
+                out[k] = best[2][k]
     _dump(out, os.path.join(out_dir, scene_id + "_ready.json"))
     return out

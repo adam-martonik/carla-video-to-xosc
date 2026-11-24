@@ -1727,27 +1727,54 @@ def _load_map_with_fallback(client, out):
     return reason
 
 
-def phase2(out, max_iter=8, record_video=False, camera="chase"):
-    from agents import motion_runner, scenario_check, xosc_export
+def _road_map_signature(out_dir, scene_id=SCENE_ID):
+    """Stable hash of the deterministic SUMO road geometry inputs (.nod/.edg/.con) + OpenDRIVE road plan so
+    timing variants on the exact same road reuse the already-loaded CARLA OpenDRIVE world (ignoring netconvert's
+    non-deterministic timestamps and input file paths inside .net.xml)."""
+    import hashlib
+    h = hashlib.sha256()
+    for suffix in (".nod.xml", ".edg.xml", ".con.xml"):
+        fn = os.path.join(out_dir, scene_id + suffix)
+        if os.path.exists(fn):
+            h.update(suffix.encode("utf-8"))
+            with open(fn, "rb") as f:
+                h.update(f.read())
+    plan_fn = os.path.join(out_dir, scene_id + "_motion.json")
+    if os.path.exists(plan_fn):
+        with open(plan_fn, encoding="utf-8") as f:
+            road = json.load(f).get("road") or {}
+        h.update(json.dumps(road, sort_keys=True).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _connect_carla():
     import carla
-    ok = False
-    for attempt in range(6):                       # the server can be busy right after a map change: wait up to ~2 minutes
+    for _ in range(6):                       # the server can be busy right after a map change: wait up to ~2 minutes
         try:
             c = carla.Client("localhost", 2000)
             c.set_timeout(20)
             c.get_world()
-            ok = True
-            break
+            return c
         except Exception:
             time.sleep(5)
-    if not ok:
+    return None
+
+
+def phase2(out, max_iter=8, record_video=False, camera="chase", dashcam=False, dashcam_mode="colliders",
+           ego_on_collider=False, client=None, skip_map_load=False):
+    from agents import motion_runner, scenario_check, xosc_export
+    c = client or _connect_carla()
+    if c is None:
         log("CARLA is not reachable: start the editor, press Play, then run again with --sim-only")
         return None
 
-    fallback = _load_map_with_fallback(c, out)
+    fallback = None if skip_map_load else _load_map_with_fallback(c, out)
 
     def run_fn(load_map):                          # the map is already loaded (once, above); every run starts with a clean cleanup
-        return motion_runner.run_motion(out, SCENE_ID, load_map=False, hold_sec=2.0, record_video=record_video, camera=camera)
+        return motion_runner.run_motion(
+            out, SCENE_ID, load_map=False, hold_sec=2.0,
+            record_video=record_video, camera=camera, dashcam=dashcam, dashcam_mode=dashcam_mode,
+        )
     ready = scenario_check.search(out, SCENE_ID, run_fn, max_iter=max_iter, log=log)
     if fallback:
         ready["map_fallback"] = fallback
@@ -1758,7 +1785,12 @@ def phase2(out, max_iter=8, record_video=False, camera="chase"):
             xsd_use = xsd if os.path.exists(xsd) else None
         except ImportError:
             xsd_use = None
-        xosc_path, _ = xosc_export.export_scene(out, SCENE_ID, xsd_path=xsd_use)
+        ego_override = None
+        if ego_on_collider:
+            da = ready.get("dashcam_actors") or (ready.get("expect") or {}).get("actors") or []
+            if da:
+                ego_override = da[0]
+        xosc_path, _ = xosc_export.export_scene(out, SCENE_ID, xsd_path=xsd_use, ego_actor=ego_override)
         ready["xosc"] = os.path.basename(str(xosc_path))
         log("exported OpenSCENARIO -> %s%s" % (xosc_path, " (XSD validated)" if xsd_use else ""))
     except Exception as e:
@@ -1768,9 +1800,69 @@ def phase2(out, max_iter=8, record_video=False, camera="chase"):
     return ready
 
 
+def phase2_variants(out, manifest=None, max_iter=8, record_video=False, camera="chase",
+                    dashcam=False, dashcam_mode="colliders", ego_on_collider=False):
+    """Simulate every generated variant in `out/variants/` in CARLA, reusing the loaded OpenDRIVE map across
+    timing variants that share the exact same road geometry."""
+    import shutil
+    from agents import scenario_variants
+
+    man_fn = os.path.join(out, "variants_manifest.json")
+    if manifest is None:
+        manifest = _load(man_fn)
+    c = _connect_carla()
+    if c is None:
+        log("CARLA is not reachable: start the editor, press Play, then run again with --sim-only")
+        return manifest
+
+    last_sig = None
+    last_xodr = None
+    variants = manifest.get("variants") or []
+    for idx, entry in enumerate(variants, start=1):
+        vdir = entry["dir"] if os.path.isabs(entry.get("dir", "")) else os.path.join(out, entry["rel_dir"])
+        sig = _road_map_signature(vdir, entry.get("scene_id", SCENE_ID))
+        reuse_map = bool(last_sig is not None and sig == last_sig and last_xodr and os.path.exists(last_xodr))
+        if reuse_map:
+            dst_xodr = os.path.join(vdir, entry.get("scene_id", SCENE_ID) + ".xodr")
+            if os.path.abspath(last_xodr) != os.path.abspath(dst_xodr):
+                shutil.copyfile(last_xodr, dst_xodr)
+        log("simulating variant %d/%d: %s%s" % (idx, len(variants), entry["id"], " (reusing loaded map)" if reuse_map else ""))
+        ready = phase2(
+            vdir, max_iter=max_iter, record_video=record_video, camera=camera,
+            dashcam=dashcam, dashcam_mode=dashcam_mode, ego_on_collider=ego_on_collider,
+            client=c, skip_map_load=reuse_map,
+        )
+        if not reuse_map:
+            last_sig = _road_map_signature(vdir, entry.get("scene_id", SCENE_ID))
+            cand_xodr = os.path.join(vdir, entry.get("scene_id", SCENE_ID) + ".xodr")
+            last_xodr = cand_xodr if os.path.exists(cand_xodr) else None
+        spec_v = _load(os.path.join(vdir, entry.get("scene_id", SCENE_ID) + "_spec.json"))
+        report(vdir, spec_v, ready)
+        if ready:
+            entry["sim_status"] = ready.get("status")
+            entry["sim_iterations"] = ready.get("iterations")
+            if ready.get("xosc"):
+                entry["xosc"] = ready["xosc"]
+            if ready.get("dashcam_actors"):
+                entry["dashcam_actors"] = ready["dashcam_actors"]
+            if ready.get("dashcam_videos"):
+                entry["dashcam_videos"] = ready["dashcam_videos"]
+            if ready.get("video_path"):
+                entry["video_path"] = ready["video_path"]
+    _save(manifest, man_fn)
+    rep = scenario_variants.format_variants_report(manifest)
+    with open(os.path.join(out, "variants_report.txt"), "w", encoding="utf-8") as f:
+        f.write(rep)
+    return manifest
+
+
 def report(out, spec, ready):
     lines = []
     if spec:
+        if isinstance(spec.get("variant"), dict):
+            v = spec["variant"]
+            lines.append("Variant: %s (road=%s, timing=%s, expected=%s)" % (
+                v.get("id", "-"), v.get("road", "-"), v.get("timing", "-"), v.get("expected_outcome", "-")))
         lines.append("Scene: %s road, %d lanes per direction; ego %s at %.0f km/h (%s, %s lane)" % (
             spec["road"]["type"], spec["road"]["lanes_per_direction"], spec["ego"]["type"], spec["ego"]["speed_kmh"],
             spec["ego"]["behavior"], spec["ego"]["lane"]))
@@ -1795,6 +1887,10 @@ def report(out, spec, ready):
             lines.append("  simulated contact parts: " + ", ".join("%s=%s" % (k, v) for k, v in last["contact_parts"].items()) + " at %.1f s" % (last.get("contact_t_sim") or 0.0))
         for r in last.get("reasons", []):
             lines.append("  failed rule: " + r)
+        if ready.get("dashcam_actors"):
+            lines.append("  dashcam on colliding vehicle(s): " + ", ".join(ready["dashcam_actors"]))
+        if ready.get("dashcam_videos"):
+            lines.append("  dashcam videos: " + ", ".join("%s=%s" % (k, os.path.basename(v)) for k, v in ready["dashcam_videos"].items()))
         if ready.get("map_fallback"):
             lines.append("  note: " + ready["map_fallback"])
         if ready.get("xosc"):
@@ -1817,18 +1913,59 @@ def main():
     ap.add_argument("--max-iter", type=int, default=8)
     ap.add_argument("--reuse", action="store_true", help="reuse frame descriptions and scores already in the output folder")
     ap.add_argument("--record", action="store_true", help="record CARLA camera video for the simulation")
-    ap.add_argument("--camera", choices=("chase", "dashcam", "both"), default="chase", help="camera view when --record is set")
+    ap.add_argument("--camera", choices=("chase", "dashcam", "both", "dashcam_all"), default="chase", help="camera view when --record is set")
+    ap.add_argument("--dashcam", action="store_true", help="record dashcam footage mounted on the colliding vehicle(s) (never a bystander)")
+    ap.add_argument("--dashcam-mode", default="colliders", help="dashcam target: colliders (default, all colliding vehicles), primary, or actor id")
+    ap.add_argument("--ego-on-collider", action="store_true", help="export the primary colliding vehicle as OpenSCENARIO 'hero'")
+    ap.add_argument("--timing-variants", default=None,
+                    help="generate timing variants: count (e.g. 4), 'all', or comma-separated presets (original,earlier_collision,later_collision,near_miss_early,near_miss_late,miss_early,miss_late,no_aggressor)")
+    ap.add_argument("--road-variants", default=None,
+                    help="generate road-design variants: count (e.g. 4), 'all', or comma-separated presets (original,straight_2lane_twoway,straight_3lane_highway,wide_4lane_highway,curve_left,curve_right,s_curve,lane_drop,highway_fork,crossroad_1lane,crossroad_2lane,crossroad_3lane)")
+    ap.add_argument("--variant-combine", choices=("product", "zip"), default="product",
+                    help="combine road and timing variants as Cartesian 'product' (default) or 1-to-1 'zip'")
     a = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    spec = ready = None
+    want_variants = bool(a.timing_variants or a.road_variants)
+    man_fn = os.path.join(a.out, "variants_manifest.json")
+    spec = ready = manifest = None
     if not a.sim_only:
         if not a.video and not a.spec:
             ap.error("a video (or --spec) is required")
         spec, _ = phase1(a.video, a.out, a.spec, a.fps, not a.no_assume_crash, a.reuse)
+        if want_variants:
+            from agents import scenario_variants
+            manifest = scenario_variants.build_variants(
+                spec, a.out, road_presets=a.road_variants, timing_presets=a.timing_variants,
+                combine=a.variant_combine, scene_id=SCENE_ID, log_fn=log,
+            )
     else:
-        spec = _load(os.path.join(a.out, SCENE_ID + "_spec.json"))
+        spec_fn = os.path.join(a.out, SCENE_ID + "_spec.json")
+        if os.path.exists(spec_fn):
+            spec = _load(spec_fn)
+        if want_variants and spec is not None:
+            from agents import scenario_variants
+            manifest = scenario_variants.build_variants(
+                spec, a.out, road_presets=a.road_variants, timing_presets=a.timing_variants,
+                combine=a.variant_combine, scene_id=SCENE_ID, log_fn=log,
+            )
+        elif os.path.exists(man_fn):
+            manifest = _load(man_fn)
+    if manifest is not None:
+        from agents import scenario_variants
+        if not a.no_sim:
+            manifest = phase2_variants(
+                a.out, manifest=manifest, max_iter=a.max_iter,
+                record_video=a.record, camera=a.camera,
+                dashcam=a.dashcam, dashcam_mode=a.dashcam_mode,
+                ego_on_collider=a.ego_on_collider,
+            )
+        print(scenario_variants.format_variants_report(manifest))
+        return
     if not a.no_sim:
-        ready = phase2(a.out, a.max_iter, record_video=a.record, camera=a.camera)
+        ready = phase2(
+            a.out, a.max_iter, record_video=a.record, camera=a.camera,
+            dashcam=a.dashcam, dashcam_mode=a.dashcam_mode, ego_on_collider=a.ego_on_collider,
+        )
     print(report(a.out, spec, ready))
 
 

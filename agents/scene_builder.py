@@ -179,21 +179,32 @@ RISE_START_M = 55.0        # ... which it does only once it has pulled away (abo
 
 
 def _required_road_length(spec, s_ego0, v_e, T, plan_ego=None):
-    """Minimum straight-road length (m) so a split/branch and replayed vehicles continue well past the simulation end, or None
-    for plain specs without a branch or replay (keeping legacy 300 m roads unchanged)."""
+    """Minimum straight-road length (m) so a split/branch, replayed vehicles, or timing/road variants continue well past the
+    simulation end, or None for plain specs without them (keeping legacy 300 m roads unchanged)."""
     road = spec.get("road") or {}
     if road.get("type") != "straight":
         return None
     prof = road.get("lane_profile") or []
     has_branch = any(isinstance(sc, dict) and sc.get("branch") for sc in prof)
     replay = spec.get("replay") or []
-    if not has_branch and not replay:
+    ev = spec.get("event") or {}
+    has_variant_ext = bool(
+        spec.get("variant") or spec.get("ego_s_start") is not None
+        or ev.get("aggressor_time_offset_s") is not None
+        or ev.get("aggressor_long_offset_m") is not None
+        or ev.get("time_shift_s") is not None
+    )
+    if not has_branch and not replay and not has_variant_ext:
         return None
     ego = spec.get("ego") or {}
     pe = plan_ego or {"mode": "static" if ego.get("behavior") == "stopped" else "drive",
                       "speed_profile": ego.get("speed_profile")}
     s_ego_t = _ego_travel(pe, v_e)
-    s_sim_end = s_ego0 + s_ego_t(T + 8.0)
+    t_extra = max(0.0, float(ev.get("aggressor_time_offset_s") or 0.0)) + max(0.0, float(ev.get("time_shift_s") or 0.0))
+    s_sim_end = s_ego0 + s_ego_t(T + t_extra + 8.0)
+    if not has_branch and not replay:
+        need = max(300.0, s_sim_end + 120.0)
+        return round(need, 1) if need > 300.5 else None
     need = max(500.0, s_sim_end + 250.0)
     for sc in prof:
         if isinstance(sc, dict) and sc.get("branch") and sc.get("d0") is not None:
@@ -364,7 +375,7 @@ def write_net(road, out_dir, scene_id, signals):
 
 
 # ----------------------------------------------------------------------------------------- measured traffic
-def traffic_actors(traffic, ego_kmh, T, lane_idx, road, existing):
+def traffic_actors(traffic, ego_kmh, T, lane_idx, road, existing, s_ego0=S_START):
     """Extra, non-event vehicles from the per-lane counts measured in the video. Returns (actors, notes).
     Vehicles in front are placed far enough ahead that neither the ego car nor the cutting car reaches them before the event
     has finished (T + 3 s), even when they are slower than the ego car."""
@@ -380,7 +391,7 @@ def traffic_actors(traffic, ego_kmh, T, lane_idx, road, existing):
     base = max(v_e - v_t_kmh / 3.6, 0.0) * (T + 3.0) + 25.0
     if has_cross:
         base = max(base, v_e * T + 35.0)
-    room = road.end_s - S_START
+    room = road.end_s - s_ego0
     taken = {}
     for a in existing:
         taken.setdefault((a["relation"], a["lane"]), []).append(a["distance_m"])
@@ -401,13 +412,13 @@ def traffic_actors(traffic, ego_kmh, T, lane_idx, road, existing):
     for i in range(n["ego_lane_ahead"]):
         add("ahead", "same", base + 12.0 * i, v_t_kmh)
     if n["left_lane"]:
-        if not road.has_lane(S_START, lane_idx + 1):
+        if not road.has_lane(s_ego0, lane_idx + 1):
             notes.append("traffic: the ego car is in the left-most lane, no left lane for %d vehicle(s)" % n["left_lane"])
         else:
             for i in range(n["left_lane"]):
                 add("ahead", "left", base + 12.0 * i, v_t_kmh)
     if n["right_lane"]:
-        if not road.has_lane(S_START, lane_idx - 1):
+        if not road.has_lane(s_ego0, lane_idx - 1):
             notes.append("traffic: the ego car is in the right-most lane, no right lane for %d vehicle(s)" % n["right_lane"])
         else:
             for i in range(n["right_lane"]):
@@ -1117,25 +1128,46 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
         and ev_actor["relation"] in ("cross_left", "cross_right")
         and ev2["relation"] in ("behind", "beside")
     )
+    crossroad_tp_straight = (
+        third_party
+        and spec["road"]["type"] == "crossroad"
+        and ev_actor["relation"] in ("cross_left", "cross_right")
+        and ev2["relation"] in ("behind", "beside")
+    )
+    agg_dt = float(event["aggressor_time_offset_s"]) if event.get("aggressor_time_offset_s") is not None else None
+    agg_long_m = float(event["aggressor_long_offset_m"]) if event.get("aggressor_long_offset_m") is not None else None
+    t_shift = float(event.get("time_shift_s") or 0.0)
     t_ev_meas = ((ev_actor.get("measured") or {}).get("t_event_s")) if (ev_actor is not None and not third_party) else None
     if t_ev_meas is not None:
         T = min(max(float(t_ev_meas), 3.0), 12.0)
     else:
         T = min(max(event["time_s"], 3.0), 8.0) if ev_actor is not None else 6.0       # simulated time of the event
-    s_ego0_est = 65.0 if straight_tp_cross else S_START
+    if spec.get("ego_s_start") is not None:
+        s_ego0_est = float(spec["ego_s_start"])
+    elif straight_tp_cross:
+        if agg_dt is not None or abs(t_shift) > 1e-6:
+            v_c2_est = max(ev2["speed_kmh"] / 3.6, 1.0)
+            t_c2_need = 3.2 + max(t_shift, 0.0) + max(-(agg_dt or 0.0), 0.0)
+            s_ego0_est = max(65.0, round(v_c2_est * t_c2_need + 10.0, 1))
+        else:
+            s_ego0_est = 65.0
+    elif agg_long_m is not None and agg_long_m < -5.0:
+        s_ego0_est = max(S_START, round(abs(agg_long_m) + 10.0, 1))
+    else:
+        s_ego0_est = S_START
     min_len = _required_road_length(spec, s_ego0_est, v_e, T)
     road = Road(spec["road"]["type"], spec["road"]["lanes_per_direction"], spec["road"].get("centerline"), spec["road"].get("one_way", False), min_length=min_len)
     lane_idx = 0 if ego["lane"] == "right" or road.L == 1 else road.L - 1
-    if straight_tp_cross and road.L < 2:
-        road = Road("straight", 2, spec["road"].get("centerline"), spec["road"].get("one_way", False), min_length=min_len)
+    if (straight_tp_cross or crossroad_tp_straight) and road.L < 2:
+        road = Road(spec["road"]["type"], 2, spec["road"].get("centerline"), spec["road"].get("one_way", False), min_length=min_len)
         lane_idx = 0 if ego["lane"] == "right" else road.L - 1
     if road.kind == "straight" and spec["road"].get("lane_profile") and not (third_party and not straight_tp_cross):
-        s_ego0 = 65.0 if straight_tp_cross else S_START
+        s_ego0 = s_ego0_est
         ego_trav_est = _ego_travel({"mode": "static" if ego["behavior"] == "stopped" else "drive",
                                     "speed_profile": ego.get("speed_profile")}, v_e)(T)
         road, lane_idx, pnote = _road_with_profile(spec, road, s_ego0, ego_trav_est, ev_actor, min_length=min_len)
         notes.append(pnote)
-    if third_party and not straight_tp_cross:
+    if third_party and not straight_tp_cross and not crossroad_tp_straight:
         # the crash is between two other road users: they meet in the junction while the ego car passes by
         if spec["road"]["type"] == "straight":
             notes.append("third-party crash needs a junction: road changed to crossroad")
@@ -1151,8 +1183,9 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
     expect = None
 
     # ---- ego geometry ---------------------------------------------------------------------------------
+    s_ego = s_ego0_est
     if road.kind == "straight":
-        heading = road.lane_heading(S_START)
+        heading = road.lane_heading(s_ego)
         end_pt = road.end_point(lane_idx)
     else:
         ego_x = road.northbound_x(lane_idx)
@@ -1162,15 +1195,24 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
         end_pt = [ego_x, road.C[1] + 90.0]
 
     stop_behaviours = ego["behavior"] in ("slow_to_stop", "stopped")
+    miss_needs_avoid = (
+        event["type"] == "miss"
+        and ev_actor is not None
+        and (
+            ev_actor["relation"] == "ahead"
+            or ((ev_actor["relation"] == "beside" or ev_actor["behavior"] == "cutting_in") and (agg_long_m or 0.0) > 3.0)
+        )
+    )
     plan_ego = {"mode": "drive", "speed_kmh": ego["speed_kmh"], "already_moving": ego["speed_kmh"] > 3 and ego["behavior"] != "stopped",
-                "avoid": ev_actor is None or event["type"] == "near_miss" or third_party}
+                "avoid": ev_actor is None or event["type"] == "near_miss" or third_party or miss_needs_avoid}
     if ev_actor is not None and (ev_actor["relation"] == "beside" or ev_actor["behavior"] == "cutting_in"):
-        plan_ego["avoid"] = False
+        if not miss_needs_avoid:
+            plan_ego["avoid"] = False
 
     # conflict point with the event actor (for crossing actors on a crossroad)
     conflict = None
     if ev_actor is not None and road.kind == "crossroad" and ev_actor["relation"] in ("cross_left", "cross_right") \
-            and ev_actor["type"] != "pedestrian":
+            and ev_actor["type"] != "pedestrian" and not crossroad_tp_straight:
         ay = road.eastbound_y(0) if ev_actor["relation"] == "cross_left" else road.westbound_y(0)
         conflict = (ego_x, ay)
     elif ev_actor is not None and ev_actor["type"] == "pedestrian":
@@ -1178,7 +1220,11 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
 
     # ---- ego start and path ---------------------------------------------------------------------------
     if road.kind == "crossroad":
-        if stop_behaviours:
+        if crossroad_tp_straight and ego["behavior"] == "stopped":
+            y0 = road.C[1] - road.half_j - 4.0
+            plan_ego = {"mode": "static"}
+            t_ego_conflict = T
+        elif stop_behaviours:
             # the ego car stops short of the conflict point (collision: close enough for contact, near miss: a bit further)
             gap = {"collision": 1.5, "near_miss": 4.0}.get(event["type"], 8.0) if conflict else (road.half_j + 2.0)
             stop_y = (conflict[1] - gap) if conflict else (road.C[1] - road.half_j - 2.0)
@@ -1197,6 +1243,9 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 T_eff = min(T, 95.0 / max(v_e, 1.0))          # the ego car reaches the conflict point at the event time
                 y0 = conflict[1] - v_e * T_eff
                 t_ego_conflict = T_eff
+            elif spec.get("variant") and ev_actor is not None and (ev_actor["relation"] == "beside" or ev_actor["behavior"] == "cutting_in"):
+                y0 = road.C[1] - 90.0
+                t_ego_conflict = T
             else:
                 y0 = road.C[1] - 45.0
                 t_ego_conflict = T
@@ -1210,12 +1259,11 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
             t_ego_conflict = (conflict[1] - y0) / max(v_e, 1.0)
         agents["v1"] = {"type": ego["type"], "x": ego_x, "y": y0, "heading": 90.0}
     else:
-        s_ego = 65.0 if straight_tp_cross else S_START
         x0, y0 = road.lane_point(s_ego, lane_idx)
         plan_ego["path"] = [end_pt]
         t_ego_conflict = T
         agents["v1"] = {"type": ego["type"], "x": x0, "y": y0, "heading": road.lane_heading(s_ego)}
-        if straight_tp_cross and ego["behavior"] == "stopped":
+        if (straight_tp_cross or spec.get("ego_s_start") is not None) and ego["behavior"] == "stopped":
             plan_ego = {"mode": "static"}
         elif stop_behaviours:
             stop_s = s_ego + v_e * v_e / (2 * 3.0) + 6.0
@@ -1229,7 +1277,7 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
     ego_start = (agents["v1"]["x"], agents["v1"]["y"])
     if any(tr.get(k, 0) for k in TRAFFIC_LANES):
         if road.kind == "straight":
-            extra, tnotes = traffic_actors(tr, ego["speed_kmh"], T, lane_idx, road, actors)
+            extra, tnotes = traffic_actors(tr, ego["speed_kmh"], T, lane_idx, road, actors, s_ego0=s_ego)
         else:
             extra, tnotes = crossroad_traffic_actors(tr, ego["speed_kmh"], lane_idx, road, actors, ego_start[1])
         actors = actors + extra
@@ -1240,17 +1288,40 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
     n_cross = 0
     placed_bg_s = {}
     placed_adj_y = {}
-    tp_cross_s = (65.0 + min(max(ev_actor["distance_m"], 6.5), 11.0)) if straight_tp_cross else None
-    tp_k2 = (max(lane_idx - 1, 0) if ev2["lane"] == "right" else min(lane_idx + 1, road.L - 1)) if straight_tp_cross else None
+    tp_cross_s = (s_ego + min(max(ev_actor["distance_m"], 6.5), 11.0)) if straight_tp_cross else None
+    tp_k2 = (max(lane_idx - 1, 0) if ev2["lane"] == "right" else min(lane_idx + 1, road.L - 1)) if (straight_tp_cross or crossroad_tp_straight) else None
     if straight_tp_cross:
         tp_k2 = road.clamp_lane(tp_cross_s, tp_k2)
     tp_t_cross = None
+    tp_t_c2 = None
+    tp_c1_delay = 0.0
     if straight_tp_cross:
         d_left_tp = (0.0 if road.one_way else road.Lw * W) + shoulder_m - 1.5
         d_right_tp = road.right_edge_d(tp_cross_s) - (shoulder_m - 1.5)
         d_start_tp = d_left_tp if ev_actor["relation"] == "cross_left" else d_right_tp
         d_conf_tp = lane_offset(road.L, tp_k2)
         tp_t_cross = abs(d_start_tp - d_conf_tp) / max(ev_actor["speed_kmh"] / 3.6, 1.0)
+        if agg_dt is None and abs(t_shift) < 1e-6:
+            tp_t_c2 = tp_t_cross
+            tp_c1_delay = 0.0
+        else:
+            dt_tp = float(agg_dt or 0.0)
+            tp_t_c2 = max(tp_t_cross + t_shift, 1.8)
+            t_c1_tp = tp_t_c2 + dt_tp
+            if t_c1_tp < tp_t_cross:
+                shift_up = tp_t_cross - t_c1_tp
+                t_c1_tp = tp_t_cross
+                tp_t_c2 += shift_up
+            tp_c1_delay = max(0.0, t_c1_tp - tp_t_cross)
+    cr_tp_ay = cr_tp_px = cr_tp_t_c2 = cr_tp_t_c1 = None
+    if crossroad_tp_straight:
+        left_cr = ev_actor["relation"] == "cross_left"
+        cr_tp_ay = road.eastbound_y(0) if left_cr else road.westbound_y(0)
+        cr_tp_px = road.northbound_x(tp_k2)
+        v_c2_cr = max(ev2["speed_kmh"] / 3.6, 1.0)
+        max_t_c2 = (cr_tp_ay - (road.C[1] - 95.0)) / v_c2_cr
+        cr_tp_t_c2 = max(1.8, min(T, max_t_c2))
+        cr_tp_t_c1 = max(1.0, cr_tp_t_c2 + float(agg_dt or 0.0))
     for n, a in enumerate(actors, start=2):
         vid = "v%d" % n
         idmap[a["id"]] = vid
@@ -1262,22 +1333,28 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
         if a["type"] == "pedestrian":
             # crosses the ego path ahead of the ego car, from the side given by the relation
             side = 1.0 if a["relation"] != "cross_right" else -1.0
+            ped_dist = a["distance_m"]
+            if is_ev and agg_dt is not None and agg_dt < 0.0 and ego["behavior"] == "cruise" and v_e > 1.0:
+                min_walk_t = (road.L * W + 1.5) / 1.4
+                ped_dist = max(ped_dist, v_e * (min_walk_t - agg_dt + 0.5))
             if road.kind == "straight":
-                ps = S_START + a["distance_m"]
+                ps = min(s_ego + ped_dist, road.end_s - 10.0)
                 y_edge = road.L * W + 1.5
                 start, dest = road.frame.to_xy(ps, -side * y_edge), road.frame.to_xy(ps, side * y_edge)
                 agents[vid] = {"type": "pedestrian", "x": start[0], "y": start[1], "heading": road.lane_heading(ps) + 90.0 * side}
                 walk = abs(lane_offset(road.L, lane_idx) - (-side * y_edge))
             else:
-                py = ego_start[1] + a["distance_m"]
+                py = min(ego_start[1] + ped_dist, road.C[1] + 85.0)
                 x_edge = road.L * W + 1.5
                 start, dest = (ego_x - side * x_edge, py), (ego_x + side * x_edge, py)
                 agents[vid] = {"type": "pedestrian", "x": start[0], "y": start[1], "heading": 0.0 if side > 0 else 180.0}
                 walk = abs(ego_x - start[0])
             speed = 1.4
             t_ped_at_lane = walk / speed
-            t_arrive = (a["distance_m"] / max(v_e, 1.0)) if ego["behavior"] == "cruise" else T
-            if event["type"] == "near_miss" and is_ev:
+            t_arrive = (ped_dist / max(v_e, 1.0)) if ego["behavior"] == "cruise" else T
+            if is_ev and agg_dt is not None:
+                t_arrive += agg_dt
+            elif event["type"] == "near_miss" and is_ev:
                 t_arrive += 1.0
             spec_p = {"mode": "walk", "speed_ms": speed, "path": [list(dest)],
                       "start": {"type": "time", "t": round(max(t_arrive - t_ped_at_lane, 0.0), 2)}}
@@ -1292,14 +1369,14 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 kc = min(lane_idx + off, road.L - 1) if left else max(lane_idx - off, 0)
                 if kc == lane_idx:
                     continue
-                if road.kind == "straight" and not (road.has_lane(S_START, kc) and road.has_lane(S_START + d_check, kc)):
+                if road.kind == "straight" and not (road.has_lane(s_ego, kc) and road.has_lane(s_ego + d_check, kc)):
                     continue
                 k_src = kc
                 break
             if k_src == lane_idx:
                 notes.append("%s: the road has no neighbouring lane, placed ahead in the ego lane" % a["id"])
                 if road.kind == "straight":
-                    sn = S_START + max(a["distance_m"], 15.0)
+                    sn = s_ego + max(a["distance_m"], 15.0)
                     agents[vid] = {"type": a["type"], "x": road.lane_point(sn, lane_idx)[0], "y": road.lane_point(sn, lane_idx)[1],
                                    "heading": road.lane_heading(sn)}
                 else:
@@ -1308,44 +1385,57 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
             else:
                 v = v_e if v_e > 2.0 else max(v_a, 3.0)
                 if road.kind == "straight":
-                    lane_pt = lambda k, s_: road.lane_point(S_START + s_, k)
-                    end_s = road.end_s - S_START
-                    blend = lambda s_, f: road.frame.to_xy(S_START + s_, lane_offset(road.L, k_src) + (lane_offset(road.L, lane_idx) - lane_offset(road.L, k_src)) * f)
-                    head = road.lane_heading(S_START)
+                    lane_pt = lambda k, s_: road.lane_point(s_ego + s_, k)
+                    end_s = road.end_s - s_ego
+                    blend = lambda s_, f: road.frame.to_xy(s_ego + s_, lane_offset(road.L, k_src) + (lane_offset(road.L, lane_idx) - lane_offset(road.L, k_src)) * f)
+                    head = road.lane_heading(s_ego)
                 else:
                     lane_pt = lambda k, s_: (road.northbound_x(k), ego_start[1] + s_)
                     end_s = road.C[1] + 90.0 - ego_start[1]
                     blend = lambda s_, f: (road.northbound_x(k_src) + (road.northbound_x(lane_idx) - road.northbound_x(k_src)) * f, ego_start[1] + s_)
                     head = 90.0
-                lead = {"collision": 1.4, "near_miss": 0.6}.get(event["type"], 0.0) if is_ev else 0.0
+                lead = {"collision": 1.4, "near_miss": 0.6, "miss": 1.4}.get(event["type"], 0.0) if is_ev else 0.0
                 t_start = max(T - lead, 0.8) if is_ev else 2.0          # the lane change begins this long after the start
                 dur = 2.4                                                # and takes this long
                 s0 = 1.0                                                 # starts alongside the ego car, 1 m ahead of its centre
                 if is_ev and road.kind == "straight":
                     # closed loop: the motion runner steers this car from the live ego position (agents/intercept.py)
                     lanes_crossed = abs(k_src - lane_idx)
-                    side_strike = bool(isinstance(meas, dict) and meas.get("side_strike") and event["type"] == "collision")
-                    long_off = -0.3 if side_strike else 1.0
+                    has_long_shift = agg_long_m is not None
+                    side_strike = bool(isinstance(meas, dict) and meas.get("side_strike") and event["type"] == "collision" and not has_long_shift)
+                    long_off = float(agg_long_m) if has_long_shift else (-0.3 if side_strike else 1.0)
                     s0 = long_off
                     cruise_ms = None
                     head_i = head
-                    if isinstance(meas, dict) and meas.get("overtake"):
+                    if isinstance(meas, dict) and meas.get("overtake") and not (has_long_shift and long_off > 3.0):
                         v_c = max(float(meas.get("speed_kmh", 20.0)) / 3.6, 5.0)
                         if v_e > 6.0:
                             v_c = min(v_c, 0.85 * v_e)
-                        lead = {"collision": 2.0, "near_miss": 1.0}.get(event["type"], lead)
+                        lead = {"collision": 2.0, "near_miss": 1.0, "miss": 1.8}.get(event["type"], lead)
                         s_ev = _ego_travel(plan_ego, v_e)(T)
-                        s0_cand = max(1.0, min(s_ev + long_off - v_c * T, road.end_s - S_START - 20.0))
-                        if road.has_lane(S_START + s0_cand, k_src):
+                        s0_cand = max(1.0, min(s_ev + long_off - v_c * T, road.end_s - s_ego - 20.0))
+                        if road.has_lane(s_ego + s0_cand, k_src):
                             s0, v = s0_cand, v_c
                             cruise_ms = round(v_c, 2)
-                            head_i = road.lane_heading(S_START + s0)
+                            head_i = road.lane_heading(s_ego + s0)
+                    elif has_long_shift and long_off > 3.0:
+                        v = max(v_e, v_a, 6.0)
+                        head_i = road.lane_heading(s_ego + s0)
+                    elif has_long_shift and long_off < -3.0:
+                        head_i = road.lane_heading(max(3.0, s_ego + s0))
                     if lanes_crossed >= 2:
                         lead = round(lead + 0.5 * (lanes_crossed - 1), 2)
                     x_i, y_i = lane_pt(k_src, s0)
                     agents[vid] = {"type": a["type"], "x": x_i, "y": y_i, "heading": head_i}
                     d_src, d_dst = lane_offset(road.L, k_src), lane_offset(road.L, lane_idx)
-                    aim = 0.0 if event["type"] == "collision" else (2.6 if d_src > d_dst else -2.6)     # a near miss keeps a 0.6 m gap
+                    if has_long_shift and abs(long_off) >= 4.0:
+                        aim = 0.0
+                    elif event["type"] == "collision":
+                        aim = 0.0
+                    elif event["type"] == "miss":
+                        aim = 3.2 if d_src > d_dst else -3.2
+                    else:
+                        aim = 2.6 if d_src > d_dst else -2.6            # a near miss keeps a 0.6 m gap
                     icp_d = {"kind": "cut_in", "target": "v1", "lead_s": lead, "aim_offset_m": aim, "t_event_s": round(T, 2),
                              "lane_src_d": d_src, "lane_dst_d": d_dst}
                     if cruise_ms is not None:
@@ -1355,9 +1445,13 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     if side_strike:
                         icp_d["long_offset_m"] = long_off
                         icp_d["side_strike"] = True
+                    elif has_long_shift:
+                        icp_d["long_offset_m"] = round(long_off, 2)
                     spec_p = {"mode": "drive", "speed_kmh": round(v * 3.6, 1), "already_moving": True, "avoid": False,
                               "intercept": icp_d}
                 else:
+                    if is_ev and agg_long_m is not None:
+                        s0 = max(float(agg_long_m), -(ego_start[1] - (road.C[1] - 95.0)) + 2.0) if road.kind == "crossroad" else float(agg_long_m)
                     s_ls = s0 + v * t_start
                     pts = [lane_pt(k_src, s_) for s_ in [s0 + 2.0 * j for j in range(int((s_ls - s0) / 2.0) + 1)]]
                     n_lc = 8
@@ -1368,7 +1462,7 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     s_c = s_ls + v * dur
                     while s_c < end_s:
                         s_c += 4.0
-                        k_c = road.clamp_lane(S_START + min(s_c, end_s), lane_idx) if road.kind == "straight" else lane_idx
+                        k_c = road.clamp_lane(s_ego + min(s_c, end_s), lane_idx) if road.kind == "straight" else lane_idx
                         pts.append(lane_pt(k_c, min(s_c, end_s)))
                     agents[vid] = {"type": a["type"], "x": pts[0][0], "y": pts[0][1], "heading": head}
                     spec_p = {"mode": "drive", "speed_kmh": round(v * 3.6, 1), "already_moving": True, "avoid": False,
@@ -1376,7 +1470,7 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
         elif road.kind == "straight":
             rel = a["relation"]
             if straight_tp_cross and a is ev2:
-                s_c2 = max(tp_cross_s - max(v_a, 1.0) * tp_t_cross, 5.0)
+                s_c2 = max(tp_cross_s - max(v_a, 1.0) * tp_t_c2, 5.0)
                 agents[vid] = {"type": a["type"], "x": road.lane_point(s_c2, tp_k2)[0], "y": road.lane_point(s_c2, tp_k2)[1],
                                "heading": road.lane_heading(s_c2)}
                 spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": False,
@@ -1385,18 +1479,27 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 left = rel == "cross_left"
                 d_left = (0.0 if road.one_way else road.Lw * W) + shoulder_m - 1.5
                 ps = None
+                cross_delay = 0.0
                 for _ in range(2 if road.varying else 1):      # the right edge (where the car starts or ends) depends on ps
                     d_right = (road.right_edge_d(ps) if ps is not None else -road.L * W) - (shoulder_m - 1.5)
                     d_start, d_end = (d_left, d_right) if left else (d_right, d_left)
                     if straight_tp_cross and a is ev_actor:
                         ps = tp_cross_s
+                        cross_delay = tp_c1_delay
                     elif is_ev and event["type"] != "none" and not stop_behaviours:
                         d_ego = lane_offset(road.L, lane_idx)
                         t_cross = abs(d_start - d_ego) / max(v_a, 1.0)
-                        t_ego_conflict = t_cross + (1.0 if event["type"] == "near_miss" else 0.0)
-                        ps = min(S_START + v_e * t_ego_conflict, road.end_s - 20.0)
+                        if agg_dt is None and abs(t_shift) < 1e-6:
+                            t_ego_conflict = t_cross + (1.0 if event["type"] == "near_miss" else 0.0)
+                            cross_delay = 0.0
+                        else:
+                            dt_c = float(agg_dt or 0.0)
+                            t_ego_conflict = max(T, t_cross - dt_c, 1.8)
+                            cross_delay = max(0.0, t_ego_conflict + dt_c - t_cross)
+                        ego_d_c = _ego_travel(plan_ego, v_e)(t_ego_conflict) if plan_ego.get("speed_profile") else (v_e * t_ego_conflict)
+                        ps = min(s_ego + ego_d_c, road.end_s - 20.0)
                     else:
-                        ps = S_START + max(a["distance_m"], 15.0) + 12.0 * n_cross
+                        ps = s_ego + max(a["distance_m"], 15.0) + 12.0 * n_cross
                 n_cross += 1
                 n_pts = max(int(abs(d_end - d_start) / 2.0), 4)
                 pts = [road.frame.to_xy(ps, d_start + (d_end - d_start) * j / n_pts) for j in range(n_pts + 1)]
@@ -1407,16 +1510,25 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 else:
                     spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": False,
                               "polyline": [[round(x, 2), round(y, 2)] for x, y in pts]}
+                    if cross_delay > 0.05:
+                        spec_p["start"] = {"type": "time", "t": round(cross_delay, 2)}
             elif rel == "ahead":
                 gapd = a["distance_m"]
                 if is_ev and event["type"] != "none":
                     close = (v_e - (v_a if beh not in ("stopped",) else 0.0))
                     if beh == "braking":
                         close = v_e
-                    gapd = max(close * T + (CAR_LEN if event["type"] == "collision" else 12.0), 8.0)
+                    if event["type"] == "miss":
+                        extra_gap = 26.0 + 4.0 * abs(float(agg_dt or 0.0))
+                        gapd = max(close * T + extra_gap, 28.0)
+                    elif event["type"] == "near_miss":
+                        extra_gap = 12.0 + (4.0 * abs(float(agg_dt)) if agg_dt is not None else 0.0)
+                        gapd = max(close * T + extra_gap, 14.0)
+                    else:
+                        gapd = max(close * T + CAR_LEN, 8.0)
                     if close <= 0.5:
                         notes.append("%s: event cannot happen, the actor is not slower than the ego car" % a["id"])
-                sa = (65.0 if straight_tp_cross else S_START) + gapd
+                sa = s_ego + gapd
                 if not road.has_lane(sa, lane_k):
                     lane_k = road.clamp_lane(sa, lane_k)
                 if straight_tp_cross and not is_ev:
@@ -1427,7 +1539,7 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 elif not straight_tp_cross and not is_ev:
                     if ev_actor is not None and ((a["lane"] == "same" and beh == "driving") or (
                             a["lane"] != "same" and ev_actor["relation"] == "beside" and a["lane"] == ev_actor["lane"])):
-                        sa = max(sa, S_START + max(v_e - v_a, 0.0) * (T + 2.0) + 15.0)
+                        sa = max(sa, s_ego + max(v_e - v_a, 0.0) * (T + 2.0) + 15.0)
                     while any(abs(sa - ps0) < 9.0 for ps0 in placed_bg_s.get(lane_k, [])):
                         sa += 9.0
                     placed_bg_s.setdefault(lane_k, []).append(sa)
@@ -1441,11 +1553,15 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": False,
                               "path": [road.end_point(lane_k)]}
                     if beh == "braking":
-                        spec_p["stop_at_s"] = round(max(T - 1.5, 1.0), 2)
-                        if is_ev:           # closed loop: brake when the ego car is about 2 s away, whichever comes first
-                            spec_p["brake_trigger"] = {"who": "v1", "ttc_s": 2.0}
+                        stop_t = max(T - 1.5, 1.0)
+                        if is_ev and event["type"] == "miss":
+                            spec_p["stop_at_s"] = round(stop_t + max(abs(float(agg_dt or 2.0)), 1.5), 2)
+                        else:
+                            spec_p["stop_at_s"] = round(stop_t, 2)
+                            if is_ev:       # closed loop: brake when the ego car is about 2 s away, whichever comes first
+                                spec_p["brake_trigger"] = {"who": "v1", "ttc_s": 2.0}
             elif rel == "behind":
-                sb = S_START - max(a["distance_m"], 10.0)
+                sb = s_ego - max(a["distance_m"], 10.0)
                 if sb < 3.0:
                     notes.append("%s: no room behind the ego car, actor dropped" % a["id"])
                     continue
@@ -1455,7 +1571,7 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": True,
                           "path": [road.end_point(lane_k)]}
             else:       # oncoming
-                so = (65.0 if straight_tp_cross else S_START) + a["distance_m"] + v_a * 2
+                so = s_ego + a["distance_m"] + v_a * 2
                 if straight_tp_cross:
                     so = max(so, tp_cross_s + 55.0)
                 so = min(so, road.end_s)
@@ -1465,11 +1581,21 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                           "path": [list(road.opposite_lane_point(10.0, lane_k))]}
         else:   # crossroad
             rel = a["relation"]
-            if rel == "ahead":
+            if crossroad_tp_straight and a is ev2:
+                y_c2 = max(road.C[1] - 95.0, cr_tp_ay - max(v_a, 1.0) * cr_tp_t_c2)
+                agents[vid] = {"type": a["type"], "x": cr_tp_px, "y": y_c2, "heading": 90.0}
+                spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": False,
+                          "path": [[cr_tp_px, road.C[1] + 90.0]]}
+            elif rel == "ahead":
                 gapd = a["distance_m"]
                 if is_ev and event["type"] != "none":
                     close = v_e - (0.0 if beh == "stopped" else (0.0 if beh == "braking" else v_a))
-                    gapd = max(close * T + (CAR_LEN if event["type"] == "collision" else 12.0), 8.0)
+                    if event["type"] == "miss":
+                        gapd = max(close * T + 26.0 + 4.0 * abs(float(agg_dt or 0.0)), 28.0)
+                    elif event["type"] == "near_miss":
+                        gapd = max(close * T + 12.0 + (4.0 * abs(float(agg_dt)) if agg_dt is not None else 0.0), 14.0)
+                    else:
+                        gapd = max(close * T + CAR_LEN, 8.0)
                 y = ego_start[1] + gapd
                 y = min(y, road.C[1] + 90.0)
                 if not is_ev and beh == "stopped" and a["lane"] != "same":
@@ -1490,9 +1616,13 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": False,
                               "path": [[road.northbound_x(lane_k), road.C[1] + 90.0]]}
                     if beh == "braking":
-                        spec_p["stop_at_s"] = round(max(T - 1.5, 1.0), 2)
-                        if is_ev:           # closed loop: brake when the ego car is about 2 s away, whichever comes first
-                            spec_p["brake_trigger"] = {"who": "v1", "ttc_s": 2.0}
+                        stop_t = max(T - 1.5, 1.0)
+                        if is_ev and event["type"] == "miss":
+                            spec_p["stop_at_s"] = round(stop_t + max(abs(float(agg_dt or 2.0)), 1.5), 2)
+                        else:
+                            spec_p["stop_at_s"] = round(stop_t, 2)
+                            if is_ev:       # closed loop: brake when the ego car is about 2 s away, whichever comes first
+                                spec_p["brake_trigger"] = {"who": "v1", "ttc_s": 2.0}
             elif rel == "behind":
                 y = ego_start[1] - max(a["distance_m"], 10.0)
                 if y < road.C[1] - 97.0:
@@ -1517,7 +1647,7 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": False, "path": [dest]}
             else:       # cross_left (from the west, heading east) / cross_right (from the east, heading west)
                 left = rel == "cross_left"
-                tp = third_party and (a is ev_actor or a is ev2)
+                tp = third_party and not crossroad_tp_straight and (a is ev_actor or a is ev2)
                 kc = (road.L - 1) if tp else 0
                 ay = road.eastbound_y(kc) if left else road.westbound_y(kc)
                 heading_a = 0.0 if left else 180.0
@@ -1532,17 +1662,33 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     agents[vid] = {"type": a["type"], "x": x, "y": ay, "heading": heading_a}
                     spec_p = {"mode": "static"}
                 else:
-                    px = (road.C[0] - 1.0) if tp else ego_x
+                    px = cr_tp_px if (crossroad_tp_straight and is_ev) else ((road.C[0] - 1.0) if tp else ego_x)
                     t_arr = T if (is_ev and event["type"] != "none") else max(T, 2.0) + 1.6 * n_cross
                     n_cross += 1
-                    if is_ev and conflict is not None:
-                        if event["type"] == "near_miss":
+                    v_a_use = v_a
+                    start_delay = 0.0
+                    if crossroad_tp_straight and is_ev:
+                        t_arr = cr_tp_t_c1
+                    elif is_ev and conflict is not None:
+                        if agg_dt is not None:
+                            t_arr = max(0.9, t_ego_conflict + agg_dt)
+                        elif event["type"] == "near_miss":
                             t_arr = t_ego_conflict + 1.0
                         elif event["type"] == "collision":
                             t_arr = t_ego_conflict
-                    s = max(v_a * t_arr, 8.0)
-                    if third_party and a is ev2:
-                        s = max(v_a * t_arr - 6.0, 8.0)            # the left turn arc is about 6 m long
+                    elif is_ev and agg_dt is not None:
+                        t_arr = max(0.9, T + agg_dt)
+                    s = max(v_a_use * t_arr, 8.0)
+                    # Keep timing-variant crossing actors safely outside the junction box (at least 4 m behind stop line)
+                    min_outside = ((px - (road.C[0] - road.half_j)) if left else ((road.C[0] + road.half_j) - px)) + 4.0
+                    if is_ev and (agg_dt is not None or abs(t_shift) > 1e-6) and s < min_outside:
+                        v_a_use = min(min_outside / max(t_arr, 0.8), 15.0)
+                        s = v_a_use * t_arr
+                    if third_party and not crossroad_tp_straight and a is ev2:
+                        s = max(v_a_use * t_arr - 6.0, 8.0)            # the left turn arc is about 6 m long
+                    if is_ev and (agg_dt is not None or abs(t_shift) > 1e-6) and s > 92.0:
+                        start_delay = (s - 90.0) / max(v_a_use, 1.0)
+                        s = 90.0
                     s = min(s, 95.0)
                     x = (px - s) if left else (px + s)
                     x = max(min(x, road.C[0] + 97.0), road.C[0] - 97.0)
@@ -1555,7 +1701,10 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     if beh == "stopped":
                         spec_p = {"mode": "static"}
                     else:
-                        spec_p = {"mode": "drive", "speed_kmh": a["speed_kmh"], "already_moving": True, "avoid": False, "path": [dest]}
+                        spec_p = {"mode": "drive", "speed_kmh": round(v_a_use * 3.6, 1) if abs(v_a_use - v_a) > 1e-3 else a["speed_kmh"],
+                                  "already_moving": True, "avoid": False, "path": [dest]}
+                        if start_delay > 0.05:
+                            spec_p["start"] = {"type": "time", "t": round(start_delay, 2)}
         if spec_p is not None and a.get("color"):
             spec_p["color"] = a["color"]
         plan_agents[vid] = spec_p
@@ -1581,27 +1730,40 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
             elif event["type"] == "near_miss":
                 expect = {"type": "near_miss", "actors": pair, "time_s": round(t_exp, 2), "window_s": 1.5, "contact": "any",
                           "max_dist_m": 8.0 if (road.kind == "straight" or a["relation"] in ("ahead", "behind")) else 6.0}
+            elif event["type"] == "miss":
+                expect = {"type": "miss", "actors": pair, "time_s": round(t_exp, 2), "window_s": 1.5, "contact": "any"}
     if third_party:
-        t_third = tp_t_cross if straight_tp_cross else T
+        t_third = tp_t_c2 if straight_tp_cross else (cr_tp_t_c2 if crossroad_tp_straight else T)
         tp_pair = [idmap[ev_actor["id"]], idmap[ev2["id"]]]
-        expect = {"type": "collision" if event["type"] == "collision" else "near_miss",
-                  "actors": tp_pair, "time_s": round(t_third, 2), "max_dist_m": 6.0,
+        ev_t_tp = event["type"] if event["type"] in ("collision", "near_miss", "miss") else "near_miss"
+        expect = {"type": ev_t_tp, "actors": tp_pair, "time_s": round(t_third, 2),
                   "window_s": 1.5, "contact": "any"}
+        if ev_t_tp != "miss":
+            expect["max_dist_m"] = 6.0
         cp_raw = event.get("contact_parts")
         if event["type"] == "collision" and isinstance(cp_raw, dict):
             mapped = {idmap[k_cp]: v_cp for k_cp, v_cp in cp_raw.items() if k_cp in idmap and idmap[k_cp] in tp_pair}
             if mapped:
                 expect["contact_parts"] = mapped
+    dashcam_resolved = None
+    if isinstance(spec.get("dashcam_actors"), (list, tuple)) and spec["dashcam_actors"]:
+        dashcam_resolved = []
+        for raw_id in spec["dashcam_actors"]:
+            mid = "v1" if raw_id in ("ego", "v1") else idmap.get(raw_id)
+            if mid and mid in agents and mid not in dashcam_resolved:
+                dashcam_resolved.append(mid)
     if expect is None:
-        expect = {"type": "none", "actors": ["v1"], "time_s": round(T, 2)}
+        expect = {"type": "none", "actors": list(dashcam_resolved) if dashcam_resolved else ["v1"], "time_s": round(T, 2)}
 
     if road.kind == "straight" and spec.get("replay"):
         s_ego_t = _ego_travel(plan_agents["v1"], v_e)
-        s_ego_rp0 = 65.0 if straight_tp_cross else S_START
+        s_ego_rp0 = s_ego
         d_ego_off = lane_offset(road.L, lane_idx)
         corridors = []                       # (d left of the ego lane centre, s(t) from the ego start, t_end[, t_start[, half_d]])
         if plan_agents["v1"].get("mode") == "drive":
             corridors.append((0.0, s_ego_t, T + 2.0))
+        protected_vids = {idmap.get(ev_actor["id"]) if ev_actor else None,
+                          idmap.get(ev2["id"]) if ev2 else None} | set(dashcam_resolved or ())
         for vid_c, p in plan_agents.items():
             if vid_c == "v1" or not p:
                 continue
@@ -1612,7 +1774,7 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     vc = float(ic["cruise_speed_ms"])
                     s_ic_fn = lambda t, s0_=s_c0, vc_=vc: s0_ + vc_ * t
                 else:
-                    s_ic_fn = lambda t: s_ego_t(t) + 1.0
+                    s_ic_fn = lambda t, lo_=float(ic.get("long_offset_m", 1.0)): s_ego_t(t) + lo_
                 if abs(ic["lane_dst_d"] - ic["lane_src_d"]) > 4.0:
                     lead_ic = float(ic.get("lead_s", 1.4))
                     t_lc0 = max(0.0, T - lead_ic)
@@ -1630,17 +1792,16 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                     t_sweep0 = max(0.0, T - float(ic.get("lead_s", 1.4)) - 0.5)
                     corridors.append((ic["lane_src_d"] - d_ego_off, s_ic_fn, T + 2.0))
                     corridors.append((ic["lane_dst_d"] - d_ego_off, s_ic_fn, T + 2.0, t_sweep0))
-            elif vid_c in agents and vid_c in (idmap.get(ev_actor["id"]) if ev_actor else None,
-                                               idmap.get(ev2["id"]) if ev2 else None):
+            elif vid_c in agents and vid_c in protected_vids:
                 s_ev0, d_ev0 = road.frame.to_sd(agents[vid_c]["x"], agents[vid_c]["y"])
                 if p.get("polyline") and abs(agents[vid_c]["heading"] - road.lane_heading(s_ev0)) > 45.0:
-                    t_c_end = (tp_t_cross + 1.5) if (straight_tp_cross and tp_t_cross is not None) else (T + 2.0)
+                    t_c_end = (max(tp_t_c2, tp_t_cross + tp_c1_delay) + 1.5) if (straight_tp_cross and tp_t_cross is not None) else (T + 2.0)
                     corridors.append((0.0, lambda t, sc=s_ev0 - s_ego_rp0: sc, t_c_end, 0.0, road.L * W + 6.0))
                 elif p.get("mode") == "drive":
                     ve = float(p.get("speed_kmh", 0.0)) / 3.6
                     corridors.append((d_ev0 - d_ego_off, lambda t, s0_=s_ev0 - s_ego_rp0, ve_=ve: s0_ + ve_ * t, T + 2.0))
         notes += _replay_agents(spec["replay"], road, lane_idx, s_ego_rp0, agents, plan_agents, idmap,
-                                corridors, duration_s=round(T + 5.0, 1))
+                                corridors, duration_s=round(max(T, float(expect.get("time_s") or T)) + 5.0, 1))
 
     # ---- optional non-conflicting cruisers on an empty diverging branch (only for rich scenes with traffic/replay)
     if road.kind == "straight" and split_index(road) is not None and (spec.get("replay") or any(a["id"].startswith("b") for a in spec.get("actors") or [])):
@@ -1724,10 +1885,17 @@ def build(spec, out_dir, scene_id="video_interpreter_0000_split"):
                 "leave_j": leave_j, "diverge_len_m": DIVERGE_LEN_M, "diverge_d_m": DIVERGE_D_M,
                 "rise_start_m": RISE_START_M, "rise_len_m": RISE_LEN_M,
             }
-    plan = {"ego": "v1", "duration_s": round(T + 5.0, 1), "expect": expect, "agents": plan_agents, "idmap": idmap,
+    t_dur_ref = max(T, float(expect.get("time_s") or T))
+    if agg_dt is not None and agg_dt > 0.0:
+        t_dur_ref = max(t_dur_ref, float(expect.get("time_s") or T) + agg_dt)
+    plan = {"ego": "v1", "duration_s": round(t_dur_ref + 5.0, 1), "expect": expect, "agents": plan_agents, "idmap": idmap,
             "notes": notes, "source": "scene_builder", "road": road_plan}
     if isinstance(spec.get("environment"), dict):
         plan["environment"] = dict(spec["environment"])
+    if dashcam_resolved:
+        plan["dashcam_actors"] = dashcam_resolved
+    if isinstance(spec.get("variant"), dict):
+        plan["variant"] = dict(spec["variant"])
     _write_json(os.path.join(out_dir, scene_id + "_motion.json"), plan)
     _write_json(os.path.join(out_dir, scene_id + "_spec.json"), spec)
     return plan

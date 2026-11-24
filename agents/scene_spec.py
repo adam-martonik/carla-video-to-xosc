@@ -26,7 +26,7 @@ ACTOR_TYPES = ("car", "suv", "truck", "van", "motorcycle", "bike", "pedestrian")
 RELATIONS = ("ahead", "behind", "beside", "oncoming", "cross_left", "cross_right")
 BEHAVIORS = ("stopped", "driving", "braking", "cutting_in", "turning_left", "turning_right", "crossing")
 EGO_BEHAVIORS = ("cruise", "slow_to_stop", "stopped", "turn_left", "turn_right")
-EVENTS = ("collision", "near_miss", "none")
+EVENTS = ("collision", "near_miss", "miss", "none")
 
 EDGES = ("barrier", "shoulder", "open")
 TRAFFIC_LANES = ("ego_lane_ahead", "left_lane", "right_lane", "oncoming")
@@ -293,6 +293,12 @@ def normalize(obj):
                     if str(v).strip().lower() in ALL_ZONES}
         if clean_cp:
             spec["event"]["contact_parts"] = clean_cp
+    if ev.get("aggressor_time_offset_s") is not None:
+        spec["event"]["aggressor_time_offset_s"] = round(_num(ev.get("aggressor_time_offset_s"), -15.0, 15.0, 0.0), 3)
+    if ev.get("aggressor_long_offset_m") is not None:
+        spec["event"]["aggressor_long_offset_m"] = round(_num(ev.get("aggressor_long_offset_m"), -40.0, 40.0, 0.0), 2)
+    if ev.get("time_shift_s") is not None:
+        spec["event"]["time_shift_s"] = round(_num(ev.get("time_shift_s"), -10.0, 15.0, 0.0), 3)
     if spec["event"]["type"] != "none" and spec["event"]["actor_id"] is None:
         spec["event"]["type"] = "none"      # an event needs an actor
     env = obj.get("environment")
@@ -301,6 +307,16 @@ def normalize(obj):
             "time_of_day": _pick(env.get("time_of_day"), TIME_OF_DAY, "day"),
             "weather": _pick(env.get("weather"), WEATHERS, "clear"),
         }
+    if obj.get("ego_s_start") is not None:
+        spec["ego_s_start"] = round(_num(obj.get("ego_s_start"), 5.0, 200.0, 15.0), 2)
+    da = obj.get("dashcam_actors")
+    if isinstance(da, (list, tuple)):
+        clean_da = [str(x).strip() for x in da if str(x).strip()]
+        if clean_da:
+            spec["dashcam_actors"] = clean_da
+    var = obj.get("variant")
+    if isinstance(var, dict):
+        spec["variant"] = copy.deepcopy(var)
     return spec, None
 
 

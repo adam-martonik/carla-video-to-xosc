@@ -82,7 +82,7 @@ class CutInController:
                 v_target = max(cfg.cruise_speed_ms, (6.5 if multi else 5.5) if cutting else min(ego_v, me_v))
         else:
             if self._gap0 is None:
-                self._gap0 = cfg.long_offset_m if cfg.side_strike else (me_s - ego_s)
+                self._gap0 = cfg.long_offset_m if (cfg.side_strike or abs(cfg.long_offset_m - 1.0) > 0.1) else (me_s - ego_s)
             v_target = max(ego_v + 0.5 * (ego_s + self._gap0 - me_s), 0.0)
         if cutting:
             lo, hi = sorted((cfg.lane_src_d, cfg.lane_dst_d))
