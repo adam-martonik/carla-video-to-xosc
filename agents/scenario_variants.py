@@ -1175,6 +1175,14 @@ def main(argv=None):
     ap.add_argument("--camera", choices=("chase", "dashcam", "both", "dashcam_all"), default="chase")
     ap.add_argument("--dashcam", action="store_true", help="record dashcam footage mounted on the colliding vehicle(s) and show first-person view")
     ap.add_argument("--dashcam-mode", default="colliders", help="colliders (default), primary, or actor id")
+    ap.add_argument("--sensors", default=None, help="smart-car sensor suite preset (tesla, tesla_lidar, surround_lidar, front_lidar, lidar, tesla_full) or comma-separated sensor names")
+    ap.add_argument("--sensor-res", default="320x180", help="camera WxH resolution for --sensors (default 320x180)")
+    ap.add_argument("--save-sensors", action="store_true", help="save synchronized camera frames, LiDAR .npy point clouds, and telemetry to sensor_data/")
+    ap.add_argument("--control", choices=("auto", "keyboard", "external"), default="auto", help="vehicle control mode: auto (scripted), keyboard (interactive WASD), or external (user controller)")
+    ap.add_argument("--control-actor", default=None, help="explicit actor id to control & equip with sensors (default: primary colliding vehicle)")
+    ap.add_argument("--action-space", choices=("continuous", "discrete", "target_speed"), default="continuous", help="action space for --control external")
+    ap.add_argument("--controller", default=None, help="external controller for --control external (e.g. module:ClassOrFunc or path/to/file.py:act)")
+    ap.add_argument("--adversarial-cutter", action="store_true", help="keep cut-in aggressor actively homing onto an evading controlled vehicle")
     args = ap.parse_args(argv)
 
     with open(args.spec, encoding="utf-8") as f:
@@ -1194,6 +1202,10 @@ def main(argv=None):
             args.out, manifest=manifest, max_iter=args.max_iter,
             record_video=args.record, camera=args.camera,
             dashcam=args.dashcam, dashcam_mode=args.dashcam_mode,
+            sensors=args.sensors, sensor_res=args.sensor_res, save_sensors=args.save_sensors,
+            control_mode=args.control, control_actor=args.control_actor,
+            action_space=args.action_space, controller=args.controller,
+            adversarial_cutter=args.adversarial_cutter,
         )
     print(format_variants_report(manifest))
 

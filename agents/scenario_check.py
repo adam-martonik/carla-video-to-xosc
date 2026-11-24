@@ -204,7 +204,8 @@ def search(out_dir, scene_id, run_fn, max_iter=MAX_ITER, log=print):
     out = {"status": status, "expect": expect, "iterations": it, "history": history,
            "best": {"detail": best[3] if best else None}}
     if best and isinstance(best[2], dict):
-        for k in ("dashcam_actors", "dashcam_videos", "video_path"):
+        for k in ("dashcam_actors", "dashcam_videos", "video_path", "sensor_preset", "sensors_active",
+                  "sensor_actor", "sensor_video_path", "sensor_data_dir"):
             if best[2].get(k):
                 out[k] = best[2][k]
     _dump(out, os.path.join(out_dir, scene_id + "_ready.json"))

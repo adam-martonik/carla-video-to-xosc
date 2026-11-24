@@ -834,21 +834,28 @@ class RouteFollower:
 
 class InterceptFollower(RouteFollower):
     """Cut-in car: steered from live positions by agents/intercept.CutInController instead of following a pre-computed path.
-    The route (along the source lane) is only used for the end-of-road stop; the contact feedback is the crash time."""
+    The route (along the source lane) is only used for the end-of-road stop; the contact feedback is the crash time.
+    When `nominal_target` (agents.ego_control.NominalTargetTrack) is provided, the cutter merges relative to the
+    target vehicle's planned reference trajectory so a controllable/RL ego can realistically avoid the cut-in."""
 
-    def __init__(self, vehicle, route, speed_kmh, ego, frame, controller):
+    def __init__(self, vehicle, route, speed_kmh, ego, frame, controller, nominal_target=None):
         super().__init__(vehicle, route, speed_kmh, False)
         self.ego, self.frame, self.ctl = ego, frame, controller
+        self.nominal_target = nominal_target
 
     def curve_speed(self):
         return 1e9
 
     def pursuit_point(self, loc, spd, look, t_sim):
         import carla
-        el = self.ego.get_location()
-        s_e, d_e = self.frame.to_sd(el.x, -el.y)
+        if self.nominal_target is not None:
+            s_e, d_e, v_e = self.nominal_target.pose_at(t_sim)
+        else:
+            el = self.ego.get_location()
+            s_e, d_e = self.frame.to_sd(el.x, -el.y)
+            v_e = self.ego.get_velocity().length()
         s_m, d_m = self.frame.to_sd(loc.x, -loc.y)
-        d_t, v_t = self.ctl.update(t_sim, (s_e, d_e, self.ego.get_velocity().length()), (s_m, d_m, spd), self.crash_time is not None)
+        d_t, v_t = self.ctl.update(t_sim, (s_e, d_e, v_e), (s_m, d_m, spd), self.crash_time is not None)
         self.speed = v_t
         if getattr(self.ctl.cfg, "side_strike", False) and abs(d_t - d_m) > 0.25:
             look_eff = max(4.5, 0.45 * spd)
@@ -861,14 +868,33 @@ class InterceptFollower(RouteFollower):
 
 
 def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost", port=2000, seed=0, record_video=None,
-               real_time=True, camera="chase", dashcam=False, dashcam_mode="colliders"):
+               real_time=True, camera="chase", dashcam=False, dashcam_mode="colliders",
+               sensors=None, sensor_res=(320, 180), save_sensors=False, sensor_video=None,
+               control_mode="auto", control_actor=None, action_space="continuous", controller=None,
+               adversarial_cutter=False):
     """real_time: every simulation step takes at least DT of wall time, so the scene plays at the speed of the video in the CARLA
     window (synchronous mode would otherwise run it as fast as the server can step).
     camera: 'chase' (smooth chase/crash-focus), 'dashcam' (colliding vehicle windshield mount), 'dashcam_all' (side-by-side of
     colliding vehicles), or 'both' (primary colliding vehicle dashcam + chase).
-    dashcam: when True, ensures dashcam footage is recorded from the colliding vehicle(s) (never a third-party bystander)."""
+    dashcam: when True, ensures dashcam footage is recorded from the colliding vehicle(s) (never a third-party bystander).
+    sensors: optional smart-car sensor preset or comma-separated sensor names (e.g. 'tesla', 'tesla_lidar', 'surround_lidar',
+             'front_lidar', 'lidar', 'tesla_full').
+    control_mode: 'auto' (default scripted playback), 'keyboard' (interactive WASD driving), or 'external' (external user controller)."""
     import carla
+    from agents import ego_control, sensor_suite
     from agents.map_builder import build_and_load_map
+
+    ctrl_mode = str(control_mode or "auto").strip().lower()
+    if ctrl_mode == "manual":
+        ctrl_mode = "keyboard"
+    if ctrl_mode not in ("auto", "keyboard", "external"):
+        raise ValueError("unknown control_mode %r (expected auto, keyboard, or external)" % (control_mode,))
+    is_controlled = ctrl_mode != "auto"
+    sensor_spec = "front_lidar" if (ctrl_mode == "keyboard" and sensors is None) else sensors
+    sensor_cfgs = sensor_suite.resolve_sensor_spec(sensor_spec)
+    want_sensors = bool(sensor_cfgs)
+    sensor_res_xy = sensor_suite.parse_resolution(sensor_res, default=(320, 180))
+    use_tesla_bp = sensor_suite.wants_tesla_blueprint(sensor_spec)
 
     pace = {"last": None}
 
@@ -967,8 +993,20 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
     cam_sensor, cam_q, cam_writer, last_frame = None, None, None, [None]
     dash_targets = []
     dash_streams = []          # list of {"aid", "sensor", "q", "last", "writer", "path"}
-    first_person_spectator = should_use_first_person_spectator(camera, dashcam=dashcam)
+    first_person_spectator = should_use_first_person_spectator(camera, dashcam=dashcam) or (ctrl_mode == "keyboard" and camera == "chase")
     fp_sync_fn = [None]
+    smart_rig = None
+    smart_target_id = None
+    sensor_video_path = None
+    sensor_save_dir = None
+    ctrl_policy = None
+    ctrl_adapter = None
+    ctrl_route_xy = []
+    ctrl_target_speed_ms = 14.0
+    ctrl_prev_yaw = None
+    ctrl_last_obs = None
+    ctrl_last_raw_sensor = {}
+    ctrl_quit = False
 
     def _capture_tick():
         if cam_writer is None and not dash_streams:
@@ -1013,13 +1051,33 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 cam_writer.write(last_frame[0])
 
     try:
+        provisional_smart_id = None
+        if want_sensors or is_controlled:
+            pa_pre = plan.get("agents") or {}
+            prov_stub = {
+                aid: type("_Stub", (), {"type_id": "walker.pedestrian" if a.get("type") == "pedestrian" else "vehicle.car", "is_alive": True})()
+                for aid, a in agents.items()
+                if (pa_pre.get(aid) or {}).get("mode") != "skip" and float((pa_pre.get(aid) or {}).get("spawn_at_s") or 0.0) <= 0.0
+            }
+            if control_actor and control_actor in prov_stub:
+                provisional_smart_id = control_actor
+            else:
+                cands_p = resolve_dashcam_actors(plan, prov_stub, agents, mode="primary")
+                provisional_smart_id = cands_p[0] if cands_p else plan.get("ego", "v1")
+
         def _spawn_one(aid, a):
             x, y, z = a["location"]
             yaw = a["rotation"][1]
             if a["type"] == "pedestrian":
                 bp = bp_lib.filter("walker.pedestrian.*")[0]
             else:
-                bp = bp_lib.find(VEHICLE_BLUEPRINTS[a["type"]])
+                bp = None
+                if use_tesla_bp and aid == provisional_smart_id and a["type"] == "car":
+                    tbps = bp_lib.filter("vehicle.tesla.model3")
+                    if tbps:
+                        bp = tbps[0]
+                if bp is None:
+                    bp = bp_lib.find(VEHICLE_BLUEPRINTS[a["type"]])
                 color = plan["agents"].get(aid, {}).get("color")
                 if color and bp.has_attribute("color"):
                     bp.set_attribute("color", color)
@@ -1105,10 +1163,21 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
         road_pl = plan.get("road") or {}
         road_frame = RoadFrame(road_pl["centerline"]) if road_pl.get("centerline") else RoadFrame.straight()
 
+        if want_sensors or is_controlled:
+            if control_actor and control_actor in actors and _is_vehicle_actor(control_actor, actors[control_actor], agents):
+                smart_target_id = control_actor
+            else:
+                scands = resolve_dashcam_actors(plan, actors, agents, mode="primary")
+                smart_target_id = scands[0] if scands else ego
+
+        nominal_targets = {}
+        ctrl_ref_fol = None
+
         def make_follower(aid, v, spec):
             speed = float(spec.get("speed_kmh", 40))
             ic = spec.get("intercept")
-            target = actors.get(ic.get("target", ego)) if ic else None
+            target_id = ic.get("target", ego) if ic else None
+            target = actors.get(target_id) if target_id else None
             if ic and target is not None:
                 vl = v.get_location()
                 s0 = road_frame.to_sd(vl.x, -vl.y)[0]
@@ -1124,11 +1193,14 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                                   cruise_speed_ms=float(ic["cruise_speed_ms"]) if ic.get("cruise_speed_ms") is not None else None,
                                   long_offset_m=float(ic.get("long_offset_m", 1.0)),
                                   side_strike=bool(ic.get("side_strike", False)))
-                return InterceptFollower(v, route, speed, target, road_frame, CutInController(cfg))
+                return InterceptFollower(
+                    v, route, speed, target, road_frame, CutInController(cfg),
+                    nominal_target=nominal_targets.get(target_id),
+                )
             if spec.get("polyline"):
                 sx, sy = polyline_shift(spec)
                 route = [_RoutePoint(carla.Location(p_[0] + sx, -(p_[1] + sy), 0.0)) for p_ in spec["polyline"]]
-            else:
+            elif spec.get("path"):
                 tgt_carla = [_to_carla(pt) for pt in spec["path"]]
                 v_loc = v.get_location()
                 route = build_route(world.get_map(), v_loc, tgt_carla,
@@ -1136,10 +1208,35 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 if road_pl.get("centerline") and tgt_carla:
                     route = sanitize_straight_route(route, (v_loc.x, v_loc.y), tgt_carla[-1], road_frame, _RoutePoint, carla.Location,
                                                     road_plan=road_pl)
+            else:
+                route = [_RoutePoint(v.get_location())]
             return RouteFollower(v, route, speed, bool(spec.get("avoid", False)),
                                  road_frame=(road_frame if road_pl.get("centerline") else None))
 
+        if is_controlled and smart_target_id in actors:
+            cspec = pa.get(smart_target_id) or {}
+            cactor = actors[smart_target_id]
+            ctrl_target_speed_ms = max(float(cspec.get("speed_kmh", 50.0)) / 3.6, 4.0)
+            ctrl_ref_fol = make_follower(smart_target_id, cactor, cspec)
+            ctrl_route_xy = [(wp.transform.location.x, wp.transform.location.y) for wp in ctrl_ref_fol.route]
+            ctrl_prev_yaw = float(cactor.get_transform().rotation.yaw)
+            if not adversarial_cutter:
+                cloc = cactor.get_location()
+                s_c0, d_c0 = road_frame.to_sd(cloc.x, -cloc.y)
+                nominal_targets[smart_target_id] = ego_control.NominalTargetTrack(
+                    s0=s_c0, d0=d_c0,
+                    speed_kmh=float(cspec.get("speed_kmh", 50.0)),
+                    speed_profile=cspec.get("speed_profile"),
+                )
+            ctrl_adapter = ego_control.ControlAdapter(action_space=action_space, dt=DT)
+            ctrl_spec = "keyboard" if ctrl_mode == "keyboard" else controller
+            ctrl_policy = ego_control.load_controller(ctrl_spec)
+            ctrl_policy.reset({"scene_id": scene_id, "control_actor": smart_target_id, "action_space": action_space})
+            print(f"[motion] controllable vehicle: {smart_target_id} (mode={ctrl_mode}, action_space={action_space})")
+
         for aid, spec in pa.items():
+            if is_controlled and aid == smart_target_id:
+                continue
             if aid in actors and spec["mode"] == "drive" and not is_kinematic(aid):
                 followers[aid] = make_follower(aid, actors[aid], spec)
                 followers[aid].stop_at = spec.get("stop_at_s")
@@ -1276,7 +1373,7 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             ego_yaw = actors[ego].get_transform().rotation.yaw
             if want_dashcam or first_person_spectator:
                 dash_targets = resolve_dashcam_actors(plan, actors, agents, mode=dashcam_mode)
-                fp_actor_id = dash_targets[0] if dash_targets else None
+                fp_actor_id = smart_target_id if (is_controlled and smart_target_id in actors) else (dash_targets[0] if dash_targets else None)
             cur_cam_pose = _chase_target_pose()
             spec_tf = (
                 carla.Transform(
@@ -1293,52 +1390,76 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                     world.get_spectator().set_transform(spec_tf)
             elif spec_tf is not None:
                 world.get_spectator().set_transform(spec_tf)
-            if record_path or want_dashcam:
+            if want_sensors and smart_target_id in actors and actors[smart_target_id].is_alive:
+                if sensor_video is True:
+                    sensor_video_path = os.path.join(out_dir, f"{scene_id}_sensors_{smart_target_id}.mp4")
+                elif isinstance(sensor_video, str) and sensor_video:
+                    sensor_video_path = sensor_video
+                elif sensor_video is None and (record_path or save_sensors):
+                    sensor_video_path = os.path.join(out_dir, f"{scene_id}_sensors_{smart_target_id}.mp4")
+                if save_sensors is True:
+                    sensor_save_dir = os.path.join(out_dir, "sensor_data", f"{scene_id}_{smart_target_id}")
+                elif isinstance(save_sensors, str) and save_sensors:
+                    sensor_save_dir = save_sensors
+                vtype_s = (agents.get(smart_target_id) or {}).get("type", "car")
+                smart_rig = sensor_suite.SmartCarSensorRig(
+                    world, bp_lib, actors[smart_target_id], sensor_spec, vtype=vtype_s, dt=DT,
+                    image_size=sensor_res_xy, video_path=sensor_video_path, save_dir=sensor_save_dir,
+                    spawned_ids=spawned_ids,
+                )
+                sensors.extend(smart_rig.sensor_actors)
+                print("[motion] smart-car sensors on %s (%s): %s" % (
+                    smart_target_id, sensor_spec if isinstance(sensor_spec, str) else ",".join(sensor_spec),
+                    ", ".join(smart_rig.active_names),
+                ))
+            if record_path or want_dashcam or smart_rig is not None:
                 import queue, cv2
                 split_main = (camera == "both") or (camera == "dashcam_all" and len(dash_targets) >= 2)
                 cam_w, cam_h = (640, 360) if split_main else (1280, 720)
-                cam_bp = bp_lib.find("sensor.camera.rgb")
-                cam_bp.set_attribute("image_size_x", str(cam_w))
-                cam_bp.set_attribute("image_size_y", str(cam_h))
-                cam_bp.set_attribute("fov", "90")
-                if record_path and camera in ("chase", "both") and spec_tf is not None:
-                    cam_sensor = world.try_spawn_actor(cam_bp, spec_tf)
-                    if cam_sensor is not None:
-                        cam_q = queue.Queue()
-                        cam_sensor.listen(cam_q.put)
-                        sensors.append(cam_sensor)
-                        spawned_ids.append(cam_sensor.id)
-                if want_dashcam:
-                    rigid_att = getattr(getattr(carla, "AttachmentType", None), "Rigid", None)
-                    for daid in dash_targets:
-                        dactor = actors.get(daid)
-                        if dactor is None or not dactor.is_alive:
-                            continue
-                        dash_bp = bp_lib.find("sensor.camera.rgb")
-                        dash_bp.set_attribute("image_size_x", str(cam_w))
-                        dash_bp.set_attribute("image_size_y", str(cam_h))
-                        dash_bp.set_attribute("fov", "100")
-                        vtype_d = (agents.get(daid) or {}).get("type", "car")
-                        bbox_ext = getattr(getattr(dactor, "bounding_box", None), "extent", None)
-                        mx, my, mz, mpitch = dashcam_mount_transform(vtype_d, bbox_ext)
-                        dash_tf = carla.Transform(carla.Location(x=mx, y=my, z=mz), carla.Rotation(pitch=mpitch))
-                        if rigid_att is not None:
-                            dsensor = world.try_spawn_actor(dash_bp, dash_tf, attach_to=dactor, attachment_type=rigid_att)
-                        else:
-                            dsensor = world.try_spawn_actor(dash_bp, dash_tf, attach_to=dactor)
-                        if dsensor is not None:
-                            dq = queue.Queue()
-                            dsensor.listen(dq.put)
-                            sensors.append(dsensor)
-                            spawned_ids.append(dsensor.id)
-                            dpath = os.path.join(out_dir, f"{scene_id}_dashcam_{daid}.mp4")
-                            dwriter = cv2.VideoWriter(dpath, cv2.VideoWriter_fourcc(*"mp4v"), round(1.0 / DT, 1), (cam_w, cam_h))
-                            dash_streams.append({"aid": daid, "sensor": dsensor, "q": dq, "last": [None],
-                                                 "writer": dwriter, "path": dpath})
-                if cam_sensor is not None or dash_streams:
+                if record_path or want_dashcam:
+                    cam_bp = bp_lib.find("sensor.camera.rgb")
+                    cam_bp.set_attribute("image_size_x", str(cam_w))
+                    cam_bp.set_attribute("image_size_y", str(cam_h))
+                    cam_bp.set_attribute("fov", "90")
+                    if record_path and camera in ("chase", "both") and spec_tf is not None:
+                        cam_sensor = world.try_spawn_actor(cam_bp, spec_tf)
+                        if cam_sensor is not None:
+                            cam_q = queue.Queue()
+                            cam_sensor.listen(cam_q.put)
+                            sensors.append(cam_sensor)
+                            spawned_ids.append(cam_sensor.id)
+                    if want_dashcam:
+                        rigid_att = getattr(getattr(carla, "AttachmentType", None), "Rigid", None)
+                        for daid in dash_targets:
+                            dactor = actors.get(daid)
+                            if dactor is None or not dactor.is_alive:
+                                continue
+                            dash_bp = bp_lib.find("sensor.camera.rgb")
+                            dash_bp.set_attribute("image_size_x", str(cam_w))
+                            dash_bp.set_attribute("image_size_y", str(cam_h))
+                            dash_bp.set_attribute("fov", "100")
+                            vtype_d = (agents.get(daid) or {}).get("type", "car")
+                            bbox_ext = getattr(getattr(dactor, "bounding_box", None), "extent", None)
+                            mx, my, mz, mpitch = dashcam_mount_transform(vtype_d, bbox_ext)
+                            dash_tf = carla.Transform(carla.Location(x=mx, y=my, z=mz), carla.Rotation(pitch=mpitch))
+                            if rigid_att is not None:
+                                dsensor = world.try_spawn_actor(dash_bp, dash_tf, attach_to=dactor, attachment_type=rigid_att)
+                            else:
+                                dsensor = world.try_spawn_actor(dash_bp, dash_tf, attach_to=dactor)
+                            if dsensor is not None:
+                                dq = queue.Queue()
+                                dsensor.listen(dq.put)
+                                sensors.append(dsensor)
+                                spawned_ids.append(dsensor.id)
+                                dpath = os.path.join(out_dir, f"{scene_id}_dashcam_{daid}.mp4")
+                                dwriter = cv2.VideoWriter(dpath, cv2.VideoWriter_fourcc(*"mp4v"), round(1.0 / DT, 1), (cam_w, cam_h))
+                                dash_streams.append({"aid": daid, "sensor": dsensor, "q": dq, "last": [None],
+                                                     "writer": dwriter, "path": dpath})
+                if cam_sensor is not None or dash_streams or smart_rig is not None:
                     json.dump(spawned_ids, open(ids_fn, "w"))
                     # Warm up camera post-processing / auto-exposure while vehicles are still braked so frame 0 is clean
-                    for _ in range(2):
+                    n_warm = 5 if smart_rig is not None else 2
+                    for warm_i in range(n_warm):
                         world.tick()
                         for q_w in [cam_q] + [ds["q"] for ds in dash_streams]:
                             if q_w is None:
@@ -1349,6 +1470,11 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                                 pass
                             while not q_w.empty():
                                 q_w.get_nowait()
+                        if smart_rig is not None:
+                            if warm_i == n_warm - 1:
+                                ctrl_last_raw_sensor = smart_rig.read_tick(timeout=0.25, record_frame=False)
+                            else:
+                                smart_rig.flush_queues(timeout=0.25)
                     t0_abs[0] = world.get_snapshot().timestamp.elapsed_seconds
                     if record_path:
                         if camera == "both" and cam_sensor is not None and dash_streams:
@@ -1362,8 +1488,8 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                     if dash_streams:
                         print("[motion] dashcam mounted on colliding vehicle(s): " + ", ".join(
                             "%s (%s)" % (ds["aid"], os.path.basename(ds["path"])) for ds in dash_streams))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[motion] camera/sensor setup warning: {e}")
 
         def ref_ttc(trig):
             ref = actors.get(trig.get("who", ego))
@@ -1389,6 +1515,69 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 v.set_target_velocity(carla.Vector3D(vx, vy, 0.0))
                 pending_launch_vel[aid] = (vx, vy, 0.0)
                 started[aid], start_time[aid] = True, 0.0
+        if is_controlled and smart_target_id in actors and ctrl_ref_fol is not None:
+            cspec = pa.get(smart_target_id) or {}
+            cv = actors[smart_target_id]
+            cv.apply_control(carla.VehicleControl(brake=0.0, hand_brake=False))
+            if cspec.get("already_moving", False) and not _has_delayed_start(cspec):
+                vx, vy = _launch_velocity_vec(cv, ctrl_ref_fol, cspec, now=0.0)
+                cv.set_target_velocity(carla.Vector3D(vx, vy, 0.0))
+                pending_launch_vel[smart_target_id] = (vx, vy, 0.0)
+            started[smart_target_id], start_time[smart_target_id] = True, 0.0
+            peak[smart_target_id] = {"long": 0.0, "lat": 0.0}
+
+        def _nearest_to_smart():
+            if not smart_target_id or smart_target_id not in actors or not actors[smart_target_id].is_alive:
+                return math.inf, None
+            me_a = actors[smart_target_id]
+            mloc = me_a.get_location()
+            myaw = me_a.get_transform().rotation.yaw
+            best_d, best_rel = math.inf, None
+            for k_o, a_o in actors.items():
+                if k_o == smart_target_id or not a_o.is_alive:
+                    continue
+                ol = a_o.get_location()
+                if abs(getattr(ol, "z", 0.0) - getattr(mloc, "z", 0.0)) > 3.0:
+                    continue
+                d_o = math.hypot(ol.x - mloc.x, ol.y - mloc.y)
+                if d_o < best_d:
+                    best_d = d_o
+                    best_rel = rel_in_frame(ol.x - mloc.x, ol.y - mloc.y, myaw)
+            return best_d, best_rel
+
+        def _smart_telemetry(t_now, st_vec=None, st_meta=None, min_d=None):
+            aid_s = smart_target_id
+            if not aid_s or aid_s not in actors or not actors[aid_s].is_alive:
+                return None
+            a_s = actors[aid_s]
+            spd = st_meta["speed_ms"] if st_meta else a_s.get_velocity().length()
+            if is_controlled and ctrl_adapter is not None:
+                st_c, th_c, br_c = ctrl_adapter.prev_steer, ctrl_adapter.prev_throttle, ctrl_adapter.prev_brake
+            elif aid_s in followers:
+                st_c, th_c, br_c = followers[aid_s].str, followers[aid_s].thr, followers[aid_s].brk
+            else:
+                st_c = th_c = br_c = 0.0
+            coll_s = any(
+                (c["actor"] == aid_s or id_of.get(c["other_id"]) == aid_s) and c["other"] != "static.road"
+                for c in collisions
+            )
+            tel = {
+                "t_sim": round(float(t_now), 3),
+                "control_mode": ctrl_mode,
+                "speed_ms": round(float(spd), 3),
+                "steer": round(float(st_c), 4),
+                "throttle": round(float(th_c), 4),
+                "brake": round(float(br_c), 4),
+                "min_obstacle_dist_m": round(float(min_d), 3) if (min_d is not None and math.isfinite(min_d)) else None,
+                "collided": coll_s,
+            }
+            if st_meta:
+                tel["lane_offset_m"] = st_meta["lane_offset_m"]
+                tel["heading_err_rad"] = st_meta["heading_err_rad"]
+            if st_vec is not None:
+                tel["ego_state"] = [round(float(x), 4) for x in st_vec]
+            return tel
+
         t_end, first_hit = float(plan.get("duration_s", 15)), None
         tick, printed = 0, 0
         recorder = TrajectoryRecorder()                 # raw poses of every actor, every tick -> <scene>_trajectories.json
@@ -1501,6 +1690,33 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             for aid, fol in followers.items():
                 if aid in started and fol.v.is_alive:
                     fol.v.apply_control(fol.control([a for k, a in actors.items() if k != aid and a.is_alive], DT, now_abs, now))
+            if is_controlled and smart_target_id in actors and actors[smart_target_id].is_alive and ctrl_policy is not None:
+                c_actor = actors[smart_target_id]
+                prev_c = (ctrl_adapter.prev_steer, ctrl_adapter.prev_throttle, ctrl_adapter.prev_brake)
+                st_vec, st_meta = ego_control.extract_ego_state(
+                    c_actor, target_speed_ms=ctrl_target_speed_ms, route_xy=ctrl_route_xy,
+                    prev_control=prev_c, prev_yaw_deg=ctrl_prev_yaw, dt=DT,
+                )
+                ctrl_prev_yaw = st_meta["yaw_deg"]
+                min_d_c, near_rel_c = _nearest_to_smart()
+                obs_c = {"state": st_vec}
+                if ctrl_last_raw_sensor:
+                    if ctrl_last_raw_sensor.get("cameras"):
+                        obs_c["cameras"] = ctrl_last_raw_sensor["cameras"]
+                    for k_s in ("lidar", "lidar_bev", "lidar_sectors", "semantic_lidar", "radar_front"):
+                        if k_s in ctrl_last_raw_sensor:
+                            obs_c[k_s] = ctrl_last_raw_sensor[k_s]
+                info_c = {
+                    "t_sim": round(now, 3), "ego": st_meta, "control_actor": smart_target_id,
+                    "min_obstacle_dist_m": round(min_d_c, 3) if math.isfinite(min_d_c) else None,
+                    "nearest_obstacle_rel": near_rel_c,
+                }
+                raw_act = ctrl_policy.act(obs_c, info_c)
+                if getattr(ctrl_policy, "quit_requested", False):
+                    ctrl_quit = True
+                    break
+                c_actor.apply_control(ctrl_adapter.to_carla_control(raw_act, carla, speed_ms=st_meta["speed_ms"]))
+                ctrl_last_obs = (st_vec, st_meta, min_d_c)
             for aid, spec in pa.items():
                 if aid in actors and spec["mode"] == "walk" and aid in started:
                     w = actors[aid]
@@ -1527,6 +1743,18 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             paced_tick(world)
             pending_launch_vel.clear()
             _capture_tick()
+            if smart_rig is not None:
+                if is_controlled and ctrl_last_obs is not None:
+                    tel_s = _smart_telemetry(now + DT, st_vec=ctrl_last_obs[0], st_meta=ctrl_last_obs[1], min_d=ctrl_last_obs[2])
+                else:
+                    md_s, _ = _nearest_to_smart()
+                    tel_s = _smart_telemetry(now + DT, min_d=md_s)
+                ctrl_last_raw_sensor = smart_rig.read_tick(timeout=0.5, telemetry=tel_s, record_frame=True)
+                if ctrl_mode == "keyboard" and ctrl_policy is not None and hasattr(ctrl_policy, "update_hud"):
+                    try:
+                        ctrl_policy.update_hud(smart_rig.render_mosaic(ctrl_last_raw_sensor, telemetry=tel_s))
+                    except Exception:
+                        pass
             tick += 1
             recorder.record(tick * DT, actors, speed_overrides=kin_spd)
             alive = {k: a.get_location() for k, a in actors.items() if a.is_alive}
@@ -1587,13 +1815,30 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             result["first_collision"] = pair[0]
         elif collisions:
             result["outcome"] = "contact_with_scenery"
+        if is_controlled:
+            ctrl_hits = [
+                c for c in collisions
+                if (c["actor"] == smart_target_id or c.get("other_actor") == smart_target_id)
+                and c["other"] != "static.road"
+            ]
+            result["control_mode"] = ctrl_mode
+            result["control_actor"] = smart_target_id
+            result["action_space"] = action_space
+            result["avoided_crash"] = len(ctrl_hits) == 0
+        if smart_rig is not None:
+            result["sensor_preset"] = sensor_spec if isinstance(sensor_spec, str) else ",".join(sensor_spec)
+            result["sensors_active"] = list(smart_rig.active_names)
+            result["sensor_actor"] = smart_target_id
         # let the final scene stay visible while finishing any camera glide
-        for hold_i in range(int(hold_sec / DT)):
+        hold_ticks = 0 if ctrl_quit else int(hold_sec / DT)
+        for hold_i in range(hold_ticks):
             hold_now = (tick + hold_i) * DT
             hold_now_abs = world.get_snapshot().timestamp.elapsed_seconds
             for aid, fol in followers.items():
                 if aid in started and fol.v.is_alive:
                     fol.v.apply_control(fol.control([a for k, a in actors.items() if k != aid and a.is_alive], DT, hold_now_abs, hold_now))
+            if is_controlled and smart_target_id in actors and actors[smart_target_id].is_alive:
+                actors[smart_target_id].apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.6))
             try:
                 tgt_pose = _chase_target_pose()
                 if tgt_pose is not None and cur_cam_pose is not None:
@@ -1609,6 +1854,9 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
             paced_tick(world)
             pending_launch_vel.clear()
             _capture_tick()
+            if smart_rig is not None:
+                md_h, _ = _nearest_to_smart()
+                smart_rig.read_tick(timeout=0.5, telemetry=_smart_telemetry(hold_now + DT, min_d=md_h), record_frame=True)
         result["actors_alive_at_end"] = sorted(k for k, a in actors.items() if a.is_alive)
     finally:
         try:
@@ -1621,6 +1869,20 @@ def run_motion(out_dir, scene_id, load_map=True, hold_sec=5.0, host="localhost",
                 cam_writer.release()
                 if record_path and os.path.exists(record_path):
                     result["video_path"] = record_path
+            except Exception:
+                pass
+        if smart_rig is not None:
+            try:
+                smart_rig.close()
+                if sensor_video_path and os.path.exists(sensor_video_path):
+                    result["sensor_video_path"] = sensor_video_path
+                if sensor_save_dir and os.path.exists(sensor_save_dir):
+                    result["sensor_data_dir"] = sensor_save_dir
+            except Exception:
+                pass
+        if ctrl_policy is not None:
+            try:
+                ctrl_policy.close()
             except Exception:
                 pass
         if dash_streams:
@@ -1681,6 +1943,21 @@ if __name__ == "__main__":
     ap.add_argument("--camera", choices=("chase", "dashcam", "both", "dashcam_all"), default="chase", help="camera view for --record")
     ap.add_argument("--dashcam", action="store_true", help="record dashcam footage mounted on the colliding vehicle(s)")
     ap.add_argument("--dashcam-mode", default="colliders", help="which vehicle(s) carry the dashcam: colliders (default), primary, or actor id")
+    ap.add_argument("--sensors", default=None, help="smart-car sensor suite preset (tesla, tesla_lidar, surround_lidar, front_lidar, lidar, tesla_full) or comma-separated sensor names")
+    ap.add_argument("--sensor-res", default="320x180", help="camera WxH resolution for --sensors (default 320x180)")
+    ap.add_argument("--save-sensors", action="store_true", help="save synchronized camera frames, LiDAR .npy clouds, and telemetry to sensor_data/")
+    ap.add_argument("--sensor-video", action="store_true", help="record a multi-camera + LiDAR BEV mosaic MP4")
+    ap.add_argument("--control", choices=("auto", "keyboard", "external"), default="auto", help="vehicle control mode: auto (scripted), keyboard (WASD), or external (user controller)")
+    ap.add_argument("--control-actor", default=None, help="explicit actor id to control & equip with sensors (default: primary colliding vehicle)")
+    ap.add_argument("--action-space", choices=("continuous", "discrete", "target_speed"), default="continuous", help="action space for --control external")
+    ap.add_argument("--controller", default=None, help="external controller for --control external (e.g. module:ClassOrFunc or path/to/file.py:act)")
+    ap.add_argument("--adversarial-cutter", action="store_true", help="keep cut-in aggressor actively homing onto an evading controllable vehicle")
     args = ap.parse_args()
-    run_motion(args.out, args.scene_id, load_map=not args.no_map, hold_sec=args.hold, record_video=args.record,
-               camera=args.camera, dashcam=args.dashcam, dashcam_mode=args.dashcam_mode)
+    run_motion(
+        args.out, args.scene_id, load_map=not args.no_map, hold_sec=args.hold, record_video=args.record,
+        camera=args.camera, dashcam=args.dashcam, dashcam_mode=args.dashcam_mode,
+        sensors=args.sensors, sensor_res=args.sensor_res, save_sensors=args.save_sensors,
+        sensor_video=True if args.sensor_video else None,
+        control_mode=args.control, control_actor=args.control_actor, action_space=args.action_space,
+        controller=args.controller, adversarial_cutter=args.adversarial_cutter,
+    )

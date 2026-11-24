@@ -1761,7 +1761,10 @@ def _connect_carla():
 
 
 def phase2(out, max_iter=8, record_video=False, camera="chase", dashcam=False, dashcam_mode="colliders",
-           ego_on_collider=False, client=None, skip_map_load=False):
+           ego_on_collider=False, client=None, skip_map_load=False,
+           sensors=None, sensor_res=(320, 180), save_sensors=False,
+           control_mode="auto", control_actor=None, action_space="continuous", controller=None,
+           adversarial_cutter=False):
     from agents import motion_runner, scenario_check, xosc_export
     c = client or _connect_carla()
     if c is None:
@@ -1774,8 +1777,33 @@ def phase2(out, max_iter=8, record_video=False, camera="chase", dashcam=False, d
         return motion_runner.run_motion(
             out, SCENE_ID, load_map=False, hold_sec=2.0,
             record_video=record_video, camera=camera, dashcam=dashcam, dashcam_mode=dashcam_mode,
+            sensors=sensors, sensor_res=sensor_res, save_sensors=save_sensors,
+            control_mode=control_mode, control_actor=control_actor, action_space=action_space,
+            controller=controller, adversarial_cutter=adversarial_cutter,
         )
-    ready = scenario_check.search(out, SCENE_ID, run_fn, max_iter=max_iter, log=log)
+
+    ctrl_mode_norm = str(control_mode or "auto").strip().lower()
+    if ctrl_mode_norm != "auto":
+        # Controllable / evaluation mode: run directly without retrying to force a crash!
+        res = run_fn(load_map=False)
+        avoided = bool(res.get("avoided_crash", False))
+        ready = {
+            "status": "avoided" if avoided else "collided",
+            "control_mode": res.get("control_mode", ctrl_mode_norm),
+            "control_actor": res.get("control_actor"),
+            "action_space": res.get("action_space", action_space),
+            "avoided_crash": avoided,
+            "outcome": res.get("outcome"),
+            "iterations": 1,
+            "expect": {"type": "avoid_crash", "actors": [res.get("control_actor") or "v1"]},
+            "history": [{"iteration": 1, "ok": avoided, "detail": {"outcome": res.get("outcome"), "reasons": []}}],
+        }
+        for k in ("dashcam_actors", "dashcam_videos", "video_path", "sensor_preset", "sensors_active",
+                  "sensor_actor", "sensor_video_path", "sensor_data_dir"):
+            if res.get(k):
+                ready[k] = res[k]
+    else:
+        ready = scenario_check.search(out, SCENE_ID, run_fn, max_iter=max_iter, log=log)
     if fallback:
         ready["map_fallback"] = fallback
     try:
@@ -1801,7 +1829,10 @@ def phase2(out, max_iter=8, record_video=False, camera="chase", dashcam=False, d
 
 
 def phase2_variants(out, manifest=None, max_iter=8, record_video=False, camera="chase",
-                    dashcam=False, dashcam_mode="colliders", ego_on_collider=False):
+                    dashcam=False, dashcam_mode="colliders", ego_on_collider=False,
+                    sensors=None, sensor_res=(320, 180), save_sensors=False,
+                    control_mode="auto", control_actor=None, action_space="continuous", controller=None,
+                    adversarial_cutter=False):
     """Simulate every generated variant in `out/variants/` in CARLA, reusing the loaded OpenDRIVE map across
     timing variants that share the exact same road geometry."""
     import shutil
@@ -1831,6 +1862,9 @@ def phase2_variants(out, manifest=None, max_iter=8, record_video=False, camera="
             vdir, max_iter=max_iter, record_video=record_video, camera=camera,
             dashcam=dashcam, dashcam_mode=dashcam_mode, ego_on_collider=ego_on_collider,
             client=c, skip_map_load=reuse_map,
+            sensors=sensors, sensor_res=sensor_res, save_sensors=save_sensors,
+            control_mode=control_mode, control_actor=control_actor, action_space=action_space,
+            controller=controller, adversarial_cutter=adversarial_cutter,
         )
         if not reuse_map:
             last_sig = _road_map_signature(vdir, entry.get("scene_id", SCENE_ID))
@@ -1841,14 +1875,10 @@ def phase2_variants(out, manifest=None, max_iter=8, record_video=False, camera="
         if ready:
             entry["sim_status"] = ready.get("status")
             entry["sim_iterations"] = ready.get("iterations")
-            if ready.get("xosc"):
-                entry["xosc"] = ready["xosc"]
-            if ready.get("dashcam_actors"):
-                entry["dashcam_actors"] = ready["dashcam_actors"]
-            if ready.get("dashcam_videos"):
-                entry["dashcam_videos"] = ready["dashcam_videos"]
-            if ready.get("video_path"):
-                entry["video_path"] = ready["video_path"]
+            for k in ("xosc", "dashcam_actors", "dashcam_videos", "video_path",
+                      "sensor_preset", "sensor_video_path", "sensor_data_dir", "avoided_crash"):
+                if k in ready and ready[k] is not None:
+                    entry[k] = ready[k]
     _save(manifest, man_fn)
     rep = scenario_variants.format_variants_report(manifest)
     with open(os.path.join(out, "variants_report.txt"), "w", encoding="utf-8") as f:
@@ -1893,6 +1923,20 @@ def report(out, spec, ready):
             lines.append("  dashcam on colliding vehicle(s): " + ", ".join(ready["dashcam_actors"]))
         if ready.get("dashcam_videos"):
             lines.append("  dashcam videos: " + ", ".join("%s=%s" % (k, os.path.basename(v)) for k, v in ready["dashcam_videos"].items()))
+        if ready.get("control_mode") and ready.get("control_mode") != "auto":
+            lines.append("  controllable ego (%s, mode=%s, space=%s): avoided_crash=%s" % (
+                ready.get("control_actor") or "v1", ready.get("control_mode"),
+                ready.get("action_space", "continuous"), ready.get("avoided_crash"),
+            ))
+        if ready.get("sensors_active"):
+            lines.append("  smart-car sensors on %s (%s): %s" % (
+                ready.get("sensor_actor") or "v1", ready.get("sensor_preset") or "custom",
+                ", ".join(ready["sensors_active"]),
+            ))
+        if ready.get("sensor_video_path"):
+            lines.append("  sensor mosaic video: " + os.path.basename(ready["sensor_video_path"]))
+        if ready.get("sensor_data_dir"):
+            lines.append("  sensor dataset dir: " + ready["sensor_data_dir"])
         if ready.get("map_fallback"):
             lines.append("  note: " + ready["map_fallback"])
         if ready.get("xosc"):
@@ -1919,6 +1963,19 @@ def main():
     ap.add_argument("--dashcam", action="store_true", help="record dashcam footage mounted on the colliding vehicle(s) (never a bystander)")
     ap.add_argument("--dashcam-mode", default="colliders", help="dashcam target: colliders (default, all colliding vehicles), primary, or actor id")
     ap.add_argument("--ego-on-collider", action="store_true", help="export the primary colliding vehicle as OpenSCENARIO 'hero'")
+    ap.add_argument("--sensors", default=None,
+                    help="attach smart-car sensors to the subject vehicle: tesla, tesla_lidar, surround_lidar, front_lidar, lidar, semantic_lidar, tesla_full, or comma-separated sensor names")
+    ap.add_argument("--sensor-res", default="320x180", help="camera WxH resolution for --sensors (default 320x180)")
+    ap.add_argument("--save-sensors", action="store_true", help="save synchronized camera frames, LiDAR .npy point clouds, and telemetry/actions to <out>/sensor_data/")
+    ap.add_argument("--control", choices=("auto", "keyboard", "external"), default="auto",
+                    help="make the subject vehicle controllable: auto (default scripted playback), keyboard (interactive WASD), or external (user controller)")
+    ap.add_argument("--control-actor", default=None, help="explicit actor id to control & equip with --sensors (default: primary colliding vehicle)")
+    ap.add_argument("--action-space", choices=("continuous", "discrete", "target_speed"), default="continuous",
+                    help="action space for --control external: continuous ([steer, accel]), discrete (9 primitives), or target_speed ([steer, v_ms])")
+    ap.add_argument("--controller", default=None,
+                    help="external user controller for --control external (e.g. module:ClassOrFunc or path/to/file.py:act)")
+    ap.add_argument("--adversarial-cutter", action="store_true",
+                    help="keep cutting-in aggressor actively homing onto an evading controllable vehicle")
     ap.add_argument("--timing-variants", default=None,
                     help="generate timing variants: count (e.g. 4), 'all', or comma-separated presets (original,earlier_collision,later_collision,fast_collision,slow_collision,near_miss_early,near_miss_late,miss_early,miss_late,no_aggressor)")
     ap.add_argument("--crashing-only", "--crash-only", dest="crashing_only", action="store_true",
@@ -1970,6 +2027,10 @@ def main():
                 record_video=a.record, camera=a.camera,
                 dashcam=a.dashcam, dashcam_mode=a.dashcam_mode,
                 ego_on_collider=a.ego_on_collider,
+                sensors=a.sensors, sensor_res=a.sensor_res, save_sensors=a.save_sensors,
+                control_mode=a.control, control_actor=a.control_actor,
+                action_space=a.action_space, controller=a.controller,
+                adversarial_cutter=a.adversarial_cutter,
             )
         print(scenario_variants.format_variants_report(manifest))
         return
@@ -1977,6 +2038,10 @@ def main():
         ready = phase2(
             a.out, a.max_iter, record_video=a.record, camera=a.camera,
             dashcam=a.dashcam, dashcam_mode=a.dashcam_mode, ego_on_collider=a.ego_on_collider,
+            sensors=a.sensors, sensor_res=a.sensor_res, save_sensors=a.save_sensors,
+            control_mode=a.control, control_actor=a.control_actor,
+            action_space=a.action_space, controller=a.controller,
+            adversarial_cutter=a.adversarial_cutter,
         )
     print(report(a.out, spec, ready))
 
